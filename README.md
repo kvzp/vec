@@ -1,5 +1,7 @@
 # vec
 
+**Semantic search for the filesystem. Not a developer toy — system infrastructure.**
+
 `locate` finds files by name. `vec` finds files by meaning.
 
 ```bash
@@ -8,7 +10,9 @@ vec "database connection pooling"
 vec "where does error handling happen"
 ```
 
-Fully local. No cloud. Embeddings run in-process on CPU via a pure-Rust ONNX engine — no Python, no external service. Index in SQLite. Ships as a static binary with no runtime dependencies.
+Most semantic search tools are Python scripts bolted onto a dev workflow. `vec` is different: it ships as a **static binary**, integrates with **systemd**, follows **FHS**, and enforces access control through **Unix filesystem permissions** — no application-level ACL, no daemon, no trust boundary to audit separately. The security model is the filesystem. Always has been.
+
+Vector search. Proven security. Zero runtime dependencies.
 
 ---
 
