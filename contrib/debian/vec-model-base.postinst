@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Re-index after model install/upgrade — old embeddings are incompatible.
+        # Run in the background so the package manager does not block.
+        if command -v vec >/dev/null 2>&1 && [ -d /var/lib/vec ]; then
+            vec updatedb --full >/dev/null 2>&1 &
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+exit 0

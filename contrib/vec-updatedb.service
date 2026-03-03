@@ -1,0 +1,14 @@
+[Unit]
+Description=vec semantic index update
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/vec updatedb
+Nice=19
+IOSchedulingClass=idle
+# Allow enough time for full filesystem indexing
+TimeoutStartSec=3h
+
+[Install]
+WantedBy=multi-user.target

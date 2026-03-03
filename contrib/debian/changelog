@@ -1,0 +1,5 @@
+vec (0.1.0-1) unstable; urgency=low
+
+  * Initial Debian packaging.
+
+ -- Gilles <gdevos@gmail.com>  Tue, 03 Mar 2026 00:00:00 +0000

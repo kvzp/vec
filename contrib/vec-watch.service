@@ -1,0 +1,19 @@
+[Unit]
+Description=vec real-time semantic index watcher
+After=local-fs.target
+# Restart if it crashes; inotify errors are transient
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/vec watch
+Nice=19
+IOSchedulingClass=idle
+Restart=on-failure
+RestartSec=5s
+# Give inotify enough room for large trees
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

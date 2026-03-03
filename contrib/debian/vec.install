@@ -1,0 +1,6 @@
+usr/bin/vec
+etc/vec.conf
+usr/lib/systemd/system/vec-updatedb.service
+usr/lib/systemd/system/vec-updatedb.timer
+usr/lib/systemd/system/vec-watch.service
+usr/lib/sysctl.d/99-vec.conf
