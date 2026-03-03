@@ -1,0 +1,11 @@
+[Unit]
+Description=vec semantic index update timer
+
+[Timer]
+# Run daily; Persistent=true means it fires at next boot if it missed its window
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

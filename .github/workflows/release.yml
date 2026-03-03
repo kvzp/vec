@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            archive: vec-linux-x86_64.tar.gz
+            cross: false
+
+          - target: aarch64-unknown-linux-gnu
+            archive: vec-linux-aarch64.tar.gz
+            cross: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install aarch64 cross-compiler
+        if: matrix.cross
+        run: sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build release binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.cross && 'aarch64-linux-gnu-gcc' || '' }}
+          CC_aarch64_unknown_linux_gnu: ${{ matrix.cross && 'aarch64-linux-gnu-gcc' || '' }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          BINARY=target/${{ matrix.target }}/release/vec
+          cp "$BINARY" vec
+          tar czf ${{ matrix.archive }} vec README.md
+          sha256sum ${{ matrix.archive }} > ${{ matrix.archive }}.sha256
+          rm vec
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}
+            ${{ matrix.archive }}.sha256
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            vec-linux-x86_64.tar.gz
+            vec-linux-x86_64.tar.gz.sha256
+            vec-linux-aarch64.tar.gz
+            vec-linux-aarch64.tar.gz.sha256
+          body: |
+            ## Installation
+
+            ```bash
+            # x86_64
+            curl -L https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/vec-linux-x86_64.tar.gz | tar xz
+            install -m755 vec /usr/local/bin/
+
+            # aarch64
+            curl -L https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/vec-linux-aarch64.tar.gz | tar xz
+            install -m755 vec /usr/local/bin/
+            ```
+
+            Then install a model:
+            ```bash
+            vec model download
+            ```
+
+            Verify checksums:
+            ```bash
+            sha256sum -c vec-linux-x86_64.tar.gz.sha256
+            ```

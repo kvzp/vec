@@ -1,0 +1,37 @@
+Source: vec
+Section: utils
+Priority: optional
+Maintainer: Gilles <gdevos@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               cargo,
+               rustc,
+               libsqlite3-dev,
+               pkg-config
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://github.com/kvzp/vec
+
+Package: vec
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libsqlite3-0
+Recommends: vec-model-base
+Description: Semantic file search — find files by meaning
+ locate finds files by name. vec finds files by meaning.
+ .
+ vec indexes the filesystem with CPU-based embeddings (pure-Rust ONNX, no
+ Python, no cloud, no external service), stores only vectors and byte
+ offsets in a central SQLite database, and enforces per-user access control
+ via filesystem permissions.
+ .
+ After 'apt install vec vec-model-base', open a terminal and type
+ 'vec "authentication middleware"' — it works with no manual setup.
+
+Package: vec-model-base
+Architecture: all
+Depends: ${misc:Depends}
+Description: Embedding model for vec (gte-multilingual-base, 50+ languages)
+ gte-multilingual-base ONNX embedding model and tokenizer for vec.
+ .
+ Supports 50+ languages, ~90 MB. Versioned independently from the vec
+ binary. After upgrading this package, run 'vec updatedb --full' to
+ re-embed with the new model weights.

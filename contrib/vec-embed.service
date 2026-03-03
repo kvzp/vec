@@ -1,0 +1,69 @@
+# vec-embed.service — OPTIONAL persistent embedding daemon
+#
+# ============================================================
+# THIS SERVICE IS COMPLETELY OPTIONAL. DO NOT AUTO-ENABLE IT.
+# ============================================================
+#
+# PURPOSE
+# -------
+# vec compiles the ONNX model graph from scratch on every invocation.
+# On large models this takes a few seconds. If that startup lag bothers
+# you for interactive use, this daemon solves it: it loads the model
+# once at startup and keeps the compiled graph in RAM indefinitely.
+# `vec <query>` then tries /run/vec/embed.sock first (near-instant)
+# and silently falls back to in-process loading if the socket is absent.
+#
+# MEMORY COST
+# -----------
+# The daemon holds the compiled ONNX model in resident memory at all times.
+# Typical footprint: 150–300 MB depending on model size.
+# THIS IS PERMANENT RAM USAGE for the lifetime of the service.
+#
+# WHEN TO ENABLE
+# --------------
+# Only enable this service if BOTH conditions are true:
+#   1. You run `vec <query>` interactively many times a day AND
+#   2. You have RAM to spare (the system has enough free memory that
+#      150–300 MB of permanent resident usage is acceptable)
+#
+# WHEN NOT TO ENABLE
+# ------------------
+#   - Servers or containers with tight memory budgets
+#   - Systems where `vec` is used only occasionally
+#   - Any situation where 150–300 MB of permanent RAM is not worth
+#     saving a few seconds of startup time per query
+#
+# vec works correctly without this service. The only difference is
+# a few seconds of startup latency on each `vec <query>` invocation.
+#
+# HOW TO ENABLE (user's explicit choice only)
+# -------------------------------------------
+#   systemctl enable --now vec-embed.service
+#
+# HOW TO DISABLE
+# --------------
+#   systemctl disable --now vec-embed.service
+#
+# Packagers: DO NOT enable this in postinst. Ship it disabled.
+
+[Unit]
+Description=vec embedding daemon (OPTIONAL — see comments before enabling)
+Documentation=man:vec(1)
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/vec daemon
+Restart=on-failure
+RestartSec=30s
+
+# Create /run/vec/ automatically (mode 755, owned by root).
+RuntimeDirectory=vec
+RuntimeDirectoryMode=0755
+
+# Low scheduling priority — this is a background helper, not latency-sensitive.
+Nice=19
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

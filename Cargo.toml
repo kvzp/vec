@@ -1,0 +1,52 @@
+[package]
+name = "vec-locate"
+version = "0.1.0"
+edition = "2021"
+description = "Semantic file search — locate finds files by name, vec finds files by meaning"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/kvzp/vec"
+
+[[bin]]
+name = "vec"
+path = "src/main.rs"
+
+[dependencies]
+clap             = { version = "4", features = ["derive"] }
+rusqlite         = { version = "0.31", features = ["bundled"] }
+tokenizers       = "0.21"
+serde            = { version = "1", features = ["derive"] }
+serde_json       = "1"
+toml             = "0.8"
+ignore           = "0.4"
+sha2             = "0.10"
+hex              = "0.4"
+rmcp             = { version = "0.3", features = ["server", "transport-io"] }
+tokio            = { version = "1", features = ["rt-multi-thread", "macros"] }
+anstream         = "0.6"
+anyhow           = "1"
+dirs             = "5"
+notify           = "6"
+prost            = "0.11"
+# ONNX inference: tract is pure Rust — no C deps, no system libs, no protoc,
+# compiles on every architecture Rust supports.
+tract-onnx       = "0.21"
+ndarray          = "0.17"
+
+# nix is Unix-only (Linux, macOS, BSDs). Not compiled on Windows.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["user", "fs"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+# Link against system libsqlite3 (required for distro packages).
+# rusqlite uses "bundled" to embed SQLite; distro builds omit "bundled" and the
+# linker picks up the system libsqlite3.  This feature is a no-op marker so that
+# distro build scripts can pass --features system-sqlite without breaking the build.
+system-sqlite = []
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

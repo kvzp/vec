@@ -1,0 +1,22 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Apply the inotify limit immediately (also takes effect at next boot).
+        sysctl --system >/dev/null 2>&1 || true
+
+        # Enable and start the daily timer and real-time watcher.
+        # Persistent=true in the timer means the first updatedb run fires at
+        # next boot even if the timer was missed.
+        if command -v systemctl >/dev/null 2>&1 && systemctl is-system-running --quiet 2>/dev/null; then
+            systemctl enable vec-updatedb.timer >/dev/null 2>&1 || true
+            systemctl start  vec-updatedb.timer >/dev/null 2>&1 || true
+            systemctl enable vec-watch.service  >/dev/null 2>&1 || true
+            systemctl start  vec-watch.service  >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+exit 0

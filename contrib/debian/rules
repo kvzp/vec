@@ -1,0 +1,32 @@
+#!/usr/bin/make -f
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@ --with=systemd
+
+override_dh_auto_build:
+	cargo build --release --features system-sqlite
+
+override_dh_auto_install:
+	# Binary
+	install -D -m 0755 target/release/vec \
+	    debian/vec/usr/bin/vec
+	# Config template
+	install -D -m 0644 contrib/vec.conf \
+	    debian/vec/etc/vec.conf
+	# systemd units (vendor path)
+	install -D -m 0644 contrib/vec-updatedb.service \
+	    debian/vec/usr/lib/systemd/system/vec-updatedb.service
+	install -D -m 0644 contrib/vec-updatedb.timer \
+	    debian/vec/usr/lib/systemd/system/vec-updatedb.timer
+	install -D -m 0644 contrib/vec-watch.service \
+	    debian/vec/usr/lib/systemd/system/vec-watch.service
+	# sysctl
+	install -D -m 0644 contrib/99-vec.conf \
+	    debian/vec/usr/lib/sysctl.d/99-vec.conf
+	# Model package files are installed from a separate source tarball.
+	# See PACKAGING.md — vec-model-base builds from the GitHub release asset.
+
+override_dh_auto_test:
+	# Unit tests pass, but skip here to avoid writing to /var/lib/vec in sbuild.
+	# Run 'cargo test' manually to verify.
