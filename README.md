@@ -41,9 +41,9 @@ cd /usr/share/vec/models/gte-multilingual-base
 
 # Download ONNX model and tokenizer from HuggingFace
 sudo curl -L -o model_int8.onnx \
-  "https://huggingface.co/Alibaba-NLP/gte-multilingual-base/resolve/main/onnx/model_int8.onnx"
+  "https://huggingface.co/onnx-community/gte-multilingual-base/resolve/main/onnx/model_int8.onnx"
 sudo curl -L -o tokenizer.json \
-  "https://huggingface.co/Alibaba-NLP/gte-multilingual-base/resolve/main/tokenizer.json"
+  "https://huggingface.co/onnx-community/gte-multilingual-base/resolve/main/tokenizer.json"
 ```
 
 Set up and index:
@@ -58,6 +58,44 @@ vec init | sudo tee /etc/vec.conf
 # Build the index (indexes everything the user can read)
 sudo vec updatedb
 ```
+
+### Userland install (no root required)
+
+If your sysadmin won't install it system-wide, you can run `vec` entirely within your own home directory:
+
+```bash
+# Binary
+install -m755 target/release/vec ~/.local/bin/
+
+# Model
+mkdir -p ~/.local/share/vec/models/gte-multilingual-base
+cd ~/.local/share/vec/models/gte-multilingual-base
+curl -L -o model_int8.onnx \
+  "https://huggingface.co/onnx-community/gte-multilingual-base/resolve/main/onnx/model_int8.onnx"
+curl -L -o tokenizer.json \
+  "https://huggingface.co/onnx-community/gte-multilingual-base/resolve/main/tokenizer.json"
+
+# Config (points vec at your local paths and scopes indexing to your home dir)
+mkdir -p ~/.config/vec
+vec init --user > ~/.config/vec/config.toml
+
+# Index
+vec --config ~/.config/vec/config.toml updatedb
+```
+
+Then search:
+
+```bash
+vec --config ~/.config/vec/config.toml "authentication middleware"
+```
+
+Tip: add an alias to your shell profile to avoid repeating `--config`:
+
+```bash
+alias vec='vec --config ~/.config/vec/config.toml'
+```
+
+---
 
 ### Distro packages _(not yet available)_
 

@@ -53,6 +53,10 @@ struct Cli {
     #[arg(long)]
     min_score: Option<f32>,
 
+    /// Path to a config file (overrides /etc/vec.conf; useful for userland installs)
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -77,8 +81,12 @@ enum Command {
         #[command(subcommand)]
         action: ModelAction,
     },
-    /// Print a starter /etc/vec.conf to stdout (redirect to install)
-    Init,
+    /// Print a starter config to stdout (redirect to install)
+    Init {
+        /// Generate a userland config (~/.local paths) instead of system-wide (/etc, /usr/share)
+        #[arg(long)]
+        user: bool,
+    },
     /// Watch configured paths and re-index on changes (real-time mode)
     Watch,
     /// Start the embedding daemon — loads the ONNX model once and serves
@@ -101,13 +109,15 @@ enum ModelAction {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    let cfg_path = cli.config.as_deref();
+
     match cli.command {
         None => {
             // Default: run a search query if one was provided; otherwise print
             // help (clap handles the no-argument case via require_equals or we
             // just print a short message).
             if let Some(query) = cli.query {
-                cmd_search(&query, cli.limit, cli.snippet, cli.path.as_deref(), cli.min_score).await
+                cmd_search(&query, cli.limit, cli.snippet, cli.path.as_deref(), cli.min_score, cfg_path).await
             } else {
                 // No query and no subcommand — print usage hint.
                 eprintln!("Usage: vec \"<query>\"  (or `vec --help` for all options)");
@@ -115,14 +125,14 @@ async fn main() -> Result<()> {
             }
         }
         Some(Command::Updatedb { full, path }) => {
-            cmd_updatedb(full, path.as_deref()).await
+            cmd_updatedb(full, path.as_deref(), cfg_path).await
         }
-        Some(Command::Status) => cmd_status().await,
+        Some(Command::Status) => cmd_status(cfg_path).await,
         Some(Command::Serve) => crate::mcp::run_server().await,
-        Some(Command::Model { action: ModelAction::Download }) => cmd_model_download(),
-        Some(Command::Init) => cmd_init(),
+        Some(Command::Model { action: ModelAction::Download }) => cmd_model_download(cfg_path),
+        Some(Command::Init { user }) => cmd_init(user),
         Some(Command::Watch) => crate::watch::run_watch(),
-        Some(Command::Daemon) => cmd_daemon().await,
+        Some(Command::Daemon) => cmd_daemon(cfg_path).await,
     }
 }
 
@@ -136,8 +146,9 @@ async fn cmd_search(
     show_snippet: bool,
     path_filter: Option<&std::path::Path>,
     min_score: Option<f32>,
+    cfg_path: Option<&std::path::Path>,
 ) -> Result<()> {
-    let cfg = Config::load(None).context("loading config")?;
+    let cfg = Config::load(cfg_path).context("loading config")?;
 
     let mut store = Store::open(&cfg.database.db_path, cfg.database.wal)
         .context("opening store")?;
@@ -202,8 +213,8 @@ async fn cmd_search(
 // vec updatedb
 // ---------------------------------------------------------------------------
 
-async fn cmd_updatedb(full: bool, path_filter: Option<&std::path::Path>) -> Result<()> {
-    let cfg = Config::load(None).context("loading config")?;
+async fn cmd_updatedb(full: bool, path_filter: Option<&std::path::Path>, cfg_path: Option<&std::path::Path>) -> Result<()> {
+    let cfg = Config::load(cfg_path).context("loading config")?;
 
     let mut store = Store::open(&cfg.database.db_path, cfg.database.wal)
         .context("opening store")?;
@@ -241,8 +252,8 @@ async fn cmd_updatedb(full: bool, path_filter: Option<&std::path::Path>) -> Resu
 // vec status
 // ---------------------------------------------------------------------------
 
-async fn cmd_status() -> Result<()> {
-    let cfg = Config::load(None).context("loading config")?;
+async fn cmd_status(cfg_path: Option<&std::path::Path>) -> Result<()> {
+    let cfg = Config::load(cfg_path).context("loading config")?;
 
     let store = Store::open(&cfg.database.db_path, cfg.database.wal)
         .context("opening store")?;
@@ -278,8 +289,8 @@ async fn cmd_status() -> Result<()> {
 // vec model download
 // ---------------------------------------------------------------------------
 
-fn cmd_model_download() -> Result<()> {
-    let cfg = Config::load(None).context("loading config")?;
+fn cmd_model_download(cfg_path: Option<&std::path::Path>) -> Result<()> {
+    let cfg = Config::load(cfg_path).context("loading config")?;
 
     // Always use the first (system) search path — models are system-installed.
     let dest_dir = cfg.embed.model_search_path[0].clone();
@@ -308,10 +319,48 @@ fn cmd_model_download() -> Result<()> {
 // vec init
 // ---------------------------------------------------------------------------
 
-fn cmd_init() -> Result<()> {
-    // Print a starter /etc/vec.conf to stdout.
-    // Usage: vec init | sudo tee /etc/vec.conf
-    print!(r#"# /etc/vec.conf — system-wide vec configuration
+fn cmd_init(user: bool) -> Result<()> {
+    if user {
+        let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("~"));
+        let model_path = home.join(".local/share/vec/models");
+        let db_path    = home.join(".local/share/vec/vec.db");
+        let socket     = home.join(".local/share/vec/embed.sock");
+        print!(
+r#"# vec userland config — no root required
+# Install: mkdir -p ~/.config/vec && vec init --user > ~/.config/vec/config.toml
+# Use:     vec --config ~/.config/vec/config.toml "your query"
+
+[embed]
+model = "gte-multilingual-base"
+model_search_path = ["{model_path}"]
+# batch_size = 16
+# max_tokens = 128
+daemon_socket = "{socket}"
+
+[index]
+# Scope to your own directories — don't index the whole system
+include_paths = ["{home}"]
+# chunk_size    = 40
+# chunk_overlap = 10
+# gitignore = true
+
+[search]
+# default_limit = 10
+# snippet_lines = 6
+
+[database]
+db_path = "{db_path}"
+# wal = true
+"#,
+            home       = home.display(),
+            model_path = model_path.display(),
+            db_path    = db_path.display(),
+            socket     = socket.display(),
+        );
+    } else {
+        // Print a starter /etc/vec.conf to stdout.
+        // Usage: vec init | sudo tee /etc/vec.conf
+        print!(r#"# /etc/vec.conf — system-wide vec configuration
 # Install: vec init | sudo tee /etc/vec.conf
 # All values shown are compiled-in defaults; uncomment and change as needed.
 
@@ -348,6 +397,7 @@ fn cmd_init() -> Result<()> {
 # db_path = "/var/lib/vec/vec.db"
 # wal     = true
 "#);
+    }
     Ok(())
 }
 
@@ -355,8 +405,8 @@ fn cmd_init() -> Result<()> {
 // vec daemon
 // ---------------------------------------------------------------------------
 
-async fn cmd_daemon() -> Result<()> {
-    let cfg = Config::load(None).context("loading config")?;
+async fn cmd_daemon(cfg_path: Option<&std::path::Path>) -> Result<()> {
+    let cfg = Config::load(cfg_path).context("loading config")?;
 
     // Require a real model — stub makes no sense for a persistent daemon.
     let model_path = cfg
