@@ -181,11 +181,7 @@ pub fn chunk_file(content: &str, _cfg: &IndexConfig) -> Vec<Chunk> {
             let mut best_dist = usize::MAX;
             for idx in scan_lo..scan_hi {
                 if is_boundary(idx) {
-                    let dist = if idx >= tentative_end {
-                        idx - tentative_end
-                    } else {
-                        tentative_end - idx
-                    };
+                    let dist = idx.abs_diff(tentative_end);
                     if dist < best_dist {
                         best_dist = dist;
                         best = Some(idx);
@@ -259,7 +255,7 @@ pub fn glob_match(pattern: &str, filename: &str) -> bool {
                     return true;
                 }
                 // Try consuming one non-'/' character from name.
-                if name.first().map_or(false, |&c| c != b'/') {
+                if name.first().is_some_and(|&c| c != b'/') {
                     inner(pat, &name[1..])
                 } else {
                     false
@@ -309,8 +305,8 @@ pub struct IndexStats {
 /// * `full`        — if `true`, skip the sha256 check and re-embed every file.
 /// * `path_filter` — if `Some(p)`, only consider files under `p`.
 /// * `progress`    — callback invoked with human-readable status lines.
-///                   Called for each file processed; the format is intentionally
-///                   unstructured so callers can log, print, or discard it.
+///   Called for each file processed; the format is intentionally
+///   unstructured so callers can log, print, or discard it.
 ///
 /// # Returns
 ///
@@ -506,7 +502,7 @@ pub fn run_updatedb(
         // devices, FIFOs. Symlinks are not followed (follow_links = false)
         // so without this check a symlink to a regular file would be indexed
         // and appear as a duplicate alongside the real path.
-        if entry.file_type().map_or(true, |ft| !ft.is_file()) {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
 

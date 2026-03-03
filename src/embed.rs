@@ -58,8 +58,8 @@ pub struct Embedder {
 enum EmbedderInner {
     /// Real tract-onnx ONNX model.
     Tract {
-        model: TractModel,
-        tokenizer: tokenizers::Tokenizer,
+        model: Box<TractModel>,
+        tokenizer: Box<tokenizers::Tokenizer>,
         max_tokens: usize,
         dim: usize,
         /// Whether the model accepts `token_type_ids` (probed during load, then cached).
@@ -199,8 +199,8 @@ impl Embedder {
         Ok(Self {
             dim,
             inner: Box::new(EmbedderInner::Tract {
-                model,
-                tokenizer,
+                model: Box::new(model),
+                tokenizer: Box::new(tokenizer),
                 max_tokens,
                 dim,
                 has_token_type_ids,
@@ -283,7 +283,7 @@ fn probe_dim(
     let outputs = run_tract(model, has_token_type_ids, batch, seq, &ids, &mask, &types)?;
 
     // TValue implements Deref<Target=Tensor>; &* dereferences through that impl.
-    let out0: &Tensor = &*outputs[0];
+    let out0: &Tensor = &outputs[0];
     let shape = out0.shape();
     // sentence_embedding: [batch, dim]
     // last_hidden_state:   [batch, seq_len, dim]
@@ -421,7 +421,7 @@ fn extract_embeddings(
     seq_len: usize,
 ) -> Result<Vec<Vec<f32>>> {
     // `outputs[0]` is a TValue; deref gives us &Tensor (via Deref impl).
-    let out0: &Tensor = &*outputs[0];
+    let out0: &Tensor = &outputs[0];
 
     if is_pre_pooled {
         // Shape: [batch, emb_dim]
@@ -441,7 +441,7 @@ fn extract_embeddings(
     } else {
         // Shape: [batch, seq_len, emb_dim]
         let shape = out0.shape();
-        let b = shape.get(0).copied().unwrap_or(batch_size);
+        let b = shape.first().copied().unwrap_or(batch_size);
         let s = shape.get(1).copied().unwrap_or(seq_len);
         let emb_dim = shape.get(2).copied().unwrap_or(*dim);
         *dim = emb_dim;
@@ -506,7 +506,7 @@ fn stub_embed(text: &str, dim: usize) -> Vec<f32> {
 }
 
 /// In-place L2 normalisation.  No-op if the norm is near zero.
-fn normalise(v: &mut Vec<f32>) {
+fn normalise(v: &mut [f32]) {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 1e-9 {
         for x in v.iter_mut() {

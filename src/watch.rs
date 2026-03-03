@@ -66,11 +66,8 @@ pub fn run_watch() -> Result<()> {
             Ok(Ok(event)) => {
                 collect_paths(&event, &mut pending);
                 // Drain any additional events that arrive within 100ms.
-                loop {
-                    match rx.recv_timeout(Duration::from_millis(100)) {
-                        Ok(Ok(ev)) => collect_paths(&ev, &mut pending),
-                        _ => break,
-                    }
+                while let Ok(Ok(ev)) = rx.recv_timeout(Duration::from_millis(100)) {
+                    collect_paths(&ev, &mut pending);
                 }
                 // Keep looping — more events may arrive within the debounce window.
             }

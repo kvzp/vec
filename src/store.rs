@@ -620,7 +620,7 @@ pub fn pack_f32(v: &[f32]) -> Vec<u8> {
 ///
 /// Returns an empty Vec if `bytes.len()` is not a multiple of 4.
 pub fn unpack_f32(bytes: &[u8]) -> Vec<f32> {
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Vec::new();
     }
     bytes

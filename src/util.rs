@@ -1,4 +1,4 @@
-/// util.rs — small cross-platform helpers.
+//! util.rs — small cross-platform helpers.
 
 /// Returns `true` if the current process has read access to `path`.
 ///
