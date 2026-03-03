@@ -168,8 +168,15 @@ vec/
 │   ├── vec.spec               # RPM spec (binary)
 │   ├── vec-model-base.spec    # RPM spec (base model package)
 │   └── debian/                # Debian packaging
-├── PACKAGING.md           # guide for distro packagers
-└── README.md
+├── README.md           # Quick start, usage, schema overview, crate dependencies
+├── ARCHITECTURE.md     # Core design decisions and data flow
+├── SECURITY.md         # Security model: no-content DB, access() ACL, threat analysis
+├── CONTRIBUTING.md     # Dev setup, tests, project structure, invariants
+├── TESTING.md          # Test strategy, coverage table, known gaps, test conventions
+├── CONFIG.md           # Full /etc/vec.conf reference with all settings and recipes
+├── MCP.md              # MCP server setup (vec serve) and tool reference
+├── PACKAGING.md        # Guide for distro packagers (Debian/RPM/BSD, system-sqlite)
+└── PROJECT.md          # Project positioning, mental model, and MVP scope
 ```
 
 ---
