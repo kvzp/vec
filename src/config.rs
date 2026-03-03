@@ -430,14 +430,14 @@ impl Config {
                 return Ok(candidate1);
             }
 
-            // Try "{dir}/{name}/model.onnx"
-            let candidate2 = dir.join(name).join("model.onnx");
+            // Try "{dir}/{name}/model_int8.onnx" first — quantized, smaller, preferred
+            let candidate2 = dir.join(name).join("model_int8.onnx");
             if candidate2.exists() {
                 return Ok(candidate2);
             }
 
-            // Try "{dir}/{name}/model_int8.onnx" (HuggingFace ONNX community naming)
-            let candidate3 = dir.join(name).join("model_int8.onnx");
+            // Fall back to "{dir}/{name}/model.onnx" (full precision)
+            let candidate3 = dir.join(name).join("model.onnx");
             if candidate3.exists() {
                 return Ok(candidate3);
             }

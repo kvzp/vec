@@ -61,7 +61,9 @@ sudo vec updatedb
 
 ### Userland install (no root required)
 
-If your sysadmin won't install it system-wide, you can run `vec` entirely within your own home directory:
+> **Only do this if `vec` is not already installed system-wide.** If `which vec` returns a path, use that — a parallel userland install will cause confusion. Userland is for machines where no sysadmin install exists.
+
+If vec is not installed and you don't have root, you can run it entirely within your own home directory:
 
 ```bash
 # Binary

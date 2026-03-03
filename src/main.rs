@@ -321,10 +321,39 @@ fn cmd_model_download(cfg_path: Option<&std::path::Path>) -> Result<()> {
 
 fn cmd_init(user: bool) -> Result<()> {
     if user {
+        // Warn if a system-wide vec is already installed — userland is redundant in that case.
+        let system_bins = ["/usr/bin/vec", "/usr/local/bin/vec"];
+        for p in &system_bins {
+            if std::path::Path::new(p).exists() {
+                eprintln!(
+                    "warning: system-wide vec found at {}.\n\
+                     A userland install is only needed when no system installation exists.\n\
+                     If you still want a separate userland config, proceed — but be aware\n\
+                     that PATH order determines which binary runs.",
+                    p
+                );
+                break;
+            }
+        }
+
         let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("~"));
-        let model_path = home.join(".local/share/vec/models");
-        let db_path    = home.join(".local/share/vec/vec.db");
-        let socket     = home.join(".local/share/vec/embed.sock");
+        let local_model_path = home.join(".local/share/vec/models");
+        let db_path          = home.join(".local/share/vec/vec.db");
+        let socket           = home.join(".local/share/vec/embed.sock");
+
+        // If system models exist and are readable, include them first so the
+        // user doesn't have to re-download a model that's already on the machine.
+        let system_model_path = std::path::Path::new("/usr/share/vec/models");
+        let model_search_path = if system_model_path.is_dir() {
+            format!(
+                "[\"{}\", \"{}\"]",
+                system_model_path.display(),
+                local_model_path.display()
+            )
+        } else {
+            format!("[\"{}\"]", local_model_path.display())
+        };
+
         print!(
 r#"# vec userland config — no root required
 # Install: mkdir -p ~/.config/vec && vec init --user > ~/.config/vec/config.toml
@@ -332,7 +361,7 @@ r#"# vec userland config — no root required
 
 [embed]
 model = "gte-multilingual-base"
-model_search_path = ["{model_path}"]
+model_search_path = {model_search_path}
 # batch_size = 16
 # max_tokens = 128
 daemon_socket = "{socket}"
@@ -352,10 +381,10 @@ include_paths = ["{home}"]
 db_path = "{db_path}"
 # wal = true
 "#,
-            home       = home.display(),
-            model_path = model_path.display(),
-            db_path    = db_path.display(),
-            socket     = socket.display(),
+            home              = home.display(),
+            model_search_path = model_search_path,
+            db_path           = db_path.display(),
+            socket            = socket.display(),
         );
     } else {
         // Print a starter /etc/vec.conf to stdout.
