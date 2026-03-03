@@ -23,7 +23,7 @@ Vector search. Proven security. Zero runtime dependencies.
 
 ## Build from source
 
-Requirements: [Rust](https://rustup.rs) (stable), `sqlite3-dev` or bundled (default).
+Requirements: [Rust](https://rustup.rs) (stable). SQLite is bundled — no system libraries needed.
 
 ```bash
 git clone https://github.com/kvzp/vec
@@ -32,17 +32,30 @@ cargo build --release
 sudo install -m755 target/release/vec /usr/local/bin/
 ```
 
-Download a model and point vec at it:
+Download a model:
 
 ```bash
-# Download gte-multilingual-base (~90MB, 50+ languages)
-mkdir -p /usr/local/share/vec/models
-# Place model_int8.onnx and tokenizer.json under /usr/local/share/vec/models/gte-multilingual-base/
+# gte-multilingual-base — ~90MB, 50+ languages
+sudo mkdir -p /usr/share/vec/models/gte-multilingual-base
+cd /usr/share/vec/models/gte-multilingual-base
 
-# Configure (optional — compiled defaults work once model is in place)
+# Download ONNX model and tokenizer from HuggingFace
+sudo curl -L -o model_int8.onnx \
+  "https://huggingface.co/Alibaba-NLP/gte-multilingual-base/resolve/main/onnx/model_int8.onnx"
+sudo curl -L -o tokenizer.json \
+  "https://huggingface.co/Alibaba-NLP/gte-multilingual-base/resolve/main/tokenizer.json"
+```
+
+Set up and index:
+
+```bash
+# Create the database directory
+sudo mkdir -p /var/lib/vec
+
+# Configure (optional — compiled defaults work out of the box)
 vec init | sudo tee /etc/vec.conf
 
-# Build the index
+# Build the index (indexes everything the user can read)
 sudo vec updatedb
 ```
 
