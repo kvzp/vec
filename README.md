@@ -12,44 +12,45 @@ Fully local. No cloud. Embeddings run in-process on CPU via a pure-Rust ONNX eng
 
 ---
 
-## Install
+> **Status: active development — not yet in distro repositories.**
+> Build from source to try it. Packagers welcome — see [PACKAGING.md](PACKAGING.md).
 
-### Distro packages (recommended)
+---
 
-```bash
-# Debian / Ubuntu
-apt install vec vec-model-base
+## Build from source
 
-# Fedora / RHEL
-dnf install vec vec-model-base
-
-# Arch
-pacman -S vec vec-model-base
-
-# NixOS
-nix-env -iA nixpkgs.vec nixpkgs.vec-model-base
-```
-
-`vec-model-base` ships the `gte-multilingual-base` embedding model (~90MB, 50+ languages).
-
-### Pre-built binary
-
-Download from [GitHub Releases](https://github.com/kvzp/vec/releases) — static binary, no dependencies:
+Requirements: [Rust](https://rustup.rs) (stable), `sqlite3-dev` or bundled (default).
 
 ```bash
-curl -L https://github.com/kvzp/vec/releases/latest/download/vec-linux-x86_64.tar.gz | tar xz
-install -m755 vec /usr/local/bin/
+git clone https://github.com/kvzp/vec
+cd vec
+cargo build --release
+sudo install -m755 target/release/vec /usr/local/bin/
 ```
 
-Then install a model package — see [Config](#config).
-
-### From source
+Download a model and point vec at it:
 
 ```bash
-cargo install vec-locate
+# Download gte-multilingual-base (~90MB, 50+ languages)
+mkdir -p /usr/local/share/vec/models
+# Place model_int8.onnx and tokenizer.json under /usr/local/share/vec/models/gte-multilingual-base/
+
+# Configure (optional — compiled defaults work once model is in place)
+vec init | sudo tee /etc/vec.conf
+
+# Build the index
+sudo vec updatedb
 ```
 
-Configure a model — see [Config](#config).
+### Distro packages _(not yet available)_
+
+Packaging specs are ready for Debian and RPM. If you maintain a package for your distro, see [PACKAGING.md](PACKAGING.md).
+
+```bash
+# These will work once packages land in distros:
+# apt install vec vec-model-base
+# dnf install vec vec-model-base
+```
 
 ---
 
