@@ -152,9 +152,8 @@ impl Store {
     pub fn open(path: &Path, wal: bool) -> Result<Self> {
         // Ensure the parent directory exists.
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("creating database directory {}", parent.display())
-            })?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating database directory {}", parent.display()))?;
         }
 
         let conn = Connection::open(path)
@@ -232,10 +231,7 @@ impl Store {
             .parse()
             .unwrap_or(0);
 
-        if stored_name != model_name
-            || stored_sha != model_sha256
-            || stored_dim != embedding_dim
-        {
+        if stored_name != model_name || stored_sha != model_sha256 || stored_dim != embedding_dim {
             bail!(
                 "model changed — run 'vec updatedb --full' to re-index\n\
                  stored:     {} (sha256={}, dim={})\n\
@@ -348,10 +344,7 @@ impl Store {
     /// stale embeddings.
     pub fn delete_chunks_for_file(&mut self, file_id: i64) -> Result<()> {
         self.conn
-            .execute(
-                "DELETE FROM chunks WHERE file_id = ?1",
-                params![file_id],
-            )
+            .execute("DELETE FROM chunks WHERE file_id = ?1", params![file_id])
             .context("deleting chunks for file")?;
         Ok(())
     }
@@ -433,14 +426,17 @@ impl Store {
 
         // Prepare once; re-execute with increasing OFFSET each page.
         // ORDER BY c.id ensures a stable scan so LIMIT/OFFSET pages are disjoint.
-        let mut stmt = self.conn.prepare(
-            "SELECT f.path, c.byte_offset, c.byte_end, c.start_line, c.end_line, c.embedding
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT f.path, c.byte_offset, c.byte_end, c.start_line, c.end_line, c.embedding
              FROM chunks c
              JOIN files f ON f.id = c.file_id
              WHERE (?1 = 0 OR f.path GLOB ?2)
              ORDER BY c.id
              LIMIT ?3 OFFSET ?4",
-        ).context("preparing search query")?;
+            )
+            .context("preparing search query")?;
 
         let mut offset: i64 = 0;
         loop {
@@ -454,12 +450,12 @@ impl Store {
                     ],
                     |row| {
                         Ok((
-                            row.get::<_, String>(0)?,        // path
-                            row.get::<_, i64>(1)? as usize,  // byte_offset
-                            row.get::<_, i64>(2)? as usize,  // byte_end
-                            row.get::<_, i64>(3)? as usize,  // start_line
-                            row.get::<_, i64>(4)? as usize,  // end_line
-                            row.get::<_, Vec<u8>>(5)?,       // embedding BLOB
+                            row.get::<_, String>(0)?,       // path
+                            row.get::<_, i64>(1)? as usize, // byte_offset
+                            row.get::<_, i64>(2)? as usize, // byte_end
+                            row.get::<_, i64>(3)? as usize, // start_line
+                            row.get::<_, i64>(4)? as usize, // end_line
+                            row.get::<_, Vec<u8>>(5)?,      // embedding BLOB
                         ))
                     },
                 )
@@ -521,7 +517,11 @@ impl Store {
             })
             .collect();
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         Ok(results)
     }
@@ -718,15 +718,21 @@ mod tests {
     #[test]
     fn set_and_check_model() {
         let mut store = open_in_memory();
-        store.set_model("gte-multilingual-base", "abc123", 768).unwrap();
+        store
+            .set_model("gte-multilingual-base", "abc123", 768)
+            .unwrap();
         // Same values → should not error.
-        store.check_model("gte-multilingual-base", "abc123", 768).unwrap();
+        store
+            .check_model("gte-multilingual-base", "abc123", 768)
+            .unwrap();
     }
 
     #[test]
     fn check_model_mismatch_errors() {
         let mut store = open_in_memory();
-        store.set_model("gte-multilingual-base", "abc123", 768).unwrap();
+        store
+            .set_model("gte-multilingual-base", "abc123", 768)
+            .unwrap();
         let err = store
             .check_model("different-model", "abc123", 768)
             .unwrap_err();
@@ -790,9 +796,7 @@ mod tests {
         store.insert_chunk(file_id, 0, 100, 0, 10, &emb).unwrap();
 
         // Query with the same vector → score should be ~1.0.
-        let results = store
-            .search(&emb, 5, 0.0, None)
-            .unwrap();
+        let results = store.search(&emb, 5, 0.0, None).unwrap();
         assert_eq!(results.len(), 1);
         assert!((results[0].score - 1.0).abs() < 1e-5);
         assert_eq!(results[0].path, Path::new("/tmp/a.rs"));
@@ -811,13 +815,18 @@ mod tests {
         // Query with an orthogonal vector → score = 0.
         let query = tiny_embed(&[0.0, 1.0, 0.0, 0.0]);
         let results = store.search(&query, 10, 0.5, None).unwrap();
-        assert!(results.is_empty(), "orthogonal vector should score below 0.5");
+        assert!(
+            results.is_empty(),
+            "orthogonal vector should score below 0.5"
+        );
     }
 
     #[test]
     fn delete_chunks_for_file() {
         let mut store = open_in_memory();
-        let fid = store.upsert_file(Path::new("/tmp/c.rs"), 1.0, "h3").unwrap();
+        let fid = store
+            .upsert_file(Path::new("/tmp/c.rs"), 1.0, "h3")
+            .unwrap();
         let emb = tiny_embed(&[1.0, 0.0, 0.0, 0.0]);
         store.insert_chunk(fid, 0, 20, 0, 5, &emb).unwrap();
 
@@ -866,8 +875,12 @@ mod tests {
     fn search_with_path_filter() {
         let mut store = open_in_memory();
 
-        let fid_a = store.upsert_file(Path::new("/proj/a/file.rs"), 1.0, "h_a").unwrap();
-        let fid_b = store.upsert_file(Path::new("/proj/b/file.rs"), 1.0, "h_b").unwrap();
+        let fid_a = store
+            .upsert_file(Path::new("/proj/a/file.rs"), 1.0, "h_a")
+            .unwrap();
+        let fid_b = store
+            .upsert_file(Path::new("/proj/b/file.rs"), 1.0, "h_b")
+            .unwrap();
 
         let emb_a = tiny_embed(&[1.0, 0.0, 0.0, 0.0]);
         let emb_b = tiny_embed(&[0.0, 1.0, 0.0, 0.0]);
@@ -910,7 +923,9 @@ mod tests {
     #[test]
     fn insert_multiple_chunks_same_file() {
         let mut store = open_in_memory();
-        let fid = store.upsert_file(Path::new("/tmp/multi.rs"), 1.0, "hmulti").unwrap();
+        let fid = store
+            .upsert_file(Path::new("/tmp/multi.rs"), 1.0, "hmulti")
+            .unwrap();
 
         let emb = tiny_embed(&[1.0, 0.0, 0.0, 0.0]);
         store.insert_chunk(fid, 0, 40, 1, 10, &emb).unwrap();
@@ -925,7 +940,9 @@ mod tests {
     #[test]
     fn cosine_search_finds_similar() {
         let mut store = open_in_memory();
-        let fid = store.upsert_file(Path::new("/tmp/cosine.rs"), 1.0, "hcos").unwrap();
+        let fid = store
+            .upsert_file(Path::new("/tmp/cosine.rs"), 1.0, "hcos")
+            .unwrap();
 
         // Use a 4-d vector: e1 = [1,0,0,0]
         let known_emb = tiny_embed(&[1.0, 0.0, 0.0, 0.0]);
@@ -990,10 +1007,14 @@ mod tests {
         // literals in the GLOB prefix filter, not as GLOB character classes.
         let mut store = open_in_memory();
         let special_path = "/proj/[module]/file.rs";
-        let normal_path  = "/proj/normal/file.rs";
+        let normal_path = "/proj/normal/file.rs";
 
-        let fid_s = store.upsert_file(Path::new(special_path), 1.0, "hs").unwrap();
-        let fid_n = store.upsert_file(Path::new(normal_path),  1.0, "hn").unwrap();
+        let fid_s = store
+            .upsert_file(Path::new(special_path), 1.0, "hs")
+            .unwrap();
+        let fid_n = store
+            .upsert_file(Path::new(normal_path), 1.0, "hn")
+            .unwrap();
 
         let emb = tiny_embed(&[1.0, 0.0, 0.0, 0.0]);
         store.insert_chunk(fid_s, 0, 10, 1, 5, &emb).unwrap();
@@ -1003,7 +1024,11 @@ mod tests {
             .search(&emb, 10, 0.0, Some(Path::new("/proj/[module]")))
             .unwrap();
 
-        assert_eq!(results.len(), 1, "path filter with '[' should return exactly 1 result");
+        assert_eq!(
+            results.len(),
+            1,
+            "path filter with '[' should return exactly 1 result"
+        );
         assert_eq!(results[0].path, Path::new(special_path));
     }
 
@@ -1065,7 +1090,10 @@ mod tests {
         // fails because the path already exists but is not a directory.
         // Store::open calls create_dir_all on the parent, so this must Err.
         let result = Store::open(Path::new("/dev/null/vec.db"), false);
-        assert!(result.is_err(), "Store::open under /dev/null should return Err");
+        assert!(
+            result.is_err(),
+            "Store::open under /dev/null should return Err"
+        );
     }
 
     // --- Integration test: full pipeline with stub ---
@@ -1107,9 +1135,9 @@ mod tests {
             &mut store,
             &mut embedder,
             &cfg,
-            false,          // not full
-            None,           // no path filter
-            |_msg| {},      // discard progress output
+            false,     // not full
+            None,      // no path filter
+            |_msg| {}, // discard progress output
         )
         .unwrap();
 

@@ -89,14 +89,13 @@ impl Embedder {
 
         // --- Tokenizer ---
         let tokenizer_path = model_dir.join("tokenizer.json");
-        let mut tokenizer =
-            tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to load tokenizer from {}: {}",
-                    tokenizer_path.display(),
-                    e
-                )
-            })?;
+        let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to load tokenizer from {}: {}",
+                tokenizer_path.display(),
+                e
+            )
+        })?;
 
         // Configure truncation so all sequences are capped at max_tokens.
         tokenizer
@@ -140,9 +139,11 @@ impl Embedder {
                                 use tract_onnx::pb::tensor_shape_proto::dimension::Value;
                                 // Replace any symbolic expression tract can't parse with concrete.
                                 if matches!(dim.value, Some(Value::DimParam(_))) {
-                                    dim.value = Some(Value::DimValue(
-                                        if i == 0 { 1 } else { max_tokens as i64 },
-                                    ));
+                                    dim.value = Some(Value::DimValue(if i == 0 {
+                                        1
+                                    } else {
+                                        max_tokens as i64
+                                    }));
                                 }
                             }
                         }
@@ -193,8 +194,14 @@ impl Embedder {
             .context("compiling ONNX model to runnable plan")?;
 
         // Probe the actual output dimension with a single forward pass (batch=1, seq=max_tokens).
-        let dim = probe_dim(&model, has_token_type_ids, is_pre_pooled, max_tokens, &tokenizer)
-            .context("probing embedding dimension")?;
+        let dim = probe_dim(
+            &model,
+            has_token_type_ids,
+            is_pre_pooled,
+            max_tokens,
+            &tokenizer,
+        )
+        .context("probing embedding dimension")?;
 
         Ok(Self {
             dim,
@@ -276,8 +283,12 @@ fn probe_dim(
         .encode("hello", true)
         .map_err(|e| anyhow::anyhow!("probe tokenization failed: {}", e))?;
     let raw_ids = enc.get_ids();
-    let ids:  Vec<i64> = (0..seq).map(|i| raw_ids.get(i).copied().unwrap_or(0) as i64).collect();
-    let mask: Vec<i64> = (0..seq).map(|i| if i < raw_ids.len() { 1 } else { 0 }).collect();
+    let ids: Vec<i64> = (0..seq)
+        .map(|i| raw_ids.get(i).copied().unwrap_or(0) as i64)
+        .collect();
+    let mask: Vec<i64> = (0..seq)
+        .map(|i| if i < raw_ids.len() { 1 } else { 0 })
+        .collect();
     let types: Vec<i64> = vec![0; seq];
 
     let outputs = run_tract(model, has_token_type_ids, batch, seq, &ids, &mask, &types)?;
@@ -288,9 +299,13 @@ fn probe_dim(
     // sentence_embedding: [batch, dim]
     // last_hidden_state:   [batch, seq_len, dim]
     let dim = if is_pre_pooled {
-        *shape.get(1).ok_or_else(|| anyhow::anyhow!("unexpected sentence_embedding shape: {shape:?}"))?
+        *shape
+            .get(1)
+            .ok_or_else(|| anyhow::anyhow!("unexpected sentence_embedding shape: {shape:?}"))?
     } else {
-        *shape.get(2).ok_or_else(|| anyhow::anyhow!("unexpected last_hidden_state shape: {shape:?}"))?
+        *shape
+            .get(2)
+            .ok_or_else(|| anyhow::anyhow!("unexpected last_hidden_state shape: {shape:?}"))?
     };
     Ok(dim)
 }
@@ -333,8 +348,12 @@ fn embed_batch_inner(inner: &mut EmbedderInner, texts: &[&str]) -> Result<Vec<Ve
                     continue;
                 }
 
-                let ids:   Vec<i64> = (0..seq).map(|i| raw_ids.get(i).copied().unwrap_or(0) as i64).collect();
-                let mask:  Vec<i64> = (0..seq).map(|i| if i < raw_ids.len() { 1 } else { 0 }).collect();
+                let ids: Vec<i64> = (0..seq)
+                    .map(|i| raw_ids.get(i).copied().unwrap_or(0) as i64)
+                    .collect();
+                let mask: Vec<i64> = (0..seq)
+                    .map(|i| if i < raw_ids.len() { 1 } else { 0 })
+                    .collect();
                 let types: Vec<i64> = vec![0i64; seq];
 
                 let outputs = run_tract(model, *has_token_type_ids, 1, seq, &ids, &mask, &types)?;
@@ -366,27 +385,20 @@ fn run_tract(
     use tract_onnx::prelude::tract_ndarray::Array2;
 
     // Build [batch, seq_len] i64 arrays using tract's re-exported ndarray.
-    let input_ids: Tensor = Array2::<i64>::from_shape_vec(
-        (batch, seq_len),
-        ids_flat.to_vec(),
-    )
-    .context("building input_ids array")?
-    .into();
+    let input_ids: Tensor = Array2::<i64>::from_shape_vec((batch, seq_len), ids_flat.to_vec())
+        .context("building input_ids array")?
+        .into();
 
-    let attention_mask: Tensor = Array2::<i64>::from_shape_vec(
-        (batch, seq_len),
-        mask_flat.to_vec(),
-    )
-    .context("building attention_mask array")?
-    .into();
+    let attention_mask: Tensor =
+        Array2::<i64>::from_shape_vec((batch, seq_len), mask_flat.to_vec())
+            .context("building attention_mask array")?
+            .into();
 
     if has_token_type_ids {
-        let token_type_ids: Tensor = Array2::<i64>::from_shape_vec(
-            (batch, seq_len),
-            type_flat.to_vec(),
-        )
-        .context("building token_type_ids array")?
-        .into();
+        let token_type_ids: Tensor =
+            Array2::<i64>::from_shape_vec((batch, seq_len), type_flat.to_vec())
+                .context("building token_type_ids array")?
+                .into();
 
         model
             .run(tvec![
@@ -397,10 +409,7 @@ fn run_tract(
             .context("tract inference (3-input)")
     } else {
         model
-            .run(tvec![
-                input_ids.into(),
-                attention_mask.into(),
-            ])
+            .run(tvec![input_ids.into(), attention_mask.into(),])
             .context("tract inference (2-input)")
     }
 }
@@ -429,7 +438,9 @@ fn extract_embeddings(
         let emb_dim = shape.get(1).copied().unwrap_or(*dim);
         *dim = emb_dim;
         // as_slice::<f32>() returns TractResult<&[f32]> (type-checked access to raw bytes)
-        let data = out0.as_slice::<f32>().context("extracting sentence_embedding f32 data")?;
+        let data = out0
+            .as_slice::<f32>()
+            .context("extracting sentence_embedding f32 data")?;
         Ok(data
             .chunks(emb_dim)
             .map(|row| {
@@ -446,7 +457,9 @@ fn extract_embeddings(
         let emb_dim = shape.get(2).copied().unwrap_or(*dim);
         *dim = emb_dim;
 
-        let data = out0.as_slice::<f32>().context("extracting last_hidden_state f32 data")?;
+        let data = out0
+            .as_slice::<f32>()
+            .context("extracting last_hidden_state f32 data")?;
 
         let mut result = Vec::with_capacity(b);
         for bi in 0..b {
@@ -625,6 +638,9 @@ mod tests {
         let vec = result.unwrap();
         assert_eq!(vec.len(), 768);
         let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-4, "result should be a unit vector, norm={norm}");
+        assert!(
+            (norm - 1.0).abs() < 1e-4,
+            "result should be a unit vector, norm={norm}"
+        );
     }
 }

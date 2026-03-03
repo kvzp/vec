@@ -32,7 +32,11 @@ use crate::store::Store;
 // ---------------------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(name = "vec", about = "Semantic file search — find files by meaning", version)]
+#[command(
+    name = "vec",
+    about = "Semantic file search — find files by meaning",
+    version
+)]
 struct Cli {
     /// Search query (the main use case — runs a semantic search)
     query: Option<String>,
@@ -117,7 +121,15 @@ async fn main() -> Result<()> {
             // help (clap handles the no-argument case via require_equals or we
             // just print a short message).
             if let Some(query) = cli.query {
-                cmd_search(&query, cli.limit, cli.snippet, cli.path.as_deref(), cli.min_score, cfg_path).await
+                cmd_search(
+                    &query,
+                    cli.limit,
+                    cli.snippet,
+                    cli.path.as_deref(),
+                    cli.min_score,
+                    cfg_path,
+                )
+                .await
             } else {
                 // No query and no subcommand — print usage hint.
                 eprintln!("Usage: vec \"<query>\"  (or `vec --help` for all options)");
@@ -129,7 +141,9 @@ async fn main() -> Result<()> {
         }
         Some(Command::Status) => cmd_status(cfg_path).await,
         Some(Command::Serve) => crate::mcp::run_server().await,
-        Some(Command::Model { action: ModelAction::Download }) => cmd_model_download(cfg_path),
+        Some(Command::Model {
+            action: ModelAction::Download,
+        }) => cmd_model_download(cfg_path),
         Some(Command::Init { user }) => cmd_init(user),
         Some(Command::Watch) => crate::watch::run_watch(),
         Some(Command::Daemon) => cmd_daemon(cfg_path).await,
@@ -150,8 +164,8 @@ async fn cmd_search(
 ) -> Result<()> {
     let cfg = Config::load(cfg_path).context("loading config")?;
 
-    let mut store = Store::open(&cfg.database.db_path, cfg.database.wal)
-        .context("opening store")?;
+    let mut store =
+        Store::open(&cfg.database.db_path, cfg.database.wal).context("opening store")?;
 
     let limit = limit.unwrap_or(cfg.search.default_limit);
     let min_score = min_score.unwrap_or(0.0);
@@ -213,11 +227,15 @@ async fn cmd_search(
 // vec updatedb
 // ---------------------------------------------------------------------------
 
-async fn cmd_updatedb(full: bool, path_filter: Option<&std::path::Path>, cfg_path: Option<&std::path::Path>) -> Result<()> {
+async fn cmd_updatedb(
+    full: bool,
+    path_filter: Option<&std::path::Path>,
+    cfg_path: Option<&std::path::Path>,
+) -> Result<()> {
     let cfg = Config::load(cfg_path).context("loading config")?;
 
-    let mut store = Store::open(&cfg.database.db_path, cfg.database.wal)
-        .context("opening store")?;
+    let mut store =
+        Store::open(&cfg.database.db_path, cfg.database.wal).context("opening store")?;
 
     let mut embedder = load_embedder(&cfg);
 
@@ -225,14 +243,9 @@ async fn cmd_updatedb(full: bool, path_filter: Option<&std::path::Path>, cfg_pat
         anstream::eprintln!("Full re-index...");
     }
 
-    let stats = run_updatedb(
-        &mut store,
-        &mut embedder,
-        &cfg,
-        full,
-        path_filter,
-        |msg| anstream::eprintln!("{msg}"),
-    )
+    let stats = run_updatedb(&mut store, &mut embedder, &cfg, full, path_filter, |msg| {
+        anstream::eprintln!("{msg}")
+    })
     .context("running updatedb")?;
 
     println!(
@@ -255,8 +268,7 @@ async fn cmd_updatedb(full: bool, path_filter: Option<&std::path::Path>, cfg_pat
 async fn cmd_status(cfg_path: Option<&std::path::Path>) -> Result<()> {
     let cfg = Config::load(cfg_path).context("loading config")?;
 
-    let store = Store::open(&cfg.database.db_path, cfg.database.wal)
-        .context("opening store")?;
+    let store = Store::open(&cfg.database.db_path, cfg.database.wal).context("opening store")?;
 
     let (file_count, chunk_count, last_mtime) = store.stats().context("reading stats")?;
 
@@ -338,8 +350,8 @@ fn cmd_init(user: bool) -> Result<()> {
 
         let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("~"));
         let local_model_path = home.join(".local/share/vec/models");
-        let db_path          = home.join(".local/share/vec/vec.db");
-        let socket           = home.join(".local/share/vec/embed.sock");
+        let db_path = home.join(".local/share/vec/vec.db");
+        let socket = home.join(".local/share/vec/embed.sock");
 
         // If system models exist and are readable, include them first so the
         // user doesn't have to re-download a model that's already on the machine.
@@ -355,7 +367,7 @@ fn cmd_init(user: bool) -> Result<()> {
         };
 
         print!(
-r#"# vec userland config — no root required
+            r#"# vec userland config — no root required
 # Install: mkdir -p ~/.config/vec && vec init --user > ~/.config/vec/config.toml
 # Use:     vec --config ~/.config/vec/config.toml "your query"
 
@@ -381,15 +393,16 @@ include_paths = ["{home}"]
 db_path = "{db_path}"
 # wal = true
 "#,
-            home              = home.display(),
+            home = home.display(),
             model_search_path = model_search_path,
-            db_path           = db_path.display(),
-            socket            = socket.display(),
+            db_path = db_path.display(),
+            socket = socket.display(),
         );
     } else {
         // Print a starter /etc/vec.conf to stdout.
         // Usage: vec init | sudo tee /etc/vec.conf
-        print!(r#"# /etc/vec.conf — system-wide vec configuration
+        print!(
+            r#"# /etc/vec.conf — system-wide vec configuration
 # Install: vec init | sudo tee /etc/vec.conf
 # All values shown are compiled-in defaults; uncomment and change as needed.
 
@@ -425,7 +438,8 @@ db_path = "{db_path}"
 [database]
 # db_path = "/var/lib/vec/vec.db"
 # wal     = true
-"#);
+"#
+        );
     }
     Ok(())
 }
@@ -442,12 +456,9 @@ async fn cmd_daemon(cfg_path: Option<&std::path::Path>) -> Result<()> {
         .resolve_model_path()
         .context("resolving model path for daemon")?;
 
-    anstream::eprintln!(
-        "Loading model from {} …",
-        model_path.display()
-    );
-    let embedder = Embedder::load(&model_path, cfg.embed.max_tokens)
-        .context("loading embedding model")?;
+    anstream::eprintln!("Loading model from {} …", model_path.display());
+    let embedder =
+        Embedder::load(&model_path, cfg.embed.max_tokens).context("loading embedding model")?;
 
     #[cfg(unix)]
     return crate::daemon::run_daemon(embedder, &cfg.embed.daemon_socket);
@@ -525,19 +536,17 @@ fn try_daemon_embed(socket_path: &std::path::Path, text: &str) -> Option<Vec<f32
 /// embedder (dim=768) and prints a warning to stderr.
 pub(crate) fn load_embedder(cfg: &Config) -> Embedder {
     match cfg.resolve_model_path() {
-        Ok(model_path) => {
-            match Embedder::load(&model_path, cfg.embed.max_tokens) {
-                Ok(e) => return e,
-                Err(err) => {
-                    anstream::eprintln!(
-                        "warn: could not load model at {}: {:?}\n\
+        Ok(model_path) => match Embedder::load(&model_path, cfg.embed.max_tokens) {
+            Ok(e) => return e,
+            Err(err) => {
+                anstream::eprintln!(
+                    "warn: could not load model at {}: {:?}\n\
                          Falling back to stub embedder (not semantically meaningful).",
-                        model_path.display(),
-                        err,
-                    );
-                }
+                    model_path.display(),
+                    err,
+                );
             }
-        }
+        },
         Err(_) => {
             anstream::eprintln!(
                 "warn: model '{}' not found in search path.\n\

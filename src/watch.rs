@@ -137,8 +137,8 @@ fn index_paths(cfg: &Config, paths: &[PathBuf]) {
             &mut store,
             &mut embedder,
             cfg,
-            false,        // not a full re-index
-            Some(dir),    // scope to this directory
+            false,     // not a full re-index
+            Some(dir), // scope to this directory
             |msg| anstream::eprintln!("{msg}"),
         ) {
             Ok(stats) => {

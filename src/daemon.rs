@@ -19,13 +19,13 @@
 // so clap parses cleanly.
 
 #[cfg(unix)]
-use std::os::unix::net::{UnixListener, UnixStream};
-#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 
-use std::path::Path;
-use anyhow::{Context, Result};
 use crate::embed::Embedder;
+use anyhow::{Context, Result};
+use std::path::Path;
 
 /// Start the embedding daemon.
 ///
@@ -82,20 +82,23 @@ pub fn run_daemon(mut embedder: Embedder, socket_path: &Path) -> Result<()> {
 
 /// Handle one embed request.  Reads text, embeds it, writes response.
 #[cfg(unix)]
-pub(crate) fn handle_connection(
-    stream: &mut UnixStream,
-    embedder: &mut Embedder,
-) -> Result<()> {
+pub(crate) fn handle_connection(stream: &mut UnixStream, embedder: &mut Embedder) -> Result<()> {
     // Read text length.
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).context("reading text length")?;
+    stream
+        .read_exact(&mut len_buf)
+        .context("reading text length")?;
     let text_len = u32::from_le_bytes(len_buf) as usize;
 
     // Guard against absurdly large requests (>= 1 MiB).
     if text_len > 1_048_576 {
         let msg = b"request too large";
-        stream.write_all(&1u32.to_le_bytes()).context("writing error status")?;
-        stream.write_all(&(msg.len() as u32).to_le_bytes()).context("writing error len")?;
+        stream
+            .write_all(&1u32.to_le_bytes())
+            .context("writing error status")?;
+        stream
+            .write_all(&(msg.len() as u32).to_le_bytes())
+            .context("writing error len")?;
         stream.write_all(msg).context("writing error body")?;
         return Ok(());
     }
@@ -118,7 +121,9 @@ pub(crate) fn handle_connection(
     };
 
     // Write response.
-    stream.write_all(&status.to_le_bytes()).context("writing status")?;
+    stream
+        .write_all(&status.to_le_bytes())
+        .context("writing status")?;
     stream
         .write_all(&(data.len() as u32).to_le_bytes())
         .context("writing data length")?;
@@ -135,9 +140,9 @@ pub(crate) fn handle_connection(
 #[cfg(unix)]
 mod tests {
     use super::*;
+    use crate::store::unpack_f32;
     use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
-    use crate::store::unpack_f32;
 
     /// Spin up a stub embedder on a temp socket, send one request, check response.
     #[test]
@@ -157,7 +162,9 @@ mod tests {
         // Connect and send a request.
         let mut client = UnixStream::connect(&socket_path).unwrap();
         let text = b"hello daemon";
-        client.write_all(&(text.len() as u32).to_le_bytes()).unwrap();
+        client
+            .write_all(&(text.len() as u32).to_le_bytes())
+            .unwrap();
         client.write_all(text).unwrap();
 
         // Read response.

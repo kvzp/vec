@@ -32,7 +32,10 @@ mod tests {
     fn readable_file_returns_true() {
         // Create a real temp file — the current process can definitely read it.
         let tmp = tempfile::NamedTempFile::new().expect("create temp file");
-        assert!(can_read(tmp.path()), "should be able to read a just-created temp file");
+        assert!(
+            can_read(tmp.path()),
+            "should be able to read a just-created temp file"
+        );
     }
 
     #[test]

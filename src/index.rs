@@ -172,7 +172,9 @@ pub fn chunk_file(content: &str, _cfg: &IndexConfig) -> Vec<Chunk> {
         //
         // Preference: find the nearest matching line that is still ≥
         // chunk_start_line + 1 (we need at least one line in the chunk).
-        let scan_lo = tentative_end.saturating_sub(BOUNDARY_SCAN).max(chunk_start_line + 1);
+        let scan_lo = tentative_end
+            .saturating_sub(BOUNDARY_SCAN)
+            .max(chunk_start_line + 1);
         let scan_hi = (tentative_end + BOUNDARY_SCAN).min(total_lines);
 
         // Find the boundary-pattern line closest to tentative_end in [scan_lo, scan_hi).
@@ -544,10 +546,7 @@ pub fn run_updatedb(
 
         // ---- exclude_files glob check ----
         // Match against the bare filename (not the full path).
-        let filename = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if icfg
             .exclude_files
             .iter()
@@ -698,7 +697,11 @@ mod tests {
         // 3 non-blank lines → below MIN_CHUNK_LINES → no chunks
         let content = "a\nb\nc\n";
         let chunks = chunk_file(content, &test_icfg());
-        assert!(chunks.is_empty(), "expected no chunks, got {}", chunks.len());
+        assert!(
+            chunks.is_empty(),
+            "expected no chunks, got {}",
+            chunks.len()
+        );
     }
 
     #[test]
@@ -903,9 +906,12 @@ mod tests {
         let mut f = std::fs::File::create(&bin_path).unwrap();
         // Write a null byte sequence that is valid binary but not valid UTF-8.
         // Size must be above min_file_size (0 in test cfg) but below max_file_size.
-        f.write_all(&[0u8, 1, 2, 3, 0xFF, 0xFE, 0xFD, 200, 201, 202, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                      0xFF, 0xFE, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                      0xFF, 0xFE, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        f.write_all(&[
+            0u8, 1, 2, 3, 0xFF, 0xFE, 0xFD, 200, 201, 202, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF,
+            0xFE, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFE, 0, 1, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ])
+        .unwrap();
 
         let cfg = test_cfg_for_dir(&dir);
         let (_db_file, mut store) = open_temp_db();
@@ -965,15 +971,8 @@ mod tests {
         let mut embedder = crate::embed::Embedder::stub(768);
 
         // Only index files under sub_a.
-        let stats = run_updatedb(
-            &mut store,
-            &mut embedder,
-            &cfg,
-            false,
-            Some(&sub_a),
-            |_| {},
-        )
-        .unwrap();
+        let stats =
+            run_updatedb(&mut store, &mut embedder, &cfg, false, Some(&sub_a), |_| {}).unwrap();
 
         assert!(
             stats.files_updated >= 1,
@@ -1015,7 +1014,10 @@ mod tests {
         let lines: Vec<String> = (0..10).map(|i| format!("line {i}")).collect();
         let content = lines.join("\n"); // no trailing newline
         let chunks = chunk_file(&content, &test_icfg());
-        assert!(!chunks.is_empty(), "file without trailing newline should produce chunks");
+        assert!(
+            !chunks.is_empty(),
+            "file without trailing newline should produce chunks"
+        );
         for chunk in &chunks {
             assert!(
                 chunk.byte_end <= content.len(),
@@ -1071,8 +1073,14 @@ mod tests {
             "symlink must not be indexed: expected 1 file, got {}",
             stats.files_updated
         );
-        assert!(store.get_file(&real_file).unwrap().is_some(), "real file must be in store");
-        assert!(store.get_file(&link_file).unwrap().is_none(), "symlink must not be in store");
+        assert!(
+            store.get_file(&real_file).unwrap().is_some(),
+            "real file must be in store"
+        );
+        assert!(
+            store.get_file(&link_file).unwrap().is_none(),
+            "symlink must not be in store"
+        );
     }
 
     #[cfg(unix)]
@@ -1089,10 +1097,7 @@ mod tests {
 
         // If we can still enter the directory (running as root), restore and skip.
         if std::fs::read_dir(&unreadable).is_ok() {
-            let _ = std::fs::set_permissions(
-                &unreadable,
-                std::fs::Permissions::from_mode(0o755),
-            );
+            let _ = std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755));
             return;
         }
 
@@ -1103,10 +1108,7 @@ mod tests {
         let result = run_updatedb(&mut store, &mut embedder, &cfg, false, None, |_| {});
 
         // Restore permissions before asserting so TempDir can clean up.
-        let _ = std::fs::set_permissions(
-            &unreadable,
-            std::fs::Permissions::from_mode(0o755),
-        );
+        let _ = std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755));
 
         assert!(
             result.is_ok(),

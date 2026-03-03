@@ -113,9 +113,7 @@ fn default_config() -> Config {
             model: "gte-multilingual-base".into(),
             // System-only model path. Models are installed by the vec-model-*
             // package into /usr/share/vec/models — never in user home dirs.
-            model_search_path: vec![
-                PathBuf::from("/usr/share/vec/models"),
-            ],
+            model_search_path: vec![PathBuf::from("/usr/share/vec/models")],
             batch_size: 16,
             max_tokens: 128,
             daemon_socket: PathBuf::from("/run/vec/embed.sock"),
@@ -548,7 +546,11 @@ default_limit = 5
         //
         // At the same time, Config::load(None) must succeed on any machine.
         let result = Config::load(None);
-        assert!(result.is_ok(), "Config::load(None) must succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Config::load(None) must succeed: {:?}",
+            result.err()
+        );
 
         // Confirm the user-config path is not in the load function by ensuring
         // we can load when passing a non-existent path as extra (error is

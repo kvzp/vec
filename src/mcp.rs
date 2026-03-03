@@ -19,12 +19,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use rmcp::{
-    ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::tool::{Parameters, ToolRouter},
-    model::{
-        CallToolResult, Content, ServerCapabilities, ServerInfo,
-    },
-    schemars, tool, tool_router,
+    model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
+    schemars, tool, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
 
@@ -110,7 +107,9 @@ pub struct VecServer {
 #[tool_router]
 impl VecServer {
     /// Search indexed files by semantic meaning.
-    #[tool(description = "Search files by semantic meaning using vector embeddings. Returns file paths, line numbers, and optional snippets ranked by relevance.")]
+    #[tool(
+        description = "Search files by semantic meaning using vector embeddings. Returns file paths, line numbers, and optional snippets ranked by relevance."
+    )]
     fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
@@ -124,7 +123,10 @@ impl VecServer {
         // Load embedder (stub fallback if model not ready).
         let mut embedder = load_embedder_for_mcp(cfg);
 
-        let limit = params.limit.map(|l| l as usize).unwrap_or(cfg.search.default_limit);
+        let limit = params
+            .limit
+            .map(|l| l as usize)
+            .unwrap_or(cfg.search.default_limit);
         let min_score = params.min_score.unwrap_or(0.0);
         let path_filter = params.path_filter.as_deref().map(std::path::Path::new);
 
@@ -167,7 +169,9 @@ impl VecServer {
     }
 
     /// Get source lines around a specific file location.
-    #[tool(description = "Return a window of source lines centred on a given line in a file. Useful for reading context around a search result.")]
+    #[tool(
+        description = "Return a window of source lines centred on a given line in a file. Useful for reading context around a search result."
+    )]
     fn context(
         &self,
         Parameters(params): Parameters<ContextParams>,
@@ -184,13 +188,9 @@ impl VecServer {
             ));
         }
 
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| {
-                McpError::internal_error(
-                    format!("Could not read {}: {e}", params.file_path),
-                    None,
-                )
-            })?;
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            McpError::internal_error(format!("Could not read {}: {e}", params.file_path), None)
+        })?;
 
         let lines: Vec<&str> = content.lines().collect();
         let total = lines.len();
@@ -215,7 +215,9 @@ impl VecServer {
     }
 
     /// Return index statistics (file count, chunk count, model info).
-    #[tool(description = "Return statistics about the vec index: number of files, chunks, database path, and configured model.")]
+    #[tool(
+        description = "Return statistics about the vec index: number of files, chunks, database path, and configured model."
+    )]
     fn index_status(
         &self,
         Parameters(_params): Parameters<IndexStatusParams>,
