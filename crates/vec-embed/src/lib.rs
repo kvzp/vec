@@ -410,25 +410,28 @@ fn embed_batch_inner(inner: &EmbedderInner, texts: &[&str]) -> Result<Vec<Vec<f3
             if texts.is_empty() {
                 return Ok(vec![]);
             }
-            // Send individual HTTP requests in parallel using scoped threads.
-            // Ollama handles concurrency server-side — this avoids batch
-            // context-length issues and maximizes GPU utilization.
-            let results: Vec<Result<Vec<f32>>> = std::thread::scope(|s| {
-                let handles: Vec<_> = texts
-                    .iter()
-                    .map(|&text| {
-                        s.spawn(|| {
-                            let mut vecs = http_embed_request(url, model, &[text])?;
-                            vecs.pop()
-                                .ok_or_else(|| anyhow::anyhow!("HTTP embed returned empty result"))
-                        })
-                    })
-                    .collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            });
+            // Send individual HTTP requests with limited concurrency to avoid
+            // overwhelming Ollama (connection resets at high parallelism).
+            const MAX_CONCURRENT: usize = 4;
             let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
-            for r in results {
-                embeddings.push(r?);
+
+            for chunk in texts.chunks(MAX_CONCURRENT) {
+                let results: Vec<Result<Vec<f32>>> = std::thread::scope(|s| {
+                    let handles: Vec<_> = chunk
+                        .iter()
+                        .map(|&text| {
+                            s.spawn(|| {
+                                let mut vecs = http_embed_request(url, model, &[text])?;
+                                vecs.pop()
+                                    .ok_or_else(|| anyhow::anyhow!("HTTP embed returned empty"))
+                            })
+                        })
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                });
+                for r in results {
+                    embeddings.push(r?);
+                }
             }
             // Normalise all vectors to unit length (Ollama doesn't always do this).
             for v in &mut embeddings {
