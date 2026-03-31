@@ -252,51 +252,9 @@ No external service. No network calls. Text never leaves the process.
 
 ---
 
-## MCP Integration (Claude Code / AI Assistants)
+## AI Assistant Integration
 
-`vec serve` starts an MCP server so AI assistants can call semantic search mid-session.
-
-Add to `~/.claude.json`:
-
-```json
-{
-  "mcpServers": {
-    "vec": {
-      "command": "vec",
-      "args": ["serve"]
-    }
-  }
-}
-```
-
-See [MCP.md](MCP.md) for Cursor, Continue, and other MCP clients.
-
-Exposed tools: `search`, `context`, `index_status`.
-
-### Claude Code Skill (lightweight alternative)
-
-A `/vec` skill is included in `.claude/skills/vec/`. It invokes `vec` directly via the CLI — no MCP server process needed. Lower token overhead for simple search workflows.
-
-Copy it to your project or personal skills directory:
-
-```bash
-# Per-project
-cp -r .claude/skills/vec /path/to/your/project/.claude/skills/
-
-# Global (all projects)
-cp -r .claude/skills/vec ~/.claude/skills/
-```
-
-Then use `/vec "authentication middleware"` in Claude Code.
-
-**When to use which:**
-
-| | MCP (`vec serve`) | Skill (`/vec`) |
-|--|--|--|
-| Token cost | Higher (schema always in context) | Lower (loaded on demand) |
-| Multi-step agent loops | Better (programmatic tool calls) | Manual |
-| Setup | Config in `~/.claude.json` | Copy skill directory |
-| Requires running process | Yes | No |
+vec integrates with Claude Code and other AI assistants via two methods: **MCP server** and **Claude Code skill**. See [MCP.md](MCP.md) for full setup details, including how to make Claude use vec autonomously.
 
 ---
 
