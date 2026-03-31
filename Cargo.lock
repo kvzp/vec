@@ -2646,6 +2646,7 @@ dependencies = [
  "ndarray 0.17.2",
  "prost",
  "rayon",
+ "serde_json",
  "sha2",
  "tempfile",
  "tokenizers",

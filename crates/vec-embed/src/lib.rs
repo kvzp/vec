@@ -67,6 +67,13 @@ enum EmbedderInner {
         is_pre_pooled: bool,
     },
 
+    /// HTTP embedding backend (Ollama / OpenAI-compatible).
+    Http {
+        url: String,
+        model: String,
+        dim: usize,
+    },
+
     /// Stub: deterministic random unit vectors derived from text hashes.
     Stub { dim: usize },
 }
@@ -231,6 +238,34 @@ impl Embedder {
         }
     }
 
+    /// Create an HTTP embedder that calls an Ollama-compatible API.
+    ///
+    /// Probes the endpoint once to determine the embedding dimension.
+    pub fn http(url: &str, model: &str) -> Result<Self> {
+        // Probe dimension with a test request.
+        let probe = http_embed_request(url, model, &["hello"])?;
+        let dim = probe.first()
+            .ok_or_else(|| anyhow::anyhow!("HTTP embed probe returned empty result"))?
+            .len();
+
+        Ok(Self {
+            inner: Box::new(EmbedderInner::Http {
+                url: url.to_string(),
+                model: model.to_string(),
+                dim,
+            }),
+        })
+    }
+
+    /// Return the model name for metadata (used by store to detect model changes).
+    pub fn model_name(&self) -> &str {
+        match self.inner.as_ref() {
+            EmbedderInner::Tract { .. } => "tract-onnx",
+            EmbedderInner::Http { model, .. } => model,
+            EmbedderInner::Stub { .. } => "stub",
+        }
+    }
+
     /// Embed a batch of texts and return one unit-normalised vector per text.
     ///
     /// The returned `Vec` has the same length as `texts`; each inner `Vec<f32>`
@@ -371,7 +406,149 @@ fn embed_batch_inner(inner: &EmbedderInner, texts: &[&str]) -> Result<Vec<Vec<f3
             // Propagate the first error, if any.
             results.into_iter().collect()
         }
+        EmbedderInner::Http { url, model, dim } => {
+            if texts.is_empty() {
+                return Ok(vec![]);
+            }
+            let mut embeddings = http_embed_request(url, model, texts)?;
+            // Normalise all vectors to unit length (Ollama doesn't always do this).
+            for v in &mut embeddings {
+                normalise(v);
+                // Verify dimension matches what we probed.
+                if v.len() != *dim {
+                    anyhow::bail!(
+                        "HTTP embedding dimension mismatch: expected {}, got {}",
+                        dim,
+                        v.len()
+                    );
+                }
+            }
+            Ok(embeddings)
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP embedding (Ollama / OpenAI-compatible)
+// ---------------------------------------------------------------------------
+
+/// Call an Ollama-compatible `/api/embed` endpoint.
+///
+/// Sends a batch of texts and returns one embedding vector per text.
+fn http_embed_request(url: &str, model: &str, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    // Parse URL to extract host:port and path.
+    let url_str = if url.ends_with('/') { &url[..url.len() - 1] } else { url };
+    let without_scheme = url_str
+        .strip_prefix("http://")
+        .ok_or_else(|| anyhow::anyhow!("embed URL must start with http://: {url}"))?;
+    let (host_port, _) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    let api_path = "/api/embed";
+
+    // Build JSON body.
+    let input: Vec<&str> = texts.to_vec();
+    let body = serde_json::json!({
+        "model": model,
+        "input": input,
+    })
+    .to_string();
+
+    // Raw HTTP POST (no external HTTP crate dependency).
+    let mut stream = TcpStream::connect(host_port)
+        .with_context(|| format!("connecting to embed endpoint {host_port}"))?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(300)))
+        .ok();
+
+    let request = format!(
+        "POST {api_path} HTTP/1.1\r\n\
+         Host: {host_port}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes())?;
+
+    // Read response.
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+
+    // Split headers from body.
+    let header_end = response
+        .find("\r\n\r\n")
+        .map(|i| (i, i + 4))
+        .or_else(|| response.find("\n\n").map(|i| (i, i + 2)))
+        .ok_or_else(|| anyhow::anyhow!("malformed HTTP response from embed endpoint"))?;
+    let headers = &response[..header_end.0];
+    let raw_body = &response[header_end.1..];
+
+    // Handle chunked transfer encoding: strip chunk-size lines.
+    let json_body = if headers.to_lowercase().contains("transfer-encoding: chunked") {
+        decode_chunked(raw_body)
+    } else {
+        raw_body.to_string()
+    };
+
+    // Parse Ollama response: {"embeddings": [[f32, ...], ...]}
+    let parsed: serde_json::Value = serde_json::from_str(&json_body)
+        .with_context(|| format!("parsing embed response JSON"))?;
+
+    let embeddings = parsed
+        .get("embeddings")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("embed response missing 'embeddings' array"))?;
+
+    let mut result = Vec::with_capacity(embeddings.len());
+    for emb in embeddings {
+        let vec: Vec<f32> = emb
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("embedding is not an array"))?
+            .iter()
+            .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+            .collect();
+        result.push(vec);
+    }
+
+    Ok(result)
+}
+
+/// Decode an HTTP chunked transfer-encoded body.
+///
+/// Format: each chunk is `<hex-length>\r\n<data>\r\n`, terminated by `0\r\n\r\n`.
+fn decode_chunked(raw: &str) -> String {
+    let mut result = String::new();
+    let mut remaining = raw;
+    loop {
+        // Skip leading whitespace/newlines.
+        remaining = remaining.trim_start();
+        if remaining.is_empty() {
+            break;
+        }
+        // Read the hex chunk size.
+        let size_end = remaining.find('\r').or_else(|| remaining.find('\n')).unwrap_or(remaining.len());
+        let size_str = remaining[..size_end].trim();
+        let size = usize::from_str_radix(size_str, 16).unwrap_or(0);
+        if size == 0 {
+            break;
+        }
+        // Skip past the size line.
+        remaining = &remaining[size_end..];
+        if remaining.starts_with("\r\n") {
+            remaining = &remaining[2..];
+        } else if remaining.starts_with('\n') {
+            remaining = &remaining[1..];
+        }
+        // Take `size` bytes of data.
+        let chunk_end = size.min(remaining.len());
+        result.push_str(&remaining[..chunk_end]);
+        remaining = &remaining[chunk_end..];
+    }
+    result
 }
 
 /// Build tract tensors and run the model, returning the raw TVec<TValue> outputs.
