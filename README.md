@@ -282,7 +282,7 @@ Embeddings run in-process on CPU via tract-onnx. Install a model package:
 |---------|-------|------|-----------|
 | `vec-model-base` | `gte-multilingual-base` | ~90 MB | 50+ |
 
-No external service. No network calls. Text never leaves the process.
+No external service. No network calls. Text never leaves the process — unless you explicitly configure `backend = "ollama"`, in which case text is sent to your Ollama endpoint for embedding.
 
 ---
 

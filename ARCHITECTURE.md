@@ -117,7 +117,7 @@ No `content` column. Text is always read from `path` at `byte_offset..byte_end` 
 
 ## Embedding Backend
 
-`vec` runs ONNX models in-process via `tract-onnx` — pure Rust, no C deps, no system libs, no network calls. Text never leaves the process.
+`vec` runs ONNX models in-process via `tract-onnx` — pure Rust, no C deps, no system libs, no network calls. Text never leaves the process. **Exception:** when `backend = "ollama"` is configured, text chunks are sent to the configured Ollama endpoint for embedding. This is an explicit opt-in — the default backend (`onnx`) makes zero network calls.
 
 ```toml
 [embed]

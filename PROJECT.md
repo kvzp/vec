@@ -210,7 +210,7 @@ vec/
 
 ## Embedding Backend
 
-Runs ONNX models in-process via `tract-onnx` (pure Rust, no C deps, no system libs, no network calls). Text never leaves the process.
+Runs ONNX models in-process via `tract-onnx` (pure Rust, no C deps, no system libs, no network calls). Text never leaves the process — unless `backend = "ollama"` is explicitly configured.
 
 | Package | Model | Size | Languages |
 |---------|-------|------|-----------|

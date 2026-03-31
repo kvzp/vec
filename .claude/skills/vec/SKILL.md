@@ -62,7 +62,7 @@ vec status
 
 - vec searches the **pre-built index** — if files were just created, they may not appear until the next `vec updatedb` or the watcher picks them up
 - The query is natural language — write what you mean, not keywords
-- vec never sends data over the network — all embedding runs locally
+- vec never sends data over the network by default — unless `backend = "ollama"` is configured, in which case text is sent to the Ollama endpoint
 
 ## Responding to the user
 
