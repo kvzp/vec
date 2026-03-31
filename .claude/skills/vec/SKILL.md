@@ -11,10 +11,10 @@ You have access to `vec`, a semantic search tool that finds files by meaning usi
 
 ## How to search
 
-Run `vec` directly via Bash. The output is `file:line` paths, one per line — pipe-friendly.
+Run `vec` directly via Bash. The output is `file:line (score)` per line — pipe-friendly, with relevance score always visible.
 
 ```bash
-# Basic search (default: 10 results, paths only — lightweight)
+# Basic search (default: 10 results)
 vec "authentication middleware"
 
 # Limit results
@@ -35,7 +35,7 @@ vec auto-detects `~/.config/vec/config.toml` for userland installs. No `--config
 
 Instead, follow this two-step approach:
 
-1. **Search without --snippet** — get ranked `file:line` paths (minimal tokens)
+1. **Search without --snippet** — get ranked `file:line (score)` lines (minimal tokens)
 2. **Read only the interesting results** — use the Read tool with offset/limit to view just the relevant lines
 
 This way you only load code you actually need into context.
