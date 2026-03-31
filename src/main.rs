@@ -49,6 +49,10 @@ struct Cli {
     #[arg(long)]
     snippet: bool,
 
+    /// Show cosine similarity score alongside each result
+    #[arg(long)]
+    score: bool,
+
     /// Restrict search to this path prefix
     #[arg(long)]
     path: Option<PathBuf>,
@@ -125,6 +129,7 @@ async fn main() -> Result<()> {
                     &query,
                     cli.limit,
                     cli.snippet,
+                    cli.score,
                     cli.path.as_deref(),
                     cli.min_score,
                     cfg_path,
@@ -158,6 +163,7 @@ async fn cmd_search(
     query: &str,
     limit: Option<usize>,
     show_snippet: bool,
+    show_score: bool,
     path_filter: Option<&std::path::Path>,
     min_score: Option<f32>,
     cfg_path: Option<&std::path::Path>,
@@ -203,7 +209,11 @@ async fn cmd_search(
             // precise file:line reference.
             let best = best_line_in_chunk(result, &query_words)
                 .unwrap_or(result.start_line);
-            println!("{}:{}", result.path.display(), best);
+            if show_score {
+                println!("{}:{} (score: {:.3})", result.path.display(), best, result.score);
+            } else {
+                println!("{}:{}", result.path.display(), best);
+            }
         } else {
             // Read the file and show snippet_lines around the best line.
             let best = best_line_in_chunk(result, &query_words)
