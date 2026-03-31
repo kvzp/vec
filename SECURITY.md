@@ -77,6 +77,8 @@ Files matching these patterns are never indexed — no embedding, no entry in th
 
 Embeddings run in-process via `tract-onnx` — pure Rust, no network calls, no external service. Text never leaves the process. The ONNX model is loaded from a local file at startup; no runtime download.
 
+**Exception:** when `[embed] backend = "ollama"` is explicitly configured, text chunks are sent over HTTP to the configured Ollama endpoint for embedding. This is opt-in — the default backend (`onnx`) makes zero network calls. If using Ollama, ensure the endpoint is on a trusted network.
+
 ---
 
 ## Threat Model
