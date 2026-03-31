@@ -3,7 +3,7 @@
 ## Usability
 
 - [x] **Auto-detect userland config** — `~/.config/vec/config.toml` is now loaded automatically after `/etc/vec.conf` (userland overrides system). `--config` flag still works as highest priority override.
-- [x] **Add `--score` flag** — `vec "query" --score` appends `(score: 0.XXX)` to each `file:line` result without the overhead of `--snippet`.
+- [x] **Show scores by default** — every result now shows `file:line (score: 0.XXX)` without needing any flag.
 
 ## Performance
 

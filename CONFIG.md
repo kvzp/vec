@@ -122,7 +122,7 @@ These are always excluded regardless of config:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `default_limit` | integer | `10` | Results returned when `--limit` is not specified |
-| `snippet_lines` | integer | `6` | Lines of context shown per result with `--snippet` |
+| `snippet_lines` | integer | `3` | Lines of context above and below the best-matching line shown with `--snippet` (±N, so 3 means 7 lines total) |
 
 ---
 

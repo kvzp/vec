@@ -188,20 +188,25 @@ vec init | sudo tee /etc/vec.conf   # write default config
 
 ## Output
 
-Plain `file:line` by default — pipe-friendly:
+`file:line (score)` by default — pipe-friendly, with relevance score always visible:
 
 ```
-/home/user/projects/backend/src/auth/middleware.rs:12
-/home/user/projects/backend/src/auth/jwt.rs:1
-/home/user/projects/frontend/src/hooks/useAuth.ts:34
+/home/user/projects/backend/src/auth/middleware.rs:42 (score: 0.943)
+/home/user/projects/backend/src/auth/jwt.rs:17 (score: 0.891)
+/home/user/projects/frontend/src/hooks/useAuth.ts:34 (score: 0.823)
 ```
 
-With `--snippet`:
+With `--snippet` — adds ±3 lines of context around the best-matching line:
 
 ```
-/home/user/projects/backend/src/auth/middleware.rs:12 (score: 0.943)
-    pub fn verify_token(req: &Request) -> Result<Claims, AuthError> {
-        let token = req.headers().get("Authorization")
+/home/user/projects/backend/src/auth/middleware.rs:42 (score: 0.943)
+    39: impl AuthMiddleware {
+    40:     pub fn new(secret: &str) -> Self {
+    41:         Self { secret: secret.to_string() }
+>   42:     pub fn verify_token(req: &Request) -> Result<Claims, AuthError> {
+    43:         let token = req.headers().get("Authorization")
+    44:             .ok_or(AuthError::MissingToken)?;
+    45:         decode_jwt(token, &self.secret)
 ```
 
 Works with `fzf`:

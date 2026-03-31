@@ -66,24 +66,25 @@ vec status
 
 ## Output
 
-Plain file paths by default — pipe-friendly, just like `locate`:
+`file:line (score)` by default — pipe-friendly, with relevance score always visible:
 
 ```
-/home/user/projects/backend/src/auth/middleware.rs:12
-/home/user/projects/backend/src/auth/jwt.rs:1
-/home/user/projects/frontend/src/hooks/useAuth.ts:34
-/home/user/projects/shared/lib/permissions.rs:88
+/home/user/projects/backend/src/auth/middleware.rs:42 (score: 0.943)
+/home/user/projects/backend/src/auth/jwt.rs:17 (score: 0.891)
+/home/user/projects/frontend/src/hooks/useAuth.ts:34 (score: 0.823)
+/home/user/projects/shared/lib/permissions.rs:88 (score: 0.798)
 ```
 
-With `--snippet`:
+With `--snippet` — adds ±3 lines of context around the best-matching line:
 
 ```
-/home/user/projects/backend/src/auth/middleware.rs:12 (score: 0.943)
-    pub fn verify_token(req: &Request) -> Result<Claims, AuthError> {
-        let token = req.headers().get("Authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .ok_or(AuthError::Missing)?;
+/home/user/projects/backend/src/auth/middleware.rs:42 (score: 0.943)
+    39: impl AuthMiddleware {
+    40:     pub fn new(secret: &str) -> Self {
+>   42:     pub fn verify_token(req: &Request) -> Result<Claims, AuthError> {
+    43:         let token = req.headers().get("Authorization")
+    44:             .and_then(|v| v.to_str().ok())
+    45:             .ok_or(AuthError::Missing)?;
 ```
 
 ---
