@@ -128,6 +128,12 @@ impl Embedder {
 
         // Clear symbolic dim_params on every graph input; supply concrete values instead.
         // ONNX shape: dim_value = 0 means dynamic; we set batch=1, seq=max_tokens.
+        //
+        // Also clear graph.value_info entirely: intermediate tensors may contain
+        // symbolic expressions like `Min(65536, sequence_length)` that tract's TDim
+        // parser cannot handle (it only supports simple names and arithmetic).
+        // Removing value_info is safe — tract infers all intermediate shapes from
+        // the input facts we supply below.
         if let Some(graph) = proto.graph.as_mut() {
             for input in graph.input.iter_mut() {
                 if let Some(type_proto) = input.r#type.as_mut() {
@@ -150,6 +156,11 @@ impl Embedder {
                     }
                 }
             }
+
+            // Strip intermediate shape annotations that may contain unparseable
+            // symbolic expressions (e.g. `Min(65536, sequence_length)` in rotary
+            // embedding nodes).  tract derives these shapes from input facts.
+            graph.value_info.clear();
         }
 
         let patched = proto.encode_to_vec();
