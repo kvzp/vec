@@ -532,6 +532,25 @@ impl Store {
 
     /// Remove rows from `files` (and their chunks, via CASCADE) for files
     /// that no longer exist on disk. Returns the number of files removed.
+    /// Return paths of indexed files that no longer exist on disk.
+    pub fn get_missing_file_paths(&self) -> Result<Vec<std::path::PathBuf>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM files")
+            .context("preparing file list query")?;
+        let paths: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .context("listing files")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("reading file list")?;
+
+        Ok(paths
+            .into_iter()
+            .filter(|p| !Path::new(p).exists())
+            .map(std::path::PathBuf::from)
+            .collect())
+    }
+
     pub fn delete_missing_files(&mut self) -> Result<usize> {
         let paths: Vec<(i64, String)> = {
             let mut stmt = self
@@ -597,8 +616,50 @@ impl Store {
         Ok((file_count, chunk_count, last_mtime))
     }
 
+    /// Return the stored embedding for the chunk that covers `line` in `path`.
+    ///
+    /// Returns `None` if no chunk covers that line.
+    pub fn get_chunk_embedding_at(&self, path: &Path, line: usize) -> Result<Option<Vec<f32>>> {
+        let sql = "SELECT c.embedding FROM chunks c
+                   JOIN files f ON c.file_id = f.id
+                   WHERE f.path = ?1 AND c.start_line <= ?2 AND c.end_line >= ?2
+                   LIMIT 1";
+        let result: Option<Vec<u8>> = self
+            .conn
+            .query_row(sql, params![path.to_string_lossy().as_ref(), line as i64], |row| {
+                row.get(0)
+            })
+            .optional()
+            .context("looking up chunk embedding")?;
+        Ok(result.map(|blob| unpack_f32(&blob)))
+    }
+
+    /// Return all chunks that cover a given line in a file.
+    pub fn get_chunks_covering(&self, path: &Path, line: usize) -> Result<Vec<ChunkRecord>> {
+        let sql = "SELECT c.id, c.file_id, c.byte_offset, c.byte_end, c.start_line, c.end_line
+                   FROM chunks c JOIN files f ON c.file_id = f.id
+                   WHERE f.path = ?1 AND c.start_line <= ?2 AND c.end_line >= ?2";
+        let mut stmt = self.conn.prepare(sql).context("preparing chunks query")?;
+        let rows = stmt
+            .query_map(params![path.to_string_lossy().as_ref(), line as i64], |row| {
+                Ok(ChunkRecord {
+                    id: row.get(0)?,
+                    file_id: row.get(1)?,
+                    byte_offset: row.get::<_, i64>(2)? as usize,
+                    byte_end: row.get::<_, i64>(3)? as usize,
+                    start_line: row.get::<_, i64>(4)? as usize,
+                    end_line: row.get::<_, i64>(5)? as usize,
+                })
+            })
+            .context("querying chunks")?;
+        let mut result = Vec::new();
+        for r in rows {
+            result.push(r?);
+        }
+        Ok(result)
+    }
+
     /// Run `VACUUM` to reclaim space after large deletions.
-    #[allow(dead_code)]
     pub fn vacuum(&mut self) -> Result<()> {
         self.conn
             .execute_batch("VACUUM;")

@@ -621,6 +621,77 @@ pub fn run_updatedb(
 }
 
 // ---------------------------------------------------------------------------
+// diff_files — compare filesystem state against the index
+// ---------------------------------------------------------------------------
+
+/// Result of comparing the filesystem against the stored index.
+pub struct DiffResult {
+    pub new_files: Vec<std::path::PathBuf>,
+    pub changed_files: Vec<std::path::PathBuf>,
+    pub deleted_files: Vec<std::path::PathBuf>,
+}
+
+/// Walk configured paths and compare against the index without modifying anything.
+///
+/// Returns lists of new, changed, and deleted files.
+pub fn diff_files(store: &Store, cfg: &Config) -> Result<DiffResult> {
+    let icfg = &cfg.index;
+    let mut new_files = Vec::new();
+    let mut changed_files = Vec::new();
+
+    if icfg.include_paths.is_empty() {
+        return Ok(DiffResult { new_files, changed_files, deleted_files: Vec::new() });
+    }
+
+    let mut builder = WalkBuilder::new(&icfg.include_paths[0]);
+    for extra in icfg.include_paths.iter().skip(1) {
+        builder.add(extra);
+    }
+    builder.git_ignore(icfg.gitignore);
+    builder.git_global(false);
+    builder.git_exclude(icfg.gitignore);
+    builder.follow_links(false);
+
+    for result in builder.build() {
+        let entry = match result {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+        let path = entry.path().to_path_buf();
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let hash = {
+            let digest = Sha256::digest(content.as_bytes());
+            hex::encode(digest)
+        };
+
+        match store.get_file(&path) {
+            Ok(Some(record)) => {
+                if record.hash != hash {
+                    changed_files.push(path);
+                }
+            }
+            Ok(None) => {
+                new_files.push(path);
+            }
+            Err(_) => continue,
+        }
+    }
+
+    let deleted_files = store.get_missing_file_paths()
+        .unwrap_or_default();
+
+    Ok(DiffResult { new_files, changed_files, deleted_files })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

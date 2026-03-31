@@ -18,7 +18,8 @@ vec-index  = { path = "../vec-index" }
 vec-watch  = { path = "../vec-watch" }
 vec-daemon = { path = "../vec-daemon" }
 vec-mcp    = { path = "../vec-mcp" }
-clap       = { version = "4", features = ["derive"] }
+clap           = { version = "4", features = ["derive"] }
+clap_complete  = "4"
 tokio      = { version = "1", features = ["rt-multi-thread", "macros"] }
 anstream   = "0.6"
 anyhow     = "1"

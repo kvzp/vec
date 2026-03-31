@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use vec_core::config::Config;
 use vec_embed::Embedder;
@@ -29,21 +29,29 @@ use vec_store::Store;
     version
 )]
 struct Cli {
-    /// Search query (the main use case — runs a semantic search)
-    query: Option<String>,
+    /// Search query (the main use case — runs a semantic search).
+    /// Multiple queries are supported: results are merged and deduplicated.
+    query: Vec<String>,
 
     /// Number of results (default from config)
     #[arg(short, long)]
     limit: Option<usize>,
 
-    /// Show snippet inline with each result
+    /// Show snippet inline with each result (±3 lines around best match)
     #[arg(long)]
     snippet: bool,
 
+    /// Output results as JSON
+    #[arg(long)]
+    json: bool,
 
     /// Restrict search to this path prefix
     #[arg(long)]
     path: Option<PathBuf>,
+
+    /// Exclude results under these directories
+    #[arg(long)]
+    exclude: Vec<PathBuf>,
 
     /// Minimum cosine similarity score (0.0–1.0); results below this are suppressed
     #[arg(long)]
@@ -89,6 +97,38 @@ enum Command {
     /// embed requests over a Unix socket so interactive `vec` queries skip
     /// the expensive model-compilation step.
     Daemon,
+    /// Show source lines around a file:line location
+    Context {
+        /// file:line (e.g. src/main.rs:42)
+        file_line: String,
+        /// Lines of context above and below (default: 10)
+        #[arg(long, default_value = "10")]
+        window: usize,
+    },
+    /// Find code similar to a given file:line (uses stored embedding, no model needed)
+    Similar {
+        /// file:line (e.g. src/main.rs:42)
+        file_line: String,
+        /// Number of results
+        #[arg(short, long)]
+        limit: Option<usize>,
+    },
+    /// Interactive search — loads the model once and accepts queries in a loop
+    Repl,
+    /// Garbage collect: remove orphaned entries and compact the database
+    Gc,
+    /// Show which chunks cover a given file:line and their stats
+    Explain {
+        /// file:line (e.g. src/main.rs:42)
+        file_line: String,
+    },
+    /// Show files changed since last index (new, modified, deleted)
+    Diff,
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Subcommand)]
@@ -109,21 +149,19 @@ async fn main() -> Result<()> {
 
     match cli.command {
         None => {
-            // Default: run a search query if one was provided; otherwise print
-            // help (clap handles the no-argument case via require_equals or we
-            // just print a short message).
-            if let Some(query) = cli.query {
+            if !cli.query.is_empty() {
                 cmd_search(
-                    &query,
+                    &cli.query,
                     cli.limit,
                     cli.snippet,
+                    cli.json,
                     cli.path.as_deref(),
+                    &cli.exclude,
                     cli.min_score,
                     cfg_path,
                 )
                 .await
             } else {
-                // No query and no subcommand — print usage hint.
                 eprintln!("Usage: vec \"<query>\"  (or `vec --help` for all options)");
                 std::process::exit(1);
             }
@@ -139,6 +177,21 @@ async fn main() -> Result<()> {
         Some(Command::Init { user }) => cmd_init(user),
         Some(Command::Watch) => vec_watch::run_watch(),
         Some(Command::Daemon) => cmd_daemon(cfg_path).await,
+        Some(Command::Context { file_line, window }) => cmd_context(&file_line, window),
+        Some(Command::Similar { file_line, limit }) => cmd_similar(&file_line, limit, cfg_path),
+        Some(Command::Repl) => cmd_repl(cfg_path),
+        Some(Command::Gc) => cmd_gc(cfg_path),
+        Some(Command::Explain { file_line }) => cmd_explain(&file_line, cfg_path),
+        Some(Command::Diff) => cmd_diff(cfg_path),
+        Some(Command::Completions { shell }) => {
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "vec",
+                &mut std::io::stdout(),
+            );
+            Ok(())
+        }
     }
 }
 
@@ -147,59 +200,90 @@ async fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn cmd_search(
-    query: &str,
+    queries: &[String],
     limit: Option<usize>,
     show_snippet: bool,
+    json: bool,
     path_filter: Option<&std::path::Path>,
+    exclude: &[PathBuf],
     min_score: Option<f32>,
     cfg_path: Option<&std::path::Path>,
 ) -> Result<()> {
     let cfg = Config::load(cfg_path).context("loading config")?;
 
-    let mut store =
+    let store =
         Store::open(&cfg.database.db_path, cfg.database.wal).context("opening store")?;
 
     let limit = limit.unwrap_or(cfg.search.default_limit);
     let min_score = min_score.unwrap_or(0.0);
 
-    // Embed the query. Try the daemon socket first (avoids the expensive
-    // ONNX graph compilation step on every interactive query). Fall back to
-    // loading the model in-process if the daemon is not running.
-    let _ = &mut store; // suppress "unused mut" if model check is skipped
-    let embedding = embed_query(&cfg, query).context("embedding query")?;
+    // Embed and search each query, merge results (dedup by path+start_line, keep highest score).
+    use std::collections::HashMap;
+    let mut merged: HashMap<(String, usize), vec_store::SearchResult> = HashMap::new();
 
-    let results = store
-        .search(&embedding, limit, min_score, path_filter)
-        .context("searching index")?;
+    for query in queries {
+        let embedding = embed_query(&cfg, query).context("embedding query")?;
+        let hits = store
+            .search(&embedding, limit, min_score, path_filter)
+            .context("searching index")?;
+        for hit in hits {
+            let key = (hit.path.to_string_lossy().into_owned(), hit.start_line);
+            let existing = merged.get(&key);
+            if existing.is_none() || existing.unwrap().score < hit.score {
+                merged.insert(key, hit);
+            }
+        }
+    }
+
+    // Sort by score descending, take top `limit`.
+    let mut results: Vec<_> = merged.into_values().collect();
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(limit);
+
+    // Apply --exclude filter.
+    if !exclude.is_empty() {
+        results.retain(|r| !exclude.iter().any(|e| r.path.starts_with(e)));
+    }
+
+    // Security: filter unreadable files.
+    results.retain(|r| vec_core::util::can_read(&r.path));
 
     if results.is_empty() {
         anstream::eprintln!("No results.");
         return Ok(());
     }
 
-    // Pre-compute query keywords (lowercased, deduplicated) for best-line matching.
-    let query_words: Vec<String> = query
-        .split_whitespace()
+    // Pre-compute query keywords for best-line matching.
+    let query_words: Vec<String> = queries
+        .iter()
+        .flat_map(|q| q.split_whitespace())
         .map(|w| w.to_lowercase())
         .collect();
 
+    if json {
+        // JSON output mode.
+        let items: Vec<serde_json::Value> = results
+            .iter()
+            .map(|r| {
+                let best = best_line_in_chunk(r, &query_words).unwrap_or(r.start_line);
+                serde_json::json!({
+                    "path": r.path.to_string_lossy(),
+                    "line": best,
+                    "score": (r.score * 1000.0).round() / 1000.0,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&items)?);
+        return Ok(());
+    }
+
     for result in &results {
-        // Security: check read permission before displaying.
-        // Silently skip results the current user cannot read.
-        if !vec_core::util::can_read(&result.path) {
-            continue;
-        }
+        let best = best_line_in_chunk(result, &query_words)
+            .unwrap_or(result.start_line);
 
         if !show_snippet {
-            // Find the best-matching line within the chunk for a more
-            // precise file:line reference.
-            let best = best_line_in_chunk(result, &query_words)
-                .unwrap_or(result.start_line);
             println!("{}:{} (score: {:.3})", result.path.display(), best, result.score);
         } else {
-            // Read the file and show snippet_lines around the best line.
-            let best = best_line_in_chunk(result, &query_words)
-                .unwrap_or(result.start_line);
             println!(
                 "{}:{} (score: {:.3})",
                 result.path.display(),
@@ -210,7 +294,7 @@ async fn cmd_search(
                 Ok(content) => {
                     let lines: Vec<&str> = content.lines().collect();
                     let ctx = cfg.search.snippet_lines;
-                    let target = best.saturating_sub(1); // 1-based → 0-based
+                    let target = best.saturating_sub(1);
                     let from = target.saturating_sub(ctx);
                     let to = (target + ctx + 1).min(lines.len());
                     for (i, line) in lines[from..to].iter().enumerate() {
@@ -487,8 +571,189 @@ async fn cmd_daemon(cfg_path: Option<&std::path::Path>) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// vec context
+// ---------------------------------------------------------------------------
+
+fn cmd_context(file_line: &str, window: usize) -> Result<()> {
+    let (path, line) = parse_file_line(file_line)?;
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {path}"))?;
+    let lines: Vec<&str> = content.lines().collect();
+    let target = line.saturating_sub(1); // 1-based → 0-based
+    let from = target.saturating_sub(window);
+    let to = (target + window + 1).min(lines.len());
+    for (i, l) in lines[from..to].iter().enumerate() {
+        let lineno = from + i + 1;
+        let marker = if lineno == line { ">" } else { " " };
+        println!("{} {:>5}: {}", marker, lineno, l);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// vec similar
+// ---------------------------------------------------------------------------
+
+fn cmd_similar(file_line: &str, limit: Option<usize>, cfg_path: Option<&std::path::Path>) -> Result<()> {
+    let cfg = Config::load(cfg_path).context("loading config")?;
+    let store = Store::open(&cfg.database.db_path, cfg.database.wal).context("opening store")?;
+    let limit = limit.unwrap_or(cfg.search.default_limit);
+
+    let (path, line) = parse_file_line(file_line)?;
+    let embedding = store
+        .get_chunk_embedding_at(&std::path::PathBuf::from(&path), line)
+        .context("looking up chunk embedding")?
+        .ok_or_else(|| anyhow::anyhow!("no chunk covers {}:{}", path, line))?;
+
+    let results = store.search(&embedding, limit + 1, 0.0, None)?;
+    // Skip the exact same chunk (score ~1.0 from itself).
+    for r in &results {
+        if !vec_core::util::can_read(&r.path) {
+            continue;
+        }
+        // Skip self-match (same file and overlapping lines).
+        if r.path.to_string_lossy() == path && r.start_line <= line && r.end_line >= line {
+            continue;
+        }
+        println!("{}:{} (score: {:.3})", r.path.display(), r.start_line, r.score);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// vec repl
+// ---------------------------------------------------------------------------
+
+fn cmd_repl(cfg_path: Option<&std::path::Path>) -> Result<()> {
+    let cfg = Config::load(cfg_path).context("loading config")?;
+    let store = Store::open(&cfg.database.db_path, cfg.database.wal).context("opening store")?;
+    let embedder = vec_core::load_embedder(&cfg);
+
+    eprintln!("vec repl — type a query, Ctrl-D to exit");
+    let mut line = String::new();
+    loop {
+        eprint!("> ");
+        use std::io::Write;
+        std::io::stderr().flush().ok();
+        line.clear();
+        if std::io::stdin().read_line(&mut line).is_err() || line.is_empty() {
+            break;
+        }
+        let query = line.trim();
+        if query.is_empty() {
+            continue;
+        }
+        let embedding = embedder.embed_one(query)?;
+        let results = store.search(&embedding, cfg.search.default_limit, 0.0, None)?;
+        for r in &results {
+            if vec_core::util::can_read(&r.path) {
+                println!("{}:{} (score: {:.3})", r.path.display(), r.start_line, r.score);
+            }
+        }
+        println!();
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// vec gc
+// ---------------------------------------------------------------------------
+
+fn cmd_gc(cfg_path: Option<&std::path::Path>) -> Result<()> {
+    let cfg = Config::load(cfg_path).context("loading config")?;
+    let mut store = Store::open(&cfg.database.db_path, cfg.database.wal).context("opening store")?;
+
+    let size_before = std::fs::metadata(&cfg.database.db_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    let deleted = store.delete_missing_files().context("pruning deleted files")?;
+    store.vacuum().context("vacuuming database")?;
+
+    let size_after = std::fs::metadata(&cfg.database.db_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    println!("Pruned:    {} stale file(s)", deleted);
+    println!("DB before: {}", fmt_size(size_before));
+    println!("DB after:  {}", fmt_size(size_after));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// vec explain
+// ---------------------------------------------------------------------------
+
+fn cmd_explain(file_line: &str, cfg_path: Option<&std::path::Path>) -> Result<()> {
+    let cfg = Config::load(cfg_path).context("loading config")?;
+    let store = Store::open(&cfg.database.db_path, cfg.database.wal).context("opening store")?;
+
+    let (path, line) = parse_file_line(file_line)?;
+    let chunks = store.get_chunks_covering(&std::path::PathBuf::from(&path), line)?;
+
+    if chunks.is_empty() {
+        println!("No chunks cover {}:{}", path, line);
+        return Ok(());
+    }
+
+    println!("{}:{} is covered by {} chunk(s):", path, line, chunks.len());
+    for c in &chunks {
+        println!("  lines {}-{}  (bytes {}..{})", c.start_line, c.end_line, c.byte_offset, c.byte_end);
+    }
+
+    if let Some(record) = store.get_file(&std::path::PathBuf::from(&path))? {
+        println!("  file hash: {}", record.hash);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// vec diff
+// ---------------------------------------------------------------------------
+
+fn cmd_diff(cfg_path: Option<&std::path::Path>) -> Result<()> {
+    let cfg = Config::load(cfg_path).context("loading config")?;
+    let store = Store::open(&cfg.database.db_path, cfg.database.wal).context("opening store")?;
+
+    let diff = vec_index::diff_files(&store, &cfg)?;
+
+    if !diff.new_files.is_empty() {
+        println!("New ({}):", diff.new_files.len());
+        for p in &diff.new_files {
+            println!("  + {}", p.display());
+        }
+    }
+    if !diff.changed_files.is_empty() {
+        println!("Changed ({}):", diff.changed_files.len());
+        for p in &diff.changed_files {
+            println!("  ~ {}", p.display());
+        }
+    }
+    if !diff.deleted_files.is_empty() {
+        println!("Deleted ({}):", diff.deleted_files.len());
+        for p in &diff.deleted_files {
+            println!("  - {}", p.display());
+        }
+    }
+    if diff.new_files.is_empty() && diff.changed_files.is_empty() && diff.deleted_files.is_empty() {
+        println!("Index is up to date.");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Parse a "file:line" string into (path, line_number).
+fn parse_file_line(s: &str) -> Result<(String, usize)> {
+    let (path, line_str) = s.rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("expected file:line format, got: {s}"))?;
+    let line: usize = line_str.parse()
+        .with_context(|| format!("invalid line number: {line_str}"))?;
+    Ok((path.to_string(), line))
+}
 
 /// Embed a query string.
 ///
