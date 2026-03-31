@@ -237,6 +237,23 @@ async fn cmd_search(
 
     // Sort by score descending, take top `limit`.
     let mut results: Vec<_> = merged.into_values().collect();
+    // Path-weighted re-ranking: boost results where the file path contains query keywords.
+    let path_boost = cfg.search.path_boost;
+    if path_boost > 0.0 {
+        let all_words: Vec<String> = queries
+            .iter()
+            .flat_map(|q| q.split_whitespace())
+            .map(|w| w.to_lowercase())
+            .collect();
+        for r in &mut results {
+            let path_lower = r.path.to_string_lossy().to_lowercase();
+            let matches = all_words.iter().filter(|w| path_lower.contains(w.as_str())).count();
+            if matches > 0 {
+                r.score += path_boost * matches as f32;
+            }
+        }
+    }
+
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     results.truncate(limit);
 
@@ -260,12 +277,29 @@ async fn cmd_search(
         .map(|w| w.to_lowercase())
         .collect();
 
+    // Cache file contents to avoid re-reading the same file for best_line + snippet.
+    let mut file_cache: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
+
+    // Helper: get cached file content.
+    let read_cached = |cache: &mut std::collections::HashMap<PathBuf, String>, path: &std::path::Path| -> Option<String> {
+        if let Some(content) = cache.get(path) {
+            return Some(content.clone());
+        }
+        if let Ok(content) = std::fs::read_to_string(path) {
+            cache.insert(path.to_path_buf(), content.clone());
+            Some(content)
+        } else {
+            None
+        }
+    };
+
     if json {
-        // JSON output mode.
         let items: Vec<serde_json::Value> = results
             .iter()
             .map(|r| {
-                let best = best_line_in_chunk(r, &query_words).unwrap_or(r.start_line);
+                let best = read_cached(&mut file_cache, &r.path)
+                    .and_then(|content| best_line_in_content(&content, r, &query_words))
+                    .unwrap_or(r.start_line);
                 serde_json::json!({
                     "path": r.path.to_string_lossy(),
                     "line": best,
@@ -278,33 +312,24 @@ async fn cmd_search(
     }
 
     for result in &results {
-        let best = best_line_in_chunk(result, &query_words)
+        let content = read_cached(&mut file_cache, &result.path);
+        let best = content.as_ref()
+            .and_then(|c| best_line_in_content(c, result, &query_words))
             .unwrap_or(result.start_line);
 
-        if !show_snippet {
-            println!("{}:{} (score: {:.3})", result.path.display(), best, result.score);
-        } else {
-            println!(
-                "{}:{} (score: {:.3})",
-                result.path.display(),
-                best,
-                result.score
-            );
-            match std::fs::read_to_string(&result.path) {
-                Ok(content) => {
-                    let lines: Vec<&str> = content.lines().collect();
-                    let ctx = cfg.search.snippet_lines;
-                    let target = best.saturating_sub(1);
-                    let from = target.saturating_sub(ctx);
-                    let to = (target + ctx + 1).min(lines.len());
-                    for (i, line) in lines[from..to].iter().enumerate() {
-                        let lineno = from + i + 1;
-                        let marker = if lineno == best { ">" } else { " " };
-                        println!("{} {:>5}: {}", marker, lineno, line);
-                    }
-                }
-                Err(e) => {
-                    anstream::eprintln!("warn: could not read {}: {}", result.path.display(), e);
+        println!("{}:{} (score: {:.3})", result.path.display(), best, result.score);
+
+        if show_snippet {
+            if let Some(ref content) = content {
+                let lines: Vec<&str> = content.lines().collect();
+                let ctx = cfg.search.snippet_lines;
+                let target = best.saturating_sub(1);
+                let from = target.saturating_sub(ctx);
+                let to = (target + ctx + 1).min(lines.len());
+                for (i, line) in lines[from..to].iter().enumerate() {
+                    let lineno = from + i + 1;
+                    let marker = if lineno == best { ">" } else { " " };
+                    println!("{} {:>5}: {}", marker, lineno, line);
                 }
             }
             println!();
@@ -856,21 +881,22 @@ fn fmt_unix_ts(secs: u64) -> String {
 
 /// Find the line within a chunk that best matches the query keywords.
 ///
-/// Reads the chunk text from disk (byte_offset..byte_end), scores each line
-/// by counting how many query words appear in it (case-insensitive), and
-/// returns the 1-based line number of the best match.  Returns `None` if
-/// the file can't be read or no line scores above zero.
-fn best_line_in_chunk(
+/// Takes the full file content (already cached) and extracts the chunk slice
+/// using byte offsets. Scores each line by counting query word matches.
+/// Returns the 1-based line number of the best match, or `None` if no line
+/// scores above zero.
+fn best_line_in_content(
+    content: &str,
     result: &vec_store::SearchResult,
     query_words: &[String],
 ) -> Option<usize> {
-    let bytes = std::fs::read(&result.path).ok()?;
+    let bytes = content.as_bytes();
     let end = result.byte_end.min(bytes.len());
     let start = result.byte_offset.min(end);
-    let chunk = String::from_utf8_lossy(&bytes[start..end]);
+    let chunk = &content[start..end];
 
     let mut best_score = 0usize;
-    let mut best_offset = 0usize; // 0-based offset within the chunk
+    let mut best_offset = 0usize;
 
     for (i, line) in chunk.lines().enumerate() {
         let lower = line.to_lowercase();
@@ -885,7 +911,6 @@ fn best_line_in_chunk(
     }
 
     if best_score > 0 {
-        // Convert chunk-relative offset to absolute 1-based line number.
         Some(result.start_line + best_offset)
     } else {
         None

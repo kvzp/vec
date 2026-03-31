@@ -139,23 +139,45 @@ impl VecServer {
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         // Convert to SearchResultItem, applying access() check and reading
-        // snippets from the live file.
+        // trimmed snippets (±snippet_lines around best-matching line).
+        let snippet_ctx = cfg.search.snippet_lines;
+        let query_words: Vec<String> = params.query
+            .split_whitespace()
+            .map(|w| w.to_lowercase())
+            .collect();
+
         let mut items: Vec<SearchResultItem> = Vec::new();
         for result in raw_results {
-            // Security: check read permission before returning the result.
             if !vec_core::util::can_read(&result.path) {
                 continue;
             }
 
-            let snippet = std::fs::read(&result.path).ok().map(|bytes| {
-                let end = result.byte_end.min(bytes.len());
-                let start = result.byte_offset.min(end);
-                String::from_utf8_lossy(&bytes[start..end]).into_owned()
-            });
+            let (best_line, snippet) = match std::fs::read_to_string(&result.path) {
+                Ok(content) => {
+                    let best = best_line_in_content(&content, &result, &query_words)
+                        .unwrap_or(result.start_line);
+                    let lines: Vec<&str> = content.lines().collect();
+                    let target = best.saturating_sub(1);
+                    let from = target.saturating_sub(snippet_ctx);
+                    let to = (target + snippet_ctx + 1).min(lines.len());
+                    let snip: String = lines[from..to]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, l)| {
+                            let lineno = from + i + 1;
+                            let marker = if lineno == best { ">" } else { " " };
+                            format!("{} {:>5}: {}", marker, lineno, l)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (best, Some(snip))
+                }
+                Err(_) => (result.start_line, None),
+            };
 
             items.push(SearchResultItem {
                 path: result.path.to_string_lossy().into_owned(),
-                start_line: result.start_line,
+                start_line: best_line,
                 end_line: result.end_line,
                 score: result.score,
                 snippet,
@@ -312,4 +334,36 @@ fn load_embedder_for_mcp(cfg: &Config) -> Embedder {
         }
     }
     Embedder::stub(768)
+}
+
+/// Find the line within a chunk that best matches query keywords.
+fn best_line_in_content(
+    content: &str,
+    result: &vec_store::SearchResult,
+    query_words: &[String],
+) -> Option<usize> {
+    let end = result.byte_end.min(content.len());
+    let start = result.byte_offset.min(end);
+    let chunk = &content[start..end];
+
+    let mut best_score = 0usize;
+    let mut best_offset = 0usize;
+
+    for (i, line) in chunk.lines().enumerate() {
+        let lower = line.to_lowercase();
+        let score: usize = query_words
+            .iter()
+            .filter(|w| lower.contains(w.as_str()))
+            .count();
+        if score > best_score {
+            best_score = score;
+            best_offset = i;
+        }
+    }
+
+    if best_score > 0 {
+        Some(result.start_line + best_offset)
+    } else {
+        None
+    }
 }

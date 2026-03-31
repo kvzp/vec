@@ -79,6 +79,8 @@ pub struct SearchConfig {
     pub default_limit: usize,
     /// Lines of source context shown per result.
     pub snippet_lines: usize,
+    /// Score boost when file path contains query keywords (0.0 = disabled).
+    pub path_boost: f32,
 }
 
 /// SQLite database settings.
@@ -183,6 +185,7 @@ fn default_config() -> Config {
         search: SearchConfig {
             default_limit: 10,
             snippet_lines: 3,
+            path_boost: 0.05,
         },
         database: DatabaseConfig {
             db_path: default_db_path,
@@ -234,6 +237,7 @@ struct RawIndexConfig {
 struct RawSearchConfig {
     default_limit: Option<usize>,
     snippet_lines: Option<usize>,
+    path_boost: Option<f32>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -305,6 +309,9 @@ fn merge(cfg: &mut Config, raw: &RawConfig) {
         }
         if let Some(v) = rs.snippet_lines {
             cfg.search.snippet_lines = v;
+        }
+        if let Some(v) = rs.path_boost {
+            cfg.search.path_boost = v;
         }
     }
 
