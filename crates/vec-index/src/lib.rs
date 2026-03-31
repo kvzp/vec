@@ -381,21 +381,27 @@ pub fn run_updatedb(
     // Follow symlinks is intentionally false (default) — avoids infinite loops.
     builder.follow_links(false);
 
-    // Configure rayon thread pool for parallel embedding.
-    let num_threads = if cfg.embed.index_threads == 0 {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
+    // Configure rayon thread pool for parallel embedding (ONNX backend only).
+    // The HTTP/Ollama backend sends work to the server — no local parallelism needed.
+    let is_local = cfg.embed.backend != "ollama";
+    let batch_size = if is_local {
+        let num_threads = if cfg.embed.index_threads == 0 {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        } else {
+            cfg.embed.index_threads
+        };
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build_global()
+            .ok();
+        // Scale batch size to fill all cores.
+        cfg.embed.batch_size * num_threads
     } else {
-        cfg.embed.index_threads
+        // HTTP backend: no scaling, use config batch_size directly.
+        cfg.embed.batch_size
     };
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .build_global()
-        .ok(); // ignore if already initialised
-
-    // Scale batch size to fill all cores: each thread gets batch_size chunks.
-    let batch_size = cfg.embed.batch_size * num_threads;
 
     // We accumulate chunks across files until we fill a batch, then embed.
     struct PendingChunk {

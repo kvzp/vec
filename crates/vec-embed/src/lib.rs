@@ -410,13 +410,25 @@ fn embed_batch_inner(inner: &EmbedderInner, texts: &[&str]) -> Result<Vec<Vec<f3
             if texts.is_empty() {
                 return Ok(vec![]);
             }
-            // Send in small batches to avoid overwhelming the HTTP endpoint.
-            // The caller may pass hundreds of texts (scaled by thread count).
-            const HTTP_BATCH: usize = 32;
-            let mut embeddings = Vec::with_capacity(texts.len());
-            for chunk in texts.chunks(HTTP_BATCH) {
-                let mut batch = http_embed_request(url, model, chunk)?;
-                embeddings.append(&mut batch);
+            // Send individual HTTP requests in parallel using scoped threads.
+            // Ollama handles concurrency server-side — this avoids batch
+            // context-length issues and maximizes GPU utilization.
+            let results: Vec<Result<Vec<f32>>> = std::thread::scope(|s| {
+                let handles: Vec<_> = texts
+                    .iter()
+                    .map(|&text| {
+                        s.spawn(|| {
+                            let mut vecs = http_embed_request(url, model, &[text])?;
+                            vecs.pop()
+                                .ok_or_else(|| anyhow::anyhow!("HTTP embed returned empty result"))
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+            for r in results {
+                embeddings.push(r?);
             }
             // Normalise all vectors to unit length (Ollama doesn't always do this).
             for v in &mut embeddings {
@@ -454,21 +466,7 @@ fn http_embed_request(url: &str, model: &str, texts: &[&str]) -> Result<Vec<Vec<
     let (host_port, _) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
     let api_path = "/api/embed";
 
-    // Tell Ollama to truncate inputs that exceed the model's context window.
-    // Also cap on our side — 512 token context ≈ 500 whitespace-delimited words.
-    const MAX_WORDS: usize = 400;
-    let truncated: Vec<String> = texts
-        .iter()
-        .map(|t| {
-            let words: Vec<&str> = t.split_whitespace().collect();
-            if words.len() <= MAX_WORDS {
-                t.to_string()
-            } else {
-                words[..MAX_WORDS].join(" ")
-            }
-        })
-        .collect();
-    let input: Vec<&str> = truncated.iter().map(|s| s.as_str()).collect();
+    let input: Vec<&str> = texts.to_vec();
     let body = serde_json::json!({
         "model": model,
         "input": input,
