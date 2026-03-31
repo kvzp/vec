@@ -16,7 +16,7 @@
 // via /etc/sysctl.d/99-vec.conf.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -57,6 +57,14 @@ pub fn run_watch() -> Result<()> {
         }
     }
 
+    // Resolve the DB directory so we can filter out self-triggered events.
+    let db_dir = cfg
+        .database
+        .db_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("/"))
+        .to_path_buf();
+
     let mut pending: HashSet<PathBuf> = HashSet::new();
     let debounce = Duration::from_secs(DEBOUNCE_SECS);
 
@@ -64,10 +72,10 @@ pub fn run_watch() -> Result<()> {
         // Block until an event arrives, then drain any that follow quickly.
         match rx.recv_timeout(debounce) {
             Ok(Ok(event)) => {
-                collect_paths(&event, &mut pending);
+                collect_paths(&event, &mut pending, &db_dir);
                 // Drain any additional events that arrive within 100ms.
                 while let Ok(Ok(ev)) = rx.recv_timeout(Duration::from_millis(100)) {
-                    collect_paths(&ev, &mut pending);
+                    collect_paths(&ev, &mut pending, &db_dir);
                 }
                 // Keep looping — more events may arrive within the debounce window.
             }
@@ -92,11 +100,16 @@ pub fn run_watch() -> Result<()> {
 }
 
 /// Extract relevant file paths from a notify event.
-fn collect_paths(event: &Event, pending: &mut HashSet<PathBuf>) {
+fn collect_paths(event: &Event, pending: &mut HashSet<PathBuf>, db_dir: &Path) {
     match event.kind {
         // We care about creates, modifications, and removes.
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
             for path in &event.paths {
+                // Skip events from the vec database directory — writing to the
+                // DB triggers inotify events which would cause a feedback loop.
+                if path.starts_with(db_dir) {
+                    continue;
+                }
                 // Skip directories — we index files only.
                 if path.is_file() || matches!(event.kind, EventKind::Remove(_)) {
                     pending.insert(path.clone());
