@@ -2596,6 +2596,7 @@ dependencies = [
  "nix",
  "notify",
  "prost",
+ "rayon",
  "rmcp",
  "rusqlite",
  "serde",
