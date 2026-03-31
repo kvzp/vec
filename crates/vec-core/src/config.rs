@@ -32,13 +32,19 @@ pub struct Config {
 /// Embedding model settings.
 #[derive(Debug, Clone)]
 pub struct EmbedConfig {
+    /// Embedding backend: "onnx" (default, local tract inference) or "ollama" (HTTP API).
+    pub backend: String,
     /// Short name (e.g. "gte-multilingual-base") or absolute path.
+    /// For the ollama backend, this is the model name (e.g. "nomic-embed-text-v2-moe:latest").
     pub model: String,
-    /// Directories searched in order when resolving a short model name.
+    /// HTTP endpoint for the ollama backend (e.g. "http://192.168.0.194:11434").
+    /// Ignored when backend is "onnx".
+    pub embed_url: String,
+    /// Directories searched in order when resolving a short model name (onnx backend only).
     pub model_search_path: Vec<PathBuf>,
     /// Number of chunks fed to the model in one batch.
     pub batch_size: usize,
-    /// Token limit passed to the tokeniser per chunk.
+    /// Token limit passed to the tokeniser per chunk (onnx backend only).
     pub max_tokens: usize,
     /// Unix socket path for `vec daemon`.
     /// `vec` tries this socket first for interactive queries; falls back to
@@ -115,7 +121,9 @@ fn default_config() -> Config {
 
     Config {
         embed: EmbedConfig {
+            backend: "onnx".into(),
             model: "gte-multilingual-base".into(),
+            embed_url: String::new(),
             // System-only model path. Models are installed by the vec-model-*
             // package into /usr/share/vec/models — never in user home dirs.
             model_search_path: vec![PathBuf::from("/usr/share/vec/models")],
@@ -212,7 +220,9 @@ struct RawConfig {
 
 #[derive(Debug, Deserialize, Default)]
 struct RawEmbedConfig {
+    backend: Option<String>,
     model: Option<String>,
+    embed_url: Option<String>,
     model_search_path: Option<Vec<String>>,
     batch_size: Option<usize>,
     max_tokens: Option<usize>,
@@ -253,8 +263,14 @@ struct RawDatabaseConfig {
 /// Apply non-None fields from `raw` on top of `cfg`.
 fn merge(cfg: &mut Config, raw: &RawConfig) {
     if let Some(ref re) = raw.embed {
+        if let Some(ref v) = re.backend {
+            cfg.embed.backend = v.clone();
+        }
         if let Some(ref v) = re.model {
             cfg.embed.model = v.clone();
+        }
+        if let Some(ref v) = re.embed_url {
+            cfg.embed.embed_url = v.clone();
         }
         if let Some(ref v) = re.model_search_path {
             cfg.embed.model_search_path = v.iter().map(PathBuf::from).collect();
