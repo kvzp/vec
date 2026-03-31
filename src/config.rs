@@ -377,12 +377,9 @@ impl Config {
     ///
     /// Merge order (last wins):
     ///   compiled-in defaults
-    ///   → /etc/vec.conf       (system admin config — the only config file)
-    ///   → extra_path (if Some, e.g. supplied via --config for testing)
-    ///
-    /// There is no per-user config file. vec is a system tool configured by
-    /// the admin via /etc/vec.conf. Users influence behaviour only through
-    /// CLI flags (--path, --limit, etc.) at query time.
+    ///   → /etc/vec.conf                      (system admin config)
+    ///   → ~/.config/vec/config.toml          (per-user config, overrides system)
+    ///   → extra_path (if Some, via --config) (explicit override, highest priority)
     pub fn load(extra_path: Option<&Path>) -> Result<Config> {
         let mut cfg = default_config();
 
@@ -396,7 +393,19 @@ impl Config {
             merge(&mut cfg, &raw);
         }
 
-        // Extra path for testing / --config flag
+        // Per-user config (overrides system — a user may want their own DB,
+        // model, or include_paths even when a system install exists).
+        if extra_path.is_none() {
+            if let Some(config_dir) = dirs::config_dir() {
+                let user_conf = config_dir.join("vec").join("config.toml");
+                if user_conf.exists() {
+                    let raw = load_file(&user_conf)?;
+                    merge(&mut cfg, &raw);
+                }
+            }
+        }
+
+        // Explicit --config flag (highest priority, skips user config auto-detection)
         if let Some(extra) = extra_path {
             let raw = load_file(extra)?;
             merge(&mut cfg, &raw);
@@ -539,31 +548,16 @@ default_limit = 5
         assert_eq!(cfg.index.chunk_size, 40);
     }
 
-    // Verify that per-user config (~/.config/vec/config.toml) is NOT loaded.
-    // The load() function only reads /etc/vec.conf (system) and the extra_path.
-    // We confirm this by inspecting the source: there is no reference to
-    // dirs::config_dir() or "~/.config/vec" in the Config::load implementation.
-    // The test also verifies that Config::load(None) always succeeds even on
-    // machines that happen to have a ~/.config/vec/config.toml.
+    // Config::load(None) auto-detects ~/.config/vec/config.toml if present.
+    // With an explicit --config path, user config auto-detection is skipped.
     #[test]
-    fn no_user_config_loaded() {
-        // The important invariant is that load() succeeds regardless of whether
-        // ~/.config/vec/config.toml exists. We cannot easily test "absence of
-        // loading" in a black-box manner, so we verify the source-level invariant:
-        // load() must not call dirs::config_dir() for a per-user config path.
-        //
-        // At the same time, Config::load(None) must succeed on any machine.
+    fn load_none_succeeds() {
         let result = Config::load(None);
         assert!(
             result.is_ok(),
             "Config::load(None) must succeed: {:?}",
             result.err()
         );
-
-        // Confirm the user-config path is not in the load function by ensuring
-        // we can load when passing a non-existent path as extra (error is
-        // expected here — this just confirms the load path logic).
-        // The key invariant is already validated above.
     }
 
     #[cfg(unix)]

@@ -9,37 +9,29 @@ allowed-tools: Bash(*), Read
 
 You have access to `vec`, a semantic search tool that finds files by meaning using vector embeddings. It works like `locate` but for concepts instead of filenames.
 
-## CRITICAL: Always use --config
-
-vec requires the `--config` flag to find the userland database. **Every** vec command must include it:
-
-```
-vec --config ~/.config/vec/config.toml <args>
-```
-
-Without `--config`, vec tries `/var/lib/vec` (system path) and fails with "Permission denied".
-
 ## How to search
 
 Run `vec` directly via Bash. The output is `file:line` paths, one per line — pipe-friendly.
 
 ```bash
 # Basic search (default: 10 results, paths only — lightweight)
-vec --config ~/.config/vec/config.toml "authentication middleware"
+vec "authentication middleware"
 
 # Limit results
-vec --config ~/.config/vec/config.toml "error handling" --limit 5
+vec "error handling" --limit 5
 
 # Scope to a directory
-vec --config ~/.config/vec/config.toml "database connection" --path ~/projects/backend
+vec "database connection" --path ~/projects/backend
 
 # Filter by minimum relevance score
-vec --config ~/.config/vec/config.toml "auth logic" --min-score 0.82
+vec "auth logic" --min-score 0.82
 ```
+
+vec auto-detects `~/.config/vec/config.toml` for userland installs. No `--config` flag needed.
 
 ## Token-conscious workflow
 
-**DO NOT use --snippet by default.** It dumps ~40 lines per result into context — 10 results = 400 lines of code wasted on tokens.
+**DO NOT use --snippet by default.** It adds ~7 lines per result — with 10 results that's 70+ extra lines in context.
 
 Instead, follow this two-step approach:
 
@@ -53,7 +45,7 @@ Only use `--snippet` if the user explicitly asks for inline snippets, or if you 
 ## Checking index health
 
 ```bash
-vec --config ~/.config/vec/config.toml status
+vec status
 ```
 
 ## When to use vec vs grep/glob

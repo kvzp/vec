@@ -18,7 +18,7 @@ cargo test --features integration   # tests requiring a live ONNX model (future)
 | `store.rs` | 27 | open/create schema, upsert, get, delete, search, cosine math, path filter (incl. `[` special char), model check, stats, full pipeline, byte_end clamping pattern, bad-parent error, paged search top-k correctness |
 | `index.rs` | 24 | chunker (empty, short, boundary snap, offsets, overlap, no trailing newline, CRLF), glob matching, updatedb (index, skip unchanged, full re-index, binary skip, size limit, path filter, unreadable dir, symlink skip) |
 | `embed.rs` | 10 | stub unit length, determinism, different texts differ, batch vs single, empty batch, long text, sha256, missing model error, missing tokenizer error |
-| `config.rs` | 13 | defaults, merge, extra path, bad TOML, no user config, central DB path, system model dir, include paths, tilde expansion (plain path, bare `~`) |
+| `config.rs` | 13 | defaults, merge, extra path, bad TOML, load succeeds, central DB path, system model dir, include paths, tilde expansion (plain path, bare `~`) |
 | `daemon.rs` | 2 | embed request round-trip, oversized request rejection |
 | `util.rs` | 3 | can_read readable file, non-existent file, directory |
 

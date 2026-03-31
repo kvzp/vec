@@ -2,15 +2,23 @@
 
 ## Config file
 
-One config file: **`/etc/vec.conf`** (TOML format).
-
-vec is a system tool — there is no per-user config file by design. Users control search at query time via CLI flags (`--path`, `--limit`, `--snippet`). Admins control indexing policy via `/etc/vec.conf`.
+Config files (TOML format), merged in order — last wins:
 
 ```
-compiled-in defaults  →  /etc/vec.conf (if present)  →  CLI flags
+compiled-in defaults
+  → /etc/vec.conf                      (system admin config)
+  → ~/.config/vec/config.toml          (per-user config, overrides system)
+  → --config flag                      (explicit override, highest priority)
+  → CLI flags                          (--path, --limit, --snippet, etc.)
 ```
 
-Every setting has a sensible compiled-in default. An empty or absent `/etc/vec.conf` is valid — vec works out of the box.
+**System-wide:** Admins control indexing policy via `/etc/vec.conf`.
+
+**Per-user:** Users can override any setting via `~/.config/vec/config.toml` — useful for a personal DB, different model, or scoped include_paths even when a system install exists. Generate one with `vec init --user > ~/.config/vec/config.toml`.
+
+**Explicit:** `--config /path/to/file.toml` skips user config auto-detection and applies on top of the system config.
+
+Every setting has a sensible compiled-in default. No config file is required — vec works out of the box.
 
 Generate a starter config:
 ```bash

@@ -2,7 +2,7 @@
 
 ## Usability
 
-- [ ] **Auto-detect userland config** — fall back to `~/.config/vec/config.toml` when `/etc/vec.conf` doesn't exist, eliminating the need for `--config` on every command. This simplifies the skill, systemd units, shell aliases, and the entire userland experience.
+- [x] **Auto-detect userland config** — `~/.config/vec/config.toml` is now loaded automatically after `/etc/vec.conf` (userland overrides system). `--config` flag still works as highest priority override.
 - [ ] **Add `--score` flag or always show scores** — non-snippet output (`file:line`) gives no indication of match confidence. A 0.95 hit and a 0.72 hit look identical. Either add a `--score` flag or append `(score: 0.XXX)` by default.
 
 ## Performance
