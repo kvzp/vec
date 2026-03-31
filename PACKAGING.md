@@ -266,12 +266,30 @@ Ready-to-use packaging templates in `contrib/`:
 ```
 contrib/
 ├── vec.conf                   # /etc/vec.conf template
-├── vec-updatedb.service       # systemd oneshot service
-├── vec-updatedb.timer         # daily timer
-├── vec-watch.service          # inotify real-time watcher
-├── vec-embed.service          # persistent embedding daemon (optional, speeds up queries)
+├── vec-updatedb.service       # systemd oneshot service (system)
+├── vec-updatedb.timer         # daily timer (system)
+├── vec-watch.service          # inotify real-time watcher (system)
+├── vec-embed.service          # persistent embedding daemon (system, optional)
+├── user/                      # systemd user units (userland install)
+│   ├── vec-updatedb.service   # oneshot indexer — uses %h for $HOME paths
+│   ├── vec-updatedb.timer     # daily timer
+│   ├── vec-watch.service      # inotify real-time watcher
+│   └── vec-embed.service      # persistent embedding daemon (optional)
 ├── 99-vec.conf                # sysctl inotify limit
 ├── vec.spec                   # RPM spec (binary)
 ├── vec-model-base.spec        # RPM spec (base model package)
 └── debian/                    # Debian packaging for all packages
 ```
+
+### Userland systemd units (`contrib/user/`)
+
+These are **not installed by the package** — they are for users who install vec without root (see `vec init --user`). Users copy them manually into `~/.config/systemd/user/`.
+
+Key differences from the system units:
+- `WantedBy=default.target` instead of `multi-user.target`
+- Binary path: `%h/.local/bin/vec` (systemd expands `%h` to `$HOME`)
+- Config: `--config %h/.config/vec/config.toml`
+- No `RuntimeDirectory` (socket lives in `~/.local/share/vec/`)
+- Timer uses `Persistent=true` — fires at next login if the user was logged out when the timer was due
+
+Packagers should ship these files in `/usr/share/doc/vec/contrib/user/` so users can find and copy them.

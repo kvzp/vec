@@ -1,0 +1,18 @@
+[Unit]
+Description=vec real-time semantic index watcher (userland)
+# Restart if it crashes; inotify errors are transient
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/vec --config %h/.config/vec/config.toml watch
+Nice=19
+IOSchedulingClass=idle
+Restart=on-failure
+RestartSec=5s
+# Give inotify enough room for large trees
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target

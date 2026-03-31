@@ -1,0 +1,32 @@
+# vec-embed.service (userland) — OPTIONAL persistent embedding daemon
+#
+# ============================================================
+# THIS SERVICE IS COMPLETELY OPTIONAL. DO NOT AUTO-ENABLE IT.
+# ============================================================
+#
+# Same trade-offs as the system-level vec-embed.service:
+#   - Saves 2–5 seconds of model compile time per query
+#   - Costs 150–300 MB of permanent resident RAM
+#
+# Only enable if you run `vec <query>` many times per day AND have RAM to spare.
+#
+# HOW TO ENABLE
+#   systemctl --user enable --now vec-embed.service
+#
+# HOW TO DISABLE
+#   systemctl --user disable --now vec-embed.service
+
+[Unit]
+Description=vec embedding daemon (userland, OPTIONAL — see comments before enabling)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/vec --config %h/.config/vec/config.toml daemon
+Restart=on-failure
+RestartSec=30s
+Nice=19
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target

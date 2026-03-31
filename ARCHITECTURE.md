@@ -104,7 +104,7 @@ No `content` column. Text is always read from `path` at `byte_offset..byte_end` 
 
 - **Size:** 40 lines, 10-line overlap between adjacent chunks
 - **Boundary detection:** Before committing a chunk boundary, scan ±5 lines for a function/class start (`fn `, `pub fn `, `impl `, `def `, `class `, `func `, `function `, `pub struct`, `pub enum`). Prefer splitting there.
-- **Minimum chunk:** Skip chunks under 5 non-blank lines (hardcoded constant in `index.rs`; `min_chunk_lines` in config is stored but not yet wired into the chunker)
+- **Minimum chunk:** Skip chunks with fewer than `cfg.min_chunk_lines` non-blank lines (default 5; configurable via `/etc/vec.conf`)
 - **Encoding:** Files read as UTF-8; skip on decode error (binary files)
 - **Byte offsets:** Computed during chunking from cumulative UTF-8 byte lengths
 
@@ -139,7 +139,11 @@ model = "gte-multilingual-base"   # short name resolved via model_search_path
 
 ## Deployment
 
-No modes, no daemon. Central DB at `/var/lib/vec/vec.db` — indexed by a system service, readable by all users. `access(path, R_OK)` enforces per-user visibility at query time.
+vec supports two deployment modes: **system-wide** (default, recommended) and **userland** (no root required).
+
+### System-wide (default)
+
+Central DB at `/var/lib/vec/vec.db` — indexed by a system service, readable by all users. `access(path, R_OK)` enforces per-user visibility at query time.
 
 ```
 /var/lib/vec/vec.db   chmod 644, owned by root
@@ -154,6 +158,24 @@ RandomizedDelaySec=10min
 ```
 
 Real-time indexing via `vec-watch.service` (inotify) supplements the daily timer. The timer acts as a reconciliation safety net.
+
+### Userland (no root)
+
+For users without root access. All paths live under `$HOME`:
+
+| Resource | Path |
+|----------|------|
+| Config | `~/.config/vec/config.toml` |
+| Database | `~/.local/share/vec/vec.db` |
+| Models | `~/.local/share/vec/models/` |
+| Socket | `~/.local/share/vec/embed.sock` |
+| Binary | `~/.local/bin/vec` |
+
+Generate the config with `vec init --user > ~/.config/vec/config.toml`.
+
+Systemd user units (`contrib/user/`) provide the same automation as the system units — daily timer, real-time watcher, optional embedding daemon — but run under `systemctl --user` with no privilege escalation. Units use `%h` (systemd specifier for `$HOME`) so they work without modification across users.
+
+The userland DB is private to the user. There is no `access()` filtering — the user owns everything they indexed.
 
 ---
 
@@ -188,6 +210,7 @@ Transport: stdio (default for Claude Code MCP registration).
 /etc/vec.conf                                      # system-wide config (all defaults commented)
 /usr/share/vec/models/                             # populated by vec-model-* packages
 /usr/share/doc/vec/
+/usr/share/doc/vec/contrib/user/                   # userland systemd units (user copies manually)
 ```
 
 ### Build Flags for Distros

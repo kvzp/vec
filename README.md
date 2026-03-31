@@ -97,6 +97,39 @@ Tip: add an alias to your shell profile to avoid repeating `--config`:
 alias vec='vec --config ~/.config/vec/config.toml'
 ```
 
+#### Automatic indexing (systemd user services)
+
+Userland systemd units are provided in `contrib/user/`. These run as your user — no root required.
+
+```bash
+# Install the units
+mkdir -p ~/.config/systemd/user
+cp contrib/user/vec-updatedb.service ~/.config/systemd/user/
+cp contrib/user/vec-updatedb.timer   ~/.config/systemd/user/
+cp contrib/user/vec-watch.service    ~/.config/systemd/user/
+cp contrib/user/vec-embed.service    ~/.config/systemd/user/
+systemctl --user daemon-reload
+
+# Enable daily indexing + real-time watcher
+systemctl --user enable --now vec-updatedb.timer vec-watch.service
+
+# Optional: enable the embedding daemon (150–300 MB RAM, faster queries)
+# systemctl --user enable --now vec-embed.service
+```
+
+| Unit | Purpose |
+|------|---------|
+| `vec-updatedb.timer` | Daily full re-index (fires at next login if missed) |
+| `vec-updatedb.service` | Oneshot triggered by the timer |
+| `vec-watch.service` | Real-time inotify watcher for changed files |
+| `vec-embed.service` | **Optional** — persistent embedding daemon for faster queries |
+
+Verify everything is running:
+
+```bash
+systemctl --user status vec-updatedb.timer vec-watch.service
+```
+
 ---
 
 ### Distro packages _(not yet available)_

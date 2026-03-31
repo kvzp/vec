@@ -1,0 +1,13 @@
+[Unit]
+Description=vec semantic index update (userland)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/vec --config %h/.config/vec/config.toml updatedb
+Nice=19
+IOSchedulingClass=idle
+# Allow enough time for full home directory indexing
+TimeoutStartSec=1h
+
+[Install]
+WantedBy=default.target

@@ -370,6 +370,14 @@ fn cmd_init(user: bool) -> Result<()> {
             r#"# vec userland config — no root required
 # Install: mkdir -p ~/.config/vec && vec init --user > ~/.config/vec/config.toml
 # Use:     vec --config ~/.config/vec/config.toml "your query"
+#
+# Automatic indexing (systemd user services):
+#   mkdir -p ~/.config/systemd/user
+#   cp contrib/user/vec-*.service contrib/user/vec-*.timer ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now vec-updatedb.timer vec-watch.service
+#
+# Tip: alias vec='vec --config ~/.config/vec/config.toml' in your shell profile.
 
 [embed]
 model = "gte-multilingual-base"

@@ -1,0 +1,11 @@
+[Unit]
+Description=vec semantic index update timer (userland)
+
+[Timer]
+# Run daily; Persistent=true means it fires at next login if it missed its window
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target
