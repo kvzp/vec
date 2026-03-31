@@ -455,12 +455,18 @@ fn http_embed_request(url: &str, model: &str, texts: &[&str]) -> Result<Vec<Vec<
     let api_path = "/api/embed";
 
     // Tell Ollama to truncate inputs that exceed the model's context window.
-    // Also cap on our side at ~1500 chars as a safety net — some model variants
-    // ignore the truncate flag.
-    const MAX_CHARS: usize = 1500;
+    // Also cap on our side — 512 token context ≈ 500 whitespace-delimited words.
+    const MAX_WORDS: usize = 400;
     let truncated: Vec<String> = texts
         .iter()
-        .map(|t| t.chars().take(MAX_CHARS).collect())
+        .map(|t| {
+            let words: Vec<&str> = t.split_whitespace().collect();
+            if words.len() <= MAX_WORDS {
+                t.to_string()
+            } else {
+                words[..MAX_WORDS].join(" ")
+            }
+        })
         .collect();
     let input: Vec<&str> = truncated.iter().map(|s| s.as_str()).collect();
     let body = serde_json::json!({
@@ -489,9 +495,11 @@ fn http_embed_request(url: &str, model: &str, texts: &[&str]) -> Result<Vec<Vec<
     );
     stream.write_all(request.as_bytes())?;
 
-    // Read response.
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
+    // Read entire response as bytes first, then convert to string.
+    // Reading as bytes avoids issues with partial UTF-8 sequences during streaming.
+    let mut raw_bytes = Vec::new();
+    stream.read_to_end(&mut raw_bytes)?;
+    let response = String::from_utf8_lossy(&raw_bytes).into_owned();
 
     // Split headers from body.
     let header_end = response
@@ -517,9 +525,12 @@ fn http_embed_request(url: &str, model: &str, texts: &[&str]) -> Result<Vec<Vec<
         .get("embeddings")
         .and_then(|v| v.as_array())
         .ok_or_else(|| {
-            // Include the response in the error for debugging.
             let preview = if json_body.len() > 200 { &json_body[..200] } else { &json_body };
-            anyhow::anyhow!("embed response missing 'embeddings' array. Response: {preview}")
+            let max_input_len = input.iter().map(|s| s.len()).max().unwrap_or(0);
+            let input_count = input.len();
+            anyhow::anyhow!(
+                "embed response missing 'embeddings' array. inputs={input_count} max_len={max_input_len} Response: {preview}"
+            )
         })?;
 
     let mut result = Vec::with_capacity(embeddings.len());
