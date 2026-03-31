@@ -94,3 +94,11 @@ Embeddings run in-process via `tract-onnx` — pure Rust, no network calls, no e
 - Encryption at rest (the DB is non-sensitive by design; if required, use full-disk encryption)
 - Authentication beyond Unix credentials (use VPN/firewall on multi-tenant hosts)
 - Audit logging (not implemented in MVP; add as needed)
+
+---
+
+## Reporting a Vulnerability
+
+Please report security issues via [GitHub Security Advisories](https://github.com/kvzp/vec/security/advisories/new) — not as a public issue.
+
+Include: what you found, steps to reproduce, and the impact as you see it. You will receive a response within 7 days.

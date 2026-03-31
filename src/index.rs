@@ -2,10 +2,11 @@
 ///
 /// # Chunker
 ///
-/// [`chunk_file`] splits a UTF-8 source file into overlapping 40-line windows.
-/// Before committing each boundary it scans ±5 lines for a recognised
-/// function/class-start pattern and snaps to that line if one is found.
-/// Chunks with fewer than [`MIN_CHUNK_LINES`] non-blank lines are discarded.
+/// [`chunk_file`] splits a UTF-8 source file into overlapping windows sized by
+/// [`IndexConfig::chunk_size`]. Before committing each boundary it scans
+/// ±[`BOUNDARY_SCAN`] lines for a recognised function/class-start pattern and
+/// snaps to that line if found. Chunks with fewer than
+/// [`IndexConfig::min_chunk_lines`] non-blank lines are discarded.
 ///
 /// # Incremental update
 ///
@@ -28,18 +29,9 @@ use crate::store::Store;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Target chunk size in source lines.
-const CHUNK_LINES: usize = 40;
-
-/// Overlap between adjacent chunks in source lines.
-const OVERLAP_LINES: usize = 10;
-
 /// Scan window (±N lines) around a tentative boundary when looking for a
 /// better split point aligned to a function/class start.
 const BOUNDARY_SCAN: usize = 5;
-
-/// Minimum non-blank lines a chunk must contain to be worth embedding.
-const MIN_CHUNK_LINES: usize = 5;
 
 /// Line-start patterns that indicate good chunk-boundary candidates.
 ///
@@ -95,16 +87,13 @@ pub struct Chunk {
 ///
 /// 1. Split `content` into lines, accumulating cumulative byte offsets so we
 ///    can map line numbers → byte positions in O(n).
-/// 2. Advance the chunk window in steps of `CHUNK_LINES - OVERLAP_LINES`
+/// 2. Advance the chunk window in steps of `chunk_size - chunk_overlap`
 ///    (i.e., 30 lines), capping at the end of the file.
 /// 3. Before committing each boundary, scan the ±[`BOUNDARY_SCAN`] lines
 ///    around it for a line whose stripped content starts with a recognised
 ///    keyword from [`BOUNDARY_PATTERNS`].  If found, snap the boundary there.
-/// 4. Skip chunks with fewer than [`MIN_CHUNK_LINES`] non-blank lines.
-///
-/// The `cfg` parameter is accepted for future per-language configuration but
-/// the current implementation uses the compile-time constants above.
-pub fn chunk_file(content: &str, _cfg: &IndexConfig) -> Vec<Chunk> {
+/// 4. Skip chunks with fewer than `cfg.min_chunk_lines` non-blank lines.
+pub fn chunk_file(content: &str, cfg: &IndexConfig) -> Vec<Chunk> {
     // -----------------------------------------------------------------------
     // Step 1: build a line table: line_starts[i] = byte offset of line i+1
     // -----------------------------------------------------------------------
@@ -157,13 +146,13 @@ pub fn chunk_file(content: &str, _cfg: &IndexConfig) -> Vec<Chunk> {
     // -----------------------------------------------------------------------
     // Step 2 & 3: emit chunks
     // -----------------------------------------------------------------------
-    let step = CHUNK_LINES.saturating_sub(OVERLAP_LINES).max(1);
+    let step = cfg.chunk_size.saturating_sub(cfg.chunk_overlap).max(1);
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut chunk_start_line = 0usize; // 0-based index into `lines`
 
     while chunk_start_line < total_lines {
-        // Tentative end: CHUNK_LINES after start, clamped to file end.
-        let tentative_end = (chunk_start_line + CHUNK_LINES).min(total_lines);
+        // Tentative end: chunk_size after start, clamped to file end.
+        let tentative_end = (chunk_start_line + cfg.chunk_size).min(total_lines);
 
         // ----- boundary snapping -----
         // Search ±BOUNDARY_SCAN around `tentative_end` for a better split.
@@ -210,7 +199,7 @@ pub fn chunk_file(content: &str, _cfg: &IndexConfig) -> Vec<Chunk> {
             .filter(|l| l.non_blank)
             .count();
 
-        if non_blank_count >= MIN_CHUNK_LINES {
+        if non_blank_count >= cfg.min_chunk_lines {
             let text = content[byte_start..byte_end].to_owned();
             chunks.push(Chunk {
                 byte_offset: byte_start,
@@ -694,7 +683,7 @@ mod tests {
 
     #[test]
     fn chunk_short_file_below_min_lines() {
-        // 3 non-blank lines → below MIN_CHUNK_LINES → no chunks
+        // 3 non-blank lines → below MIN_40 → no chunks
         let content = "a\nb\nc\n";
         let chunks = chunk_file(content, &test_icfg());
         assert!(
@@ -744,10 +733,10 @@ mod tests {
         // Build a file where a 'fn ' line appears just after the tentative boundary.
         // The chunker should prefer splitting there.
         let mut lines: Vec<String> = Vec::new();
-        for i in 0..CHUNK_LINES {
+        for i in 0..40 {
             lines.push(format!("    // filler line {i}"));
         }
-        // Place a boundary pattern at CHUNK_LINES + 3 (within BOUNDARY_SCAN).
+        // Place a boundary pattern at 40 + 3 (within BOUNDARY_SCAN).
         for _ in 0..3 {
             lines.push("    // more filler".to_string());
         }
@@ -760,9 +749,9 @@ mod tests {
         assert!(!chunks.is_empty());
         // The first chunk should end at or near the 'fn ' line.
         let first = &chunks[0];
-        // The 'fn' line is at 1-based index CHUNK_LINES + 4.
-        // After snapping, end_line should equal CHUNK_LINES + 4.
-        let fn_line = CHUNK_LINES + 4; // 1-based
+        // The 'fn' line is at 1-based index 40 + 4.
+        // After snapping, end_line should equal 40 + 4.
+        let fn_line: usize = 40 + 4; // 1-based
         assert!(
             first.end_line >= fn_line.saturating_sub(BOUNDARY_SCAN)
                 && first.end_line <= fn_line + BOUNDARY_SCAN,
@@ -775,7 +764,7 @@ mod tests {
     fn chunk_overlap_between_consecutive_chunks() {
         // Build a file large enough to produce two chunks.
         let mut lines = Vec::new();
-        for i in 0..(CHUNK_LINES * 2) {
+        for i in 0..(40 * 2) {
             lines.push(format!("code line {i:03}"));
         }
         let content = lines.join("\n") + "\n";
@@ -997,7 +986,7 @@ mod tests {
 
     #[test]
     fn chunk_file_short_file() {
-        // 3 non-blank lines is fewer than MIN_CHUNK_LINES (5) → no chunks.
+        // 3 non-blank lines is fewer than MIN_40 (5) → no chunks.
         let content = "line one\nline two\nline three\n";
         let chunks = chunk_file(content, &test_icfg());
         assert!(
@@ -1122,14 +1111,14 @@ mod tests {
         // Build a file where a function definition appears near a chunk boundary.
         // The chunker should snap the boundary to the function definition line.
         let mut lines: Vec<String> = Vec::new();
-        // Fill CHUNK_LINES lines of filler.
-        for i in 0..CHUNK_LINES {
+        // Fill 40 lines of filler.
+        for i in 0..40 {
             lines.push(format!("    // filler {i}"));
         }
         // Insert 2 filler lines then a boundary pattern within BOUNDARY_SCAN.
         lines.push("    // near boundary 1".to_string());
         lines.push("    // near boundary 2".to_string());
-        lines.push("fn snap_target() {".to_string()); // boundary at CHUNK_LINES + 3 (0-based)
+        lines.push("fn snap_target() {".to_string()); // boundary at 40 + 3 (0-based)
         for i in 0..20 {
             lines.push(format!("    let x = {i};"));
         }
@@ -1139,8 +1128,8 @@ mod tests {
         assert!(!chunks.is_empty(), "file should produce at least one chunk");
 
         let first = &chunks[0];
-        // fn line is at 1-based line CHUNK_LINES + 3.
-        let fn_line_1based = CHUNK_LINES + 3;
+        // fn line is at 1-based line 40 + 3.
+        let fn_line_1based: usize = 40 + 3;
         // The first chunk should end at or near the fn line (within BOUNDARY_SCAN).
         assert!(
             first.end_line >= fn_line_1based.saturating_sub(BOUNDARY_SCAN)
