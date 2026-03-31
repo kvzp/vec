@@ -455,7 +455,14 @@ fn http_embed_request(url: &str, model: &str, texts: &[&str]) -> Result<Vec<Vec<
     let api_path = "/api/embed";
 
     // Tell Ollama to truncate inputs that exceed the model's context window.
-    let input: Vec<&str> = texts.to_vec();
+    // Also cap on our side at ~1500 chars as a safety net — some model variants
+    // ignore the truncate flag.
+    const MAX_CHARS: usize = 1500;
+    let truncated: Vec<String> = texts
+        .iter()
+        .map(|t| t.chars().take(MAX_CHARS).collect())
+        .collect();
+    let input: Vec<&str> = truncated.iter().map(|s| s.as_str()).collect();
     let body = serde_json::json!({
         "model": model,
         "input": input,
