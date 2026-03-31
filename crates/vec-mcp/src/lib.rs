@@ -25,9 +25,9 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
-use crate::embed::Embedder;
-use crate::store::Store;
+use vec_core::config::Config;
+use vec_embed::Embedder;
+use vec_store::Store;
 
 // ---------------------------------------------------------------------------
 // Public return types (serialised to JSON for MCP clients)
@@ -143,7 +143,7 @@ impl VecServer {
         let mut items: Vec<SearchResultItem> = Vec::new();
         for result in raw_results {
             // Security: check read permission before returning the result.
-            if !crate::util::can_read(&result.path) {
+            if !vec_core::util::can_read(&result.path) {
                 continue;
             }
 
@@ -181,7 +181,7 @@ impl VecServer {
 
         // Security: check read permission before returning file content.
         let path = std::path::Path::new(&params.file_path);
-        if !crate::util::can_read(path) {
+        if !vec_core::util::can_read(path) {
             return Err(McpError::invalid_params(
                 format!("Permission denied: {}", params.file_path),
                 None,

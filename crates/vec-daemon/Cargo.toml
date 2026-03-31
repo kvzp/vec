@@ -1,0 +1,16 @@
+[package]
+name = "vec-daemon"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "vec persistent embedding daemon over Unix socket"
+license = "MIT"
+
+[dependencies]
+vec-embed = { path = "../vec-embed" }
+anyhow    = "1"
+anstream  = "0.6"
+
+[dev-dependencies]
+vec-store = { path = "../vec-store" }
+tempfile  = "3"

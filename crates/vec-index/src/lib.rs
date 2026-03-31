@@ -21,9 +21,9 @@ use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
 
-use crate::config::{Config, IndexConfig};
-use crate::embed::Embedder;
-use crate::store::Store;
+use vec_core::config::{Config, IndexConfig};
+use vec_embed::Embedder;
+use vec_store::Store;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -797,8 +797,8 @@ mod tests {
     // --- New tests ---
 
     // Helper: build a full Config pointing at a given TempDir with stub-friendly settings.
-    fn test_cfg_for_dir(dir: &tempfile::TempDir) -> crate::config::Config {
-        let mut cfg = crate::config::Config::load(None).unwrap();
+    fn test_cfg_for_dir(dir: &tempfile::TempDir) -> vec_core::config::Config {
+        let mut cfg = vec_core::config::Config::load(None).unwrap();
         cfg.index.include_paths = vec![dir.path().to_path_buf()];
         cfg.index.min_file_size = 0;
         cfg.index.gitignore = false;
@@ -817,9 +817,9 @@ mod tests {
         }
     }
 
-    fn open_temp_db() -> (tempfile::NamedTempFile, crate::store::Store) {
+    fn open_temp_db() -> (tempfile::NamedTempFile, vec_store::Store) {
         let db_file = tempfile::NamedTempFile::new().unwrap();
-        let store = crate::store::Store::open(db_file.path(), false).unwrap();
+        let store = vec_store::Store::open(db_file.path(), false).unwrap();
         (db_file, store)
     }
 
@@ -831,7 +831,7 @@ mod tests {
 
         let cfg = test_cfg_for_dir(&dir);
         let (_db_file, mut store) = open_temp_db();
-        let embedder = crate::embed::Embedder::stub(768);
+        let embedder = vec_embed::Embedder::stub(768);
 
         let stats = run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {}).unwrap();
 
@@ -854,7 +854,7 @@ mod tests {
 
         let cfg = test_cfg_for_dir(&dir);
         let (_db_file, mut store) = open_temp_db();
-        let embedder = crate::embed::Embedder::stub(768);
+        let embedder = vec_embed::Embedder::stub(768);
 
         // First run indexes the file.
         run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {}).unwrap();
@@ -880,7 +880,7 @@ mod tests {
 
         let cfg = test_cfg_for_dir(&dir);
         let (_db_file, mut store) = open_temp_db();
-        let embedder = crate::embed::Embedder::stub(768);
+        let embedder = vec_embed::Embedder::stub(768);
 
         // First run — normal incremental.
         run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {}).unwrap();
@@ -914,7 +914,7 @@ mod tests {
 
         let cfg = test_cfg_for_dir(&dir);
         let (_db_file, mut store) = open_temp_db();
-        let embedder = crate::embed::Embedder::stub(768);
+        let embedder = vec_embed::Embedder::stub(768);
 
         let stats = run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {}).unwrap();
 
@@ -942,7 +942,7 @@ mod tests {
         cfg.index.max_file_size = 100; // 100 bytes limit
 
         let (_db_file, mut store) = open_temp_db();
-        let embedder = crate::embed::Embedder::stub(768);
+        let embedder = vec_embed::Embedder::stub(768);
 
         let stats = run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {}).unwrap();
 
@@ -967,7 +967,7 @@ mod tests {
 
         let cfg = test_cfg_for_dir(&dir);
         let (_db_file, mut store) = open_temp_db();
-        let embedder = crate::embed::Embedder::stub(768);
+        let embedder = vec_embed::Embedder::stub(768);
 
         // Only index files under sub_a.
         let stats =
@@ -1062,7 +1062,7 @@ mod tests {
 
         let cfg = test_cfg_for_dir(&dir);
         let (_db_file, mut store) = open_temp_db();
-        let embedder = crate::embed::Embedder::stub(768);
+        let embedder = vec_embed::Embedder::stub(768);
 
         let stats = run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {}).unwrap();
 
@@ -1102,7 +1102,7 @@ mod tests {
 
         let cfg = test_cfg_for_dir(&dir);
         let (_db_file, mut store) = open_temp_db();
-        let embedder = crate::embed::Embedder::stub(768);
+        let embedder = vec_embed::Embedder::stub(768);
 
         let result = run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {});
 
@@ -1148,5 +1148,44 @@ mod tests {
             first.end_line,
             fn_line_1based
         );
+    }
+
+    #[test]
+    fn full_pipeline_with_stub() {
+        use std::io::Write;
+
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let mut store = vec_store::Store::open(db_file.path(), false).unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        for name in &["alpha.txt", "beta.txt"] {
+            let p = dir.path().join(name);
+            let mut f = std::fs::File::create(&p).unwrap();
+            for i in 0..50u32 {
+                writeln!(f, "This is line {i} of {name}").unwrap();
+            }
+        }
+
+        let cfg = {
+            let mut c = vec_core::config::Config::load(None).unwrap();
+            c.index.include_paths = vec![dir.path().to_path_buf()];
+            c.index.min_file_size = 0;
+            c.index.gitignore = false;
+            c.index.exclude_dirs = vec![];
+            c.index.exclude_files = vec![];
+            c.embed.batch_size = 4;
+            c
+        };
+
+        let embedder = vec_embed::Embedder::stub(768);
+        let stats = run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {}).unwrap();
+
+        assert!(stats.files_updated >= 2);
+        assert!(stats.chunks_added > 0);
+
+        let qemb = vec_embed::Embedder::stub(768);
+        let query_vec = qemb.embed_one("authentication middleware").unwrap();
+        let results = store.search(&query_vec, 5, -1.0, None).unwrap();
+        assert!(!results.is_empty());
     }
 }

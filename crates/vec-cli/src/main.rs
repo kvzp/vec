@@ -8,24 +8,15 @@
 //   vec model download       — show where to get the model
 //   vec init                 — write a default config file
 
-mod config;
-mod daemon;
-mod embed;
-mod index;
-mod mcp;
-mod store;
-mod util;
-mod watch;
-
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::config::Config;
-use crate::embed::Embedder;
-use crate::index::run_updatedb;
-use crate::store::Store;
+use vec_core::config::Config;
+use vec_embed::Embedder;
+use vec_index::run_updatedb;
+use vec_store::Store;
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -141,12 +132,12 @@ async fn main() -> Result<()> {
             cmd_updatedb(full, path.as_deref(), cfg_path).await
         }
         Some(Command::Status) => cmd_status(cfg_path).await,
-        Some(Command::Serve) => crate::mcp::run_server().await,
+        Some(Command::Serve) => vec_mcp::run_server().await,
         Some(Command::Model {
             action: ModelAction::Download,
         }) => cmd_model_download(cfg_path),
         Some(Command::Init { user }) => cmd_init(user),
-        Some(Command::Watch) => crate::watch::run_watch(),
+        Some(Command::Watch) => vec_watch::run_watch(),
         Some(Command::Daemon) => cmd_daemon(cfg_path).await,
     }
 }
@@ -195,7 +186,7 @@ async fn cmd_search(
     for result in &results {
         // Security: check read permission before displaying.
         // Silently skip results the current user cannot read.
-        if !crate::util::can_read(&result.path) {
+        if !vec_core::util::can_read(&result.path) {
             continue;
         }
 
@@ -253,7 +244,7 @@ async fn cmd_updatedb(
     let mut store =
         Store::open(&cfg.database.db_path, cfg.database.wal).context("opening store")?;
 
-    let embedder = load_embedder(&cfg);
+    let embedder = vec_core::load_embedder(&cfg);
 
     if full {
         anstream::eprintln!("Full re-index...");
@@ -485,7 +476,7 @@ async fn cmd_daemon(cfg_path: Option<&std::path::Path>) -> Result<()> {
         Embedder::load(&model_path, cfg.embed.max_tokens).context("loading embedding model")?;
 
     #[cfg(unix)]
-    return crate::daemon::run_daemon(embedder, &cfg.embed.daemon_socket);
+    return vec_daemon::run_daemon(embedder, &cfg.embed.daemon_socket);
 
     #[cfg(not(unix))]
     {
@@ -512,7 +503,7 @@ fn embed_query(cfg: &Config, text: &str) -> Result<Vec<f32>> {
     }
 
     // Slow path: compile and run the model in-process.
-    let embedder = load_embedder(cfg);
+    let embedder = vec_core::load_embedder(cfg);
     embedder.embed_one(text).context("embedding query")
 }
 
@@ -547,40 +538,11 @@ fn try_daemon_embed(socket_path: &std::path::Path, text: &str) -> Option<Vec<f32
         return None; // Daemon returned an error — fall back to local.
     }
 
-    let floats = crate::store::unpack_f32(&data);
+    let floats = vec_store::unpack_f32(&data);
     if floats.is_empty() {
         return None;
     }
     Some(floats)
-}
-
-/// Load the embedder from the configured model path.
-///
-/// If the model cannot be found or loaded, falls back to a deterministic stub
-/// embedder (dim=768) and prints a warning to stderr.
-pub(crate) fn load_embedder(cfg: &Config) -> Embedder {
-    match cfg.resolve_model_path() {
-        Ok(model_path) => match Embedder::load(&model_path, cfg.embed.max_tokens) {
-            Ok(e) => return e,
-            Err(err) => {
-                anstream::eprintln!(
-                    "warn: could not load model at {}: {:?}\n\
-                         Falling back to stub embedder (not semantically meaningful).",
-                    model_path.display(),
-                    err,
-                );
-            }
-        },
-        Err(_) => {
-            anstream::eprintln!(
-                "warn: model '{}' not found in search path.\n\
-                 Run `vec model download` for installation instructions.\n\
-                 Using stub embedder (not semantically meaningful).",
-                cfg.embed.model
-            );
-        }
-    }
-    Embedder::stub(768)
 }
 
 /// Format a byte count as a human-readable size string.
@@ -634,7 +596,7 @@ fn fmt_unix_ts(secs: u64) -> String {
 /// returns the 1-based line number of the best match.  Returns `None` if
 /// the file can't be read or no line scores above zero.
 fn best_line_in_chunk(
-    result: &crate::store::SearchResult,
+    result: &vec_store::SearchResult,
     query_words: &[String],
 ) -> Option<usize> {
     let bytes = std::fs::read(&result.path).ok()?;

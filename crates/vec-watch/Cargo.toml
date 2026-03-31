@@ -1,0 +1,16 @@
+[package]
+name = "vec-watch"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "vec real-time inotify filesystem watcher"
+license = "MIT"
+
+[dependencies]
+vec-core  = { path = "../vec-core" }
+vec-embed = { path = "../vec-embed" }
+vec-index = { path = "../vec-index" }
+vec-store = { path = "../vec-store" }
+notify    = "6"
+anstream  = "0.6"
+anyhow    = "1"

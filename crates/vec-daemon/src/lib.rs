@@ -23,7 +23,7 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 
-use crate::embed::Embedder;
+use vec_embed::Embedder;
 use anyhow::{Context, Result};
 use std::path::Path;
 
@@ -140,7 +140,7 @@ pub(crate) fn handle_connection(stream: &mut UnixStream, embedder: &Embedder) ->
 #[cfg(unix)]
 mod tests {
     use super::*;
-    use crate::store::unpack_f32;
+    use vec_store::unpack_f32;
     use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
 

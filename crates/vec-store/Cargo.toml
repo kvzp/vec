@@ -1,0 +1,14 @@
+[package]
+name = "vec-store"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "vec SQLite storage and cosine similarity search"
+license = "MIT"
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+anyhow   = "1"
+
+[features]
+system-sqlite = []

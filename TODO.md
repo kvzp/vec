@@ -31,11 +31,12 @@
 ## Operational
 
 - [ ] **`vec gc`** — garbage collect orphaned chunks from files that were deleted but not pruned. The incremental updater handles this, but a manual command gives confidence.
+- [ ] **Watcher cleanup on delete** — verify that the watcher notices file deletions and removes stale entries from the index. Currently `run_updatedb` prunes missing files, but this should be confirmed end-to-end for inotify `Remove` events.
 - [ ] **`vec explain <file:line>`** — show which chunk(s) cover a given line and their embedding stats. Debugging tool for "why did/didn't this show up in results?"
 
 ## Architecture
 
-- [ ] **Split into crates** — the single `src/` directory mixes embedding, indexing, storage, config, CLI, MCP server, daemon, and watcher into one compilation unit. Split into workspace crates for faster incremental builds, clearer dependency boundaries, and reusability:
+- [x] **Split into crates** — the single `src/` directory mixes embedding, indexing, storage, config, CLI, MCP server, daemon, and watcher into one compilation unit. Split into workspace crates for faster incremental builds, clearer dependency boundaries, and reusability:
   - `vec-core` — config, store, embedder, chunker (the library)
   - `vec-cli` — clap CLI, `cmd_search`, `cmd_init`, progress output
   - `vec-mcp` — MCP server (`vec serve`)

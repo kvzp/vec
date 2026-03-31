@@ -2583,30 +2583,114 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
-name = "vec-locate"
+name = "vec-cli"
 version = "0.1.0"
 dependencies = [
  "anstream",
  "anyhow",
  "clap",
  "dirs",
- "hex",
- "ignore",
- "ndarray 0.17.2",
- "nix",
- "notify",
- "prost",
- "rayon",
- "rmcp",
- "rusqlite",
  "serde",
  "serde_json",
+ "tokio",
+ "vec-core",
+ "vec-daemon",
+ "vec-embed",
+ "vec-index",
+ "vec-mcp",
+ "vec-store",
+ "vec-watch",
+]
+
+[[package]]
+name = "vec-core"
+version = "0.1.0"
+dependencies = [
+ "anstream",
+ "anyhow",
+ "dirs",
+ "nix",
+ "serde",
+ "tempfile",
+ "toml",
+ "vec-embed",
+]
+
+[[package]]
+name = "vec-daemon"
+version = "0.1.0"
+dependencies = [
+ "anstream",
+ "anyhow",
+ "tempfile",
+ "vec-embed",
+ "vec-store",
+]
+
+[[package]]
+name = "vec-embed"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "ndarray 0.17.2",
+ "prost",
+ "rayon",
  "sha2",
  "tempfile",
  "tokenizers",
- "tokio",
- "toml",
  "tract-onnx",
+]
+
+[[package]]
+name = "vec-index"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "ignore",
+ "rayon",
+ "sha2",
+ "tempfile",
+ "vec-core",
+ "vec-embed",
+ "vec-store",
+]
+
+[[package]]
+name = "vec-mcp"
+version = "0.1.0"
+dependencies = [
+ "anstream",
+ "anyhow",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
+ "vec-core",
+ "vec-embed",
+ "vec-store",
+]
+
+[[package]]
+name = "vec-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rusqlite",
+]
+
+[[package]]
+name = "vec-watch"
+version = "0.1.0"
+dependencies = [
+ "anstream",
+ "anyhow",
+ "notify",
+ "vec-core",
+ "vec-embed",
+ "vec-index",
+ "vec-store",
 ]
 
 [[package]]

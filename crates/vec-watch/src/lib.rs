@@ -23,9 +23,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 
-use crate::config::Config;
-use crate::index::run_updatedb;
-use crate::store::Store;
+use vec_core::config::Config;
+use vec_index::run_updatedb;
+use vec_store::Store;
 
 /// Debounce window: wait this long after the last event before re-indexing.
 const DEBOUNCE_SECS: u64 = 3;
@@ -144,7 +144,7 @@ fn index_paths(cfg: &Config, paths: &[PathBuf]) {
             }
         };
 
-        let embedder = crate::load_embedder(cfg);
+        let embedder = vec_core::load_embedder(cfg);
 
         match run_updatedb(
             &mut store,
