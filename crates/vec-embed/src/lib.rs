@@ -410,28 +410,41 @@ fn embed_batch_inner(inner: &EmbedderInner, texts: &[&str]) -> Result<Vec<Vec<f3
             if texts.is_empty() {
                 return Ok(vec![]);
             }
-            // Send individual HTTP requests with limited concurrency to avoid
-            // overwhelming Ollama (connection resets at high parallelism).
+            // Sliding window: keep MAX_CONCURRENT requests in flight at all
+            // times. A work-stealing pattern using an atomic counter ensures
+            // a completed thread immediately picks up the next text.
             const MAX_CONCURRENT: usize = 4;
-            let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::sync::Mutex;
 
-            for chunk in texts.chunks(MAX_CONCURRENT) {
-                let results: Vec<Result<Vec<f32>>> = std::thread::scope(|s| {
-                    let handles: Vec<_> = chunk
-                        .iter()
-                        .map(|&text| {
-                            s.spawn(|| {
-                                let mut vecs = http_embed_request(url, model, &[text])?;
-                                vecs.pop()
-                                    .ok_or_else(|| anyhow::anyhow!("HTTP embed returned empty"))
-                            })
-                        })
-                        .collect();
-                    handles.into_iter().map(|h| h.join().unwrap()).collect()
-                });
-                for r in results {
-                    embeddings.push(r?);
+            let next_idx = AtomicUsize::new(0);
+            let results: Vec<Mutex<Option<Result<Vec<f32>>>>> =
+                (0..texts.len()).map(|_| Mutex::new(None)).collect();
+
+            std::thread::scope(|s| {
+                for _ in 0..MAX_CONCURRENT.min(texts.len()) {
+                    s.spawn(|| {
+                        loop {
+                            let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                            if idx >= texts.len() {
+                                break;
+                            }
+                            let result = http_embed_request(url, model, &[texts[idx]])
+                                .and_then(|mut v| {
+                                    v.pop().ok_or_else(|| anyhow::anyhow!("HTTP embed returned empty"))
+                                });
+                            *results[idx].lock().unwrap() = Some(result);
+                        }
+                    });
                 }
+            });
+
+            // Collect results in order.
+            let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+            for slot in &results {
+                let r = slot.lock().unwrap().take()
+                    .unwrap_or_else(|| Err(anyhow::anyhow!("embedding slot was never filled")));
+                embeddings.push(r?);
             }
             // Normalise all vectors to unit length (Ollama doesn't always do this).
             for v in &mut embeddings {
