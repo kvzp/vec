@@ -466,7 +466,25 @@ fn http_embed_request(url: &str, model: &str, texts: &[&str]) -> Result<Vec<Vec<
     let (host_port, _) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
     let api_path = "/api/embed";
 
-    let input: Vec<&str> = texts.to_vec();
+    // Truncate inputs client-side — Ollama's `truncate` flag is unreliable
+    // for some models (e.g. nomic-embed-text-v2-moe). Cap at 1200 chars
+    // (~400 tokens at ~3 chars/token, well within a 512-token context).
+    const MAX_BYTES: usize = 1200;
+    let truncated: Vec<String> = texts
+        .iter()
+        .map(|t| {
+            if t.len() <= MAX_BYTES {
+                t.to_string()
+            } else {
+                let mut end = MAX_BYTES;
+                while end > 0 && !t.is_char_boundary(end) {
+                    end -= 1;
+                }
+                t[..end].to_string()
+            }
+        })
+        .collect();
+    let input: Vec<&str> = truncated.iter().map(|s| s.as_str()).collect();
     let body = serde_json::json!({
         "model": model,
         "input": input,
