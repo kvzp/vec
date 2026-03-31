@@ -9,28 +9,38 @@ allowed-tools: Bash(*), Read
 
 You have access to `vec`, a semantic search tool that finds files by meaning using vector embeddings. It works like `locate` but for concepts instead of filenames.
 
+## CRITICAL: Always use --config
+
+vec requires the `--config` flag to find the userland database. **Every** vec command must include it:
+
+```
+vec --config ~/.config/vec/config.toml <args>
+```
+
+Without `--config`, vec tries `/var/lib/vec` (system path) and fails with "Permission denied".
+
 ## How to search
 
 Run `vec` directly via Bash. The output is `file:line` paths, one per line — pipe-friendly.
 
 ```bash
 # Basic search
-vec "authentication middleware"
+vec --config ~/.config/vec/config.toml "authentication middleware"
 
 # Limit results
-vec "error handling" --limit 5
+vec --config ~/.config/vec/config.toml "error handling" --limit 5
 
 # Scope to a directory
-vec "database connection" --path ~/projects/backend
+vec --config ~/.config/vec/config.toml "database connection" --path ~/projects/backend
 
 # Show code snippets inline
-vec "cache invalidation" --snippet
+vec --config ~/.config/vec/config.toml "cache invalidation" --snippet
 
 # Filter by minimum relevance score
-vec "auth logic" --min-score 0.82
+vec --config ~/.config/vec/config.toml "auth logic" --min-score 0.82
 
 # Combine flags
-vec "payment processing" --path ~/projects --limit 10 --snippet --min-score 0.75
+vec --config ~/.config/vec/config.toml "payment processing" --path ~/projects --limit 10 --snippet --min-score 0.75
 ```
 
 ## Reading context around a result
@@ -46,7 +56,7 @@ Use the Read tool with offset/limit to view context around the matched line.
 ## Checking index health
 
 ```bash
-vec status
+vec --config ~/.config/vec/config.toml status
 ```
 
 Reports: file count, chunk count, DB path, model info, last update.
