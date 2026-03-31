@@ -123,6 +123,7 @@ These are always excluded regardless of config:
 |-----|------|---------|-------------|
 | `default_limit` | integer | `10` | Results returned when `--limit` is not specified |
 | `snippet_lines` | integer | `3` | Lines of context above and below the best-matching line shown with `--snippet` (±N, so 3 means 7 lines total) |
+| `path_boost` | float | `0.05` | Score bonus per query keyword found in the file path. Searching "auth" boosts `auth/middleware.rs` over `utils/helpers.rs` at equal embedding similarity. Set to `0.0` to disable. |
 
 ---
 

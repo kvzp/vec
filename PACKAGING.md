@@ -34,7 +34,7 @@ No `protobuf-compiler`. No Python. No HuggingFace tooling. No network access at 
 ### Build command
 
 ```bash
-cargo build --release --features system-sqlite
+cargo build --release -p vec-cli --features vec-store/system-sqlite
 ```
 
 | Feature | Effect |
@@ -209,7 +209,7 @@ vec is BSD-compatible. Portability differences are handled via conditional compi
 Build deps: `lang/rust`, `databases/sqlite3`, `devel/pkgconf`
 
 ```bash
-cargo build --release --features system-sqlite
+cargo build --release -p vec-cli --features vec-store/system-sqlite
 ```
 
 Install prefix: `/usr/local/`
@@ -230,7 +230,7 @@ Data directory: `/var/db/vec/` (BSD convention; configure via `/usr/local/etc/ve
 Build deps: `lang/rust`, `databases/sqlite3`
 
 ```bash
-cargo build --release --features system-sqlite
+cargo build --release -p vec-cli --features vec-store/system-sqlite
 ```
 
 Notes:

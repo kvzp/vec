@@ -11,8 +11,31 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Workspace split** — 8 crates: vec-core, vec-embed, vec-store, vec-index, vec-watch, vec-daemon, vec-mcp, vec-cli
+- **New subcommands:** `vec context`, `vec similar`, `vec repl`, `vec gc`, `vec explain`, `vec diff`, `vec completions`
+- **New flags:** `--json` (structured output), `--exclude` (filter directories)
+- **Multi-query search** — `vec "auth" "error handling"` merges and deduplicates results
+- **Path-weighted re-ranking** — file paths containing query keywords get a score boost (`[search] path_boost`)
+- **MCP snippet trimming** — `search` tool returns ±`snippet_lines` around best-matching line instead of full chunk
+- **Auto-detect userland config** — `~/.config/vec/config.toml` loaded automatically, no `--config` needed
+- **Scores always shown** — every result includes `(score: 0.XXX)`
+- **Snippet rework** — `--snippet` shows ±3 lines with line numbers and `>` marker (was full 40-line chunk)
+- **Best-line targeting** — results point to the most relevant line within a chunk, not chunk start
 - Parallel embedding during indexing via rayon — `vec updatedb` now uses all available CPU cores
 - `[embed] index_threads` config option (0 = auto, default; set to N to limit threads)
+- `vec gc` runs automatically after daily `vec-updatedb.service` via `ExecStartPost`
+- Nix flake (`flake.nix`) for NixOS users
+- Systemd user units for userland installs (`contrib/user/`)
+- Claude Code `/vec` skill for AI assistant integration
+
+### Fixed
+
+- ONNX model loading with `gte-multilingual-base` — cleared `value_info` symbolic dims that tract couldn't parse
+- Watcher feedback loop — events from the DB directory are now filtered out
+
+### Changed
+
+- File read cache in search — no redundant I/O for best-line targeting and snippet display
 
 ---
 

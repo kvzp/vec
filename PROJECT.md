@@ -152,14 +152,14 @@ vec/
 ├── Cargo.toml
 ├── Cargo.lock
 ├── src/
-│   ├── main.rs         # CLI entry point
-│   ├── config.rs       # TOML config (/etc/vec.conf)
-│   ├── embed.rs        # tract-onnx CPU inference (pure Rust, no C deps)
-│   ├── store.rs        # SQLite read/write, cosine similarity, access() validation
-│   ├── index.rs        # File walker, chunker, gitignore-aware, incremental
-│   ├── watch.rs        # inotify-based real-time re-indexing (vec watch)
-│   ├── mcp.rs          # MCP server: search, context, index_status
-│   └── util.rs         # Shared helpers
+│   ├── vec-core/       # Config, util, load_embedder
+│   ├── vec-embed/      # ONNX inference (tract, tokenizer, rayon)
+│   ├── vec-store/      # SQLite, cosine similarity search
+│   ├── vec-index/      # File walker, chunker, incremental indexer, diff
+│   ├── vec-watch/      # inotify real-time watcher
+│   ├── vec-daemon/     # Unix socket embedding daemon
+│   ├── vec-mcp/        # MCP server: search, context, index_status
+│   └── vec-cli/        # Clap CLI — all subcommands
 ├── contrib/
 │   ├── vec.conf               # /etc/vec.conf template (all defaults commented)
 │   ├── vec-updatedb.service   # systemd oneshot service

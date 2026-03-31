@@ -165,22 +165,49 @@ vec "payment processing"
 vec "cache invalidation" --limit 5
 vec "auth logic" --path ~/projects/backend
 
-# Show snippets inline
+# Multi-query (results merged and deduplicated)
+vec "auth middleware" "error handling" "database pooling"
+
+# Show snippets inline (±3 lines around best match)
 vec "error handling" --snippet
+
+# JSON output for scripting
+vec "auth logic" --json
+
+# Exclude directories from results
+vec "auth" --exclude ~/projects/old-fork
 
 # Filter weak matches at query time
 vec "auth logic" --min-score 0.82
+
+# Find code similar to a location (no model load needed)
+vec similar src/auth.rs:42
+
+# Show source context around a file:line (fzf preview friendly)
+vec context src/auth.rs:42 --window 5
+
+# Interactive mode (loads model once, accepts queries in a loop)
+vec repl
 
 # Index management
 vec updatedb                        # incremental re-index (changed files only)
 vec updatedb --full                 # force full re-index
 vec status                          # DB stats, config, last update
+vec diff                            # show new/changed/deleted files vs index
+vec gc                              # prune stale entries + vacuum DB
+
+# Debugging
+vec explain src/auth.rs:42          # show which chunks cover a line
 
 # Real-time watching (runs as a systemd service, rarely invoked directly)
 vec watch
 
 # MCP server (AI assistant integration)
 vec serve
+
+# Shell completions
+vec completions bash >> ~/.bash_completion
+vec completions zsh > ~/.zfunc/_vec
 
 # First-time setup
 vec init | sudo tee /etc/vec.conf   # write default config

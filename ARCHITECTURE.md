@@ -26,16 +26,21 @@ Every query re-validates each result with `access(path, R_OK)` as the requesting
 
 ## Components
 
+Cargo workspace with 8 crates:
+
 ```
-src/
-├── main.rs       # Clap CLI entry point
-├── config.rs     # TOML config, path resolution
-├── embed.rs      # Embedding backends: local ONNX (tract) or HTTP (Ollama/OpenAI-compatible)
-├── store.rs      # rusqlite read/write, cosine similarity, access() validation
-├── index.rs      # File walker (ignore crate), chunker, incremental update (sha256)
-├── watch.rs      # inotify-based real-time re-indexing (vec watch)
-└── mcp.rs        # MCP server (rmcp): search, context, index_status
+crates/
+├── vec-core/     # Config (TOML, path resolution), util (access() check), load_embedder()
+├── vec-embed/    # ONNX inference via tract, HuggingFace tokenizer, rayon parallel embedding
+├── vec-store/    # rusqlite, cosine similarity search, pack/unpack embeddings
+├── vec-index/    # File walker (ignore crate), chunker, incremental update (sha256), diff
+├── vec-watch/    # inotify-based real-time re-indexing (vec watch)
+├── vec-daemon/   # Unix socket embedding daemon (vec daemon)
+├── vec-mcp/      # MCP server (rmcp): search, context, index_status
+└── vec-cli/      # Clap CLI entry point, all subcommands
 ```
+
+Dependency graph: `vec-core` and `vec-embed` and `vec-store` are standalone. `vec-index` depends on all three. `vec-cli` depends on everything.
 
 ---
 

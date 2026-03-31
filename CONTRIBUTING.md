@@ -82,26 +82,29 @@ Tests that require the embedding model on disk are gated behind `#[cfg(feature =
 
 ```
 vec/
-├── src/
-│   ├── main.rs         # CLI entry point (clap)
-│   ├── config.rs       # TOML config, compiled-in defaults
-│   ├── embed.rs        # tract-onnx local ONNX inference
-│   ├── store.rs        # SQLite read/write, cosine similarity, access()
-│   ├── index.rs        # File walker, chunker, incremental hash check
-│   ├── watch.rs        # inotify watcher (vec watch subcommand)
-│   ├── mcp.rs          # MCP server (vec serve)
-│   └── util.rs         # Shared helpers
-├── contrib/            # systemd units, sysctl, distro packaging
-├── Cargo.toml
-├── README.md           # Quick start, usage, schema overview, crate dependencies
+├── crates/
+│   ├── vec-core/       # Config (TOML), util (access() check), load_embedder()
+│   ├── vec-embed/      # ONNX inference via tract, tokenizer, rayon parallel embedding
+│   ├── vec-store/      # SQLite storage, cosine similarity search, pack/unpack
+│   ├── vec-index/      # File walker, chunker, incremental hash check, diff
+│   ├── vec-watch/      # inotify watcher (vec watch)
+│   ├── vec-daemon/     # Unix socket embedding daemon (vec daemon)
+│   ├── vec-mcp/        # MCP server (vec serve)
+│   └── vec-cli/        # Clap CLI — all subcommands
+├── contrib/            # systemd units (system + user), sysctl, distro packaging
+├── Cargo.toml          # Workspace root
+├── flake.nix           # Nix flake for NixOS users
+├── README.md           # Quick start, usage, output format
 ├── ARCHITECTURE.md     # Core design decisions and data flow
 ├── SECURITY.md         # Security model: no-content DB, access() ACL, threat analysis
 ├── CONTRIBUTING.md     # This file — dev setup, tests, project structure, invariants
 ├── TESTING.md          # Test strategy, coverage table, known gaps, test conventions
-├── CONFIG.md           # Full /etc/vec.conf reference with all settings and recipes
+├── CONFIG.md           # Full config reference with all settings and recipes
 ├── AI-INTEGRATION.md   # AI assistant integration (MCP server, Claude Code skill, hooks)
 ├── PACKAGING.md        # Guide for distro packagers (Debian/RPM/BSD, system-sqlite)
 ├── CHANGELOG.md        # Version history following Keep a Changelog
+├── TODO.md             # Feature backlog and deferred items
+├── BUGS.md             # Known bugs and untested platforms
 └── PROJECT.md          # Project positioning, mental model, and MVP scope
 ```
 
