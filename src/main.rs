@@ -185,6 +185,12 @@ async fn cmd_search(
         return Ok(());
     }
 
+    // Pre-compute query keywords (lowercased, deduplicated) for best-line matching.
+    let query_words: Vec<String> = query
+        .split_whitespace()
+        .map(|w| w.to_lowercase())
+        .collect();
+
     for result in &results {
         // Security: check read permission before displaying.
         // Silently skip results the current user cannot read.
@@ -193,26 +199,31 @@ async fn cmd_search(
         }
 
         if !show_snippet {
-            println!("{}:{}", result.path.display(), result.start_line);
+            // Find the best-matching line within the chunk for a more
+            // precise file:line reference.
+            let best = best_line_in_chunk(result, &query_words)
+                .unwrap_or(result.start_line);
+            println!("{}:{}", result.path.display(), best);
         } else {
+            // Read the file and show snippet_lines around the best line.
+            let best = best_line_in_chunk(result, &query_words)
+                .unwrap_or(result.start_line);
             println!(
                 "{}:{} (score: {:.3})",
                 result.path.display(),
-                result.start_line,
+                best,
                 result.score
             );
-            // Read the file and show snippet_lines lines around start_line.
             match std::fs::read_to_string(&result.path) {
                 Ok(content) => {
                     let lines: Vec<&str> = content.lines().collect();
                     let ctx = cfg.search.snippet_lines;
-                    // start_line is 1-based; convert to 0-based index.
-                    let target = result.start_line.saturating_sub(1);
+                    let target = best.saturating_sub(1); // 1-based → 0-based
                     let from = target.saturating_sub(ctx);
                     let to = (target + ctx + 1).min(lines.len());
                     for (i, line) in lines[from..to].iter().enumerate() {
                         let lineno = from + i + 1;
-                        let marker = if lineno == result.start_line { ">" } else { " " };
+                        let marker = if lineno == best { ">" } else { " " };
                         println!("{} {:>5}: {}", marker, lineno, line);
                     }
                 }
@@ -613,4 +624,42 @@ fn fmt_unix_ts(secs: u64) -> String {
     let y = if m <= 2 { y + 1 } else { y };
 
     format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, hh, mm)
+}
+
+/// Find the line within a chunk that best matches the query keywords.
+///
+/// Reads the chunk text from disk (byte_offset..byte_end), scores each line
+/// by counting how many query words appear in it (case-insensitive), and
+/// returns the 1-based line number of the best match.  Returns `None` if
+/// the file can't be read or no line scores above zero.
+fn best_line_in_chunk(
+    result: &crate::store::SearchResult,
+    query_words: &[String],
+) -> Option<usize> {
+    let bytes = std::fs::read(&result.path).ok()?;
+    let end = result.byte_end.min(bytes.len());
+    let start = result.byte_offset.min(end);
+    let chunk = String::from_utf8_lossy(&bytes[start..end]);
+
+    let mut best_score = 0usize;
+    let mut best_offset = 0usize; // 0-based offset within the chunk
+
+    for (i, line) in chunk.lines().enumerate() {
+        let lower = line.to_lowercase();
+        let score: usize = query_words
+            .iter()
+            .filter(|w| lower.contains(w.as_str()))
+            .count();
+        if score > best_score {
+            best_score = score;
+            best_offset = i;
+        }
+    }
+
+    if best_score > 0 {
+        // Convert chunk-relative offset to absolute 1-based line number.
+        Some(result.start_line + best_offset)
+    } else {
+        None
+    }
 }
