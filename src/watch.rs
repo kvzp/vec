@@ -131,11 +131,11 @@ fn index_paths(cfg: &Config, paths: &[PathBuf]) {
             }
         };
 
-        let mut embedder = crate::load_embedder(cfg);
+        let embedder = crate::load_embedder(cfg);
 
         match run_updatedb(
             &mut store,
-            &mut embedder,
+            &embedder,
             cfg,
             false,     // not a full re-index
             Some(dir), // scope to this directory

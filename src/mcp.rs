@@ -121,7 +121,7 @@ impl VecServer {
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         // Load embedder (stub fallback if model not ready).
-        let mut embedder = load_embedder_for_mcp(cfg);
+        let embedder = load_embedder_for_mcp(cfg);
 
         let limit = params
             .limit

@@ -46,6 +46,7 @@ For `include_paths`, you define the full list — it replaces `["/"]` entirely.
 | `batch_size` | integer | `16` | Chunks per inference call. Higher = better throughput; lower = less peak RAM |
 | `max_tokens` | integer | `128` | Token limit per chunk passed to the tokeniser. Longer chunks are truncated. Attention is O(n²) — halving this quadruples indexing speed |
 | `daemon_socket` | path | `"/run/vec/embed.sock"` | **Optional.** Unix socket path for `vec daemon`. `vec` tries this socket first and falls back to in-process model loading if the daemon is not running. See note below. |
+| `index_threads` | integer | `0` | Number of threads for parallel embedding during indexing. `0` = automatic (all available cores). Set to a lower number on memory-constrained systems |
 
 > **`daemon_socket` / `vec daemon` is completely optional.**
 > The daemon keeps the compiled ONNX model in resident memory (150–300 MB)

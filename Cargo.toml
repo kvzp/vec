@@ -32,6 +32,7 @@ prost            = "0.11"
 # compiles on every architecture Rust supports.
 tract-onnx       = "0.21"
 ndarray          = "0.17"
+rayon            = "1.10"
 
 # nix is Unix-only (Linux, macOS, BSDs). Not compiled on Windows.
 [target.'cfg(unix)'.dependencies]

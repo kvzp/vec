@@ -304,7 +304,7 @@ pub struct IndexStats {
 /// An [`IndexStats`] summarising the run.
 pub fn run_updatedb(
     store: &mut Store,
-    embedder: &mut Embedder,
+    embedder: &Embedder,
     cfg: &Config,
     full: bool,
     path_filter: Option<&Path>,
@@ -381,11 +381,21 @@ pub fn run_updatedb(
     // Follow symlinks is intentionally false (default) — avoids infinite loops.
     builder.follow_links(false);
 
-    // Process entries one by one (not in parallel — we call `store` which is
-    // single-threaded and embedding is already CPU-bound).
-    //
-    // Batch state: collect (path, chunks) then flush to DB.
-    let batch_size = cfg.embed.batch_size;
+    // Configure rayon thread pool for parallel embedding.
+    let num_threads = if cfg.embed.index_threads == 0 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    } else {
+        cfg.embed.index_threads
+    };
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .ok(); // ignore if already initialised
+
+    // Scale batch size to fill all cores: each thread gets batch_size chunks.
+    let batch_size = cfg.embed.batch_size * num_threads;
 
     // We accumulate chunks across files until we fill a batch, then embed.
     struct PendingChunk {
@@ -404,7 +414,7 @@ pub fn run_updatedb(
     // that takes explicit arguments.
     fn flush_pending(
         pending: &mut Vec<PendingChunk>,
-        embedder: &mut Embedder,
+        embedder: &Embedder,
         store: &mut Store,
         stats: &mut IndexStats,
         progress: &dyn Fn(&str),
@@ -821,9 +831,9 @@ mod tests {
 
         let cfg = test_cfg_for_dir(&dir);
         let (_db_file, mut store) = open_temp_db();
-        let mut embedder = crate::embed::Embedder::stub(768);
+        let embedder = crate::embed::Embedder::stub(768);
 
-        let stats = run_updatedb(&mut store, &mut embedder, &cfg, false, None, |_| {}).unwrap();
+        let stats = run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {}).unwrap();
 
         assert!(
             stats.files_updated >= 2,
@@ -844,13 +854,13 @@ mod tests {
 
         let cfg = test_cfg_for_dir(&dir);
         let (_db_file, mut store) = open_temp_db();
-        let mut embedder = crate::embed::Embedder::stub(768);
+        let embedder = crate::embed::Embedder::stub(768);
 
         // First run indexes the file.
-        run_updatedb(&mut store, &mut embedder, &cfg, false, None, |_| {}).unwrap();
+        run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {}).unwrap();
 
         // Second run — file content unchanged — should show files_unchanged > 0.
-        let stats2 = run_updatedb(&mut store, &mut embedder, &cfg, false, None, |_| {}).unwrap();
+        let stats2 = run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {}).unwrap();
 
         assert!(
             stats2.files_unchanged >= 1,
@@ -870,13 +880,13 @@ mod tests {
 
         let cfg = test_cfg_for_dir(&dir);
         let (_db_file, mut store) = open_temp_db();
-        let mut embedder = crate::embed::Embedder::stub(768);
+        let embedder = crate::embed::Embedder::stub(768);
 
         // First run — normal incremental.
-        run_updatedb(&mut store, &mut embedder, &cfg, false, None, |_| {}).unwrap();
+        run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {}).unwrap();
 
         // Second run with full=true — should re-index even though the file hasn't changed.
-        let stats_full = run_updatedb(&mut store, &mut embedder, &cfg, true, None, |_| {}).unwrap();
+        let stats_full = run_updatedb(&mut store, &embedder, &cfg, true, None, |_| {}).unwrap();
 
         assert!(
             stats_full.files_updated >= 1,
@@ -904,9 +914,9 @@ mod tests {
 
         let cfg = test_cfg_for_dir(&dir);
         let (_db_file, mut store) = open_temp_db();
-        let mut embedder = crate::embed::Embedder::stub(768);
+        let embedder = crate::embed::Embedder::stub(768);
 
-        let stats = run_updatedb(&mut store, &mut embedder, &cfg, false, None, |_| {}).unwrap();
+        let stats = run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {}).unwrap();
 
         // The binary file is visited but not indexed (read_to_string fails → skip).
         // files_updated should be 0 because the binary file is not valid UTF-8.
@@ -932,9 +942,9 @@ mod tests {
         cfg.index.max_file_size = 100; // 100 bytes limit
 
         let (_db_file, mut store) = open_temp_db();
-        let mut embedder = crate::embed::Embedder::stub(768);
+        let embedder = crate::embed::Embedder::stub(768);
 
-        let stats = run_updatedb(&mut store, &mut embedder, &cfg, false, None, |_| {}).unwrap();
+        let stats = run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {}).unwrap();
 
         assert_eq!(
             stats.files_updated, 0,
@@ -957,11 +967,11 @@ mod tests {
 
         let cfg = test_cfg_for_dir(&dir);
         let (_db_file, mut store) = open_temp_db();
-        let mut embedder = crate::embed::Embedder::stub(768);
+        let embedder = crate::embed::Embedder::stub(768);
 
         // Only index files under sub_a.
         let stats =
-            run_updatedb(&mut store, &mut embedder, &cfg, false, Some(&sub_a), |_| {}).unwrap();
+            run_updatedb(&mut store, &embedder, &cfg, false, Some(&sub_a), |_| {}).unwrap();
 
         assert!(
             stats.files_updated >= 1,
@@ -1052,9 +1062,9 @@ mod tests {
 
         let cfg = test_cfg_for_dir(&dir);
         let (_db_file, mut store) = open_temp_db();
-        let mut embedder = crate::embed::Embedder::stub(768);
+        let embedder = crate::embed::Embedder::stub(768);
 
-        let stats = run_updatedb(&mut store, &mut embedder, &cfg, false, None, |_| {}).unwrap();
+        let stats = run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {}).unwrap();
 
         // Only the real file should be indexed; the symlink must be skipped.
         assert_eq!(
@@ -1092,9 +1102,9 @@ mod tests {
 
         let cfg = test_cfg_for_dir(&dir);
         let (_db_file, mut store) = open_temp_db();
-        let mut embedder = crate::embed::Embedder::stub(768);
+        let embedder = crate::embed::Embedder::stub(768);
 
-        let result = run_updatedb(&mut store, &mut embedder, &cfg, false, None, |_| {});
+        let result = run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {});
 
         // Restore permissions before asserting so TempDir can clean up.
         let _ = std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755));

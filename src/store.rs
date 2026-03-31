@@ -1130,10 +1130,10 @@ mod tests {
         };
 
         // 4. Run updatedb with a stub embedder.
-        let mut embedder = crate::embed::Embedder::stub(768);
+        let embedder = crate::embed::Embedder::stub(768);
         let stats = crate::index::run_updatedb(
             &mut store,
-            &mut embedder,
+            &embedder,
             &cfg,
             false,     // not full
             None,      // no path filter

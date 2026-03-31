@@ -237,13 +237,13 @@ async fn cmd_updatedb(
     let mut store =
         Store::open(&cfg.database.db_path, cfg.database.wal).context("opening store")?;
 
-    let mut embedder = load_embedder(&cfg);
+    let embedder = load_embedder(&cfg);
 
     if full {
         anstream::eprintln!("Full re-index...");
     }
 
-    let stats = run_updatedb(&mut store, &mut embedder, &cfg, full, path_filter, |msg| {
+    let stats = run_updatedb(&mut store, &embedder, &cfg, full, path_filter, |msg| {
         anstream::eprintln!("{msg}")
     })
     .context("running updatedb")?;
@@ -496,7 +496,7 @@ fn embed_query(cfg: &Config, text: &str) -> Result<Vec<f32>> {
     }
 
     // Slow path: compile and run the model in-process.
-    let mut embedder = load_embedder(cfg);
+    let embedder = load_embedder(cfg);
     embedder.embed_one(text).context("embedding query")
 }
 

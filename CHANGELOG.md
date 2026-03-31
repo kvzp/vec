@@ -9,6 +9,11 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Parallel embedding during indexing via rayon — `vec updatedb` now uses all available CPU cores
+- `[embed] index_threads` config option (0 = auto, default; set to N to limit threads)
+
 ---
 
 ## [0.1.0] — 2026-03-04

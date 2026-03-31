@@ -38,7 +38,7 @@ use std::path::Path;
 /// Returns an error if the model cannot be loaded or the socket cannot be
 /// bound (e.g. permission denied or parent directory missing).
 #[cfg(unix)]
-pub fn run_daemon(mut embedder: Embedder, socket_path: &Path) -> Result<()> {
+pub fn run_daemon(embedder: Embedder, socket_path: &Path) -> Result<()> {
     // Remove a stale socket left by a previous crash.
     let _ = std::fs::remove_file(socket_path);
 
@@ -69,7 +69,7 @@ pub fn run_daemon(mut embedder: Embedder, socket_path: &Path) -> Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(mut conn) => {
-                if let Err(e) = handle_connection(&mut conn, &mut embedder) {
+                if let Err(e) = handle_connection(&mut conn, &embedder) {
                     anstream::eprintln!("connection error: {e}");
                 }
             }
@@ -82,7 +82,7 @@ pub fn run_daemon(mut embedder: Embedder, socket_path: &Path) -> Result<()> {
 
 /// Handle one embed request.  Reads text, embeds it, writes response.
 #[cfg(unix)]
-pub(crate) fn handle_connection(stream: &mut UnixStream, embedder: &mut Embedder) -> Result<()> {
+pub(crate) fn handle_connection(stream: &mut UnixStream, embedder: &Embedder) -> Result<()> {
     // Read text length.
     let mut len_buf = [0u8; 4];
     stream
@@ -155,8 +155,8 @@ mod tests {
         // Serve exactly one request in a background thread.
         let handle = std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
-            let mut embedder = Embedder::stub(128);
-            handle_connection(&mut conn, &mut embedder).unwrap();
+            let embedder = Embedder::stub(128);
+            handle_connection(&mut conn, &embedder).unwrap();
         });
 
         // Connect and send a request.
@@ -202,8 +202,8 @@ mod tests {
 
         let handle = std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
-            let mut embedder = Embedder::stub(128);
-            handle_connection(&mut conn, &mut embedder).unwrap();
+            let embedder = Embedder::stub(128);
+            handle_connection(&mut conn, &embedder).unwrap();
         });
 
         let mut client = UnixStream::connect(&socket_path).unwrap();

@@ -44,6 +44,9 @@ pub struct EmbedConfig {
     /// `vec` tries this socket first for interactive queries; falls back to
     /// loading the model in-process if the daemon is not running.
     pub daemon_socket: PathBuf,
+    /// Number of threads for parallel embedding during indexing.
+    /// 0 = automatic (use all available cores).
+    pub index_threads: usize,
 }
 
 /// File-walking and chunking settings.
@@ -117,6 +120,7 @@ fn default_config() -> Config {
             batch_size: 16,
             max_tokens: 128,
             daemon_socket: PathBuf::from("/run/vec/embed.sock"),
+            index_threads: 0,
         },
         index: IndexConfig {
             chunk_size: 40,
@@ -210,6 +214,7 @@ struct RawEmbedConfig {
     batch_size: Option<usize>,
     max_tokens: Option<usize>,
     daemon_socket: Option<String>,
+    index_threads: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -258,6 +263,9 @@ fn merge(cfg: &mut Config, raw: &RawConfig) {
         }
         if let Some(ref v) = re.daemon_socket {
             cfg.embed.daemon_socket = PathBuf::from(v);
+        }
+        if let Some(v) = re.index_threads {
+            cfg.embed.index_threads = v;
         }
     }
 

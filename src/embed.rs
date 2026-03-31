@@ -47,8 +47,6 @@ type TractModel = TypedSimplePlan<TypedModel>;
 /// The embedding engine.
 pub struct Embedder {
     inner: Box<EmbedderInner>,
-    /// Dimensionality of every returned embedding vector.
-    pub dim: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -215,7 +213,6 @@ impl Embedder {
         .context("probing embedding dimension")?;
 
         Ok(Self {
-            dim,
             inner: Box::new(EmbedderInner::Tract {
                 model: Box::new(model),
                 tokenizer: Box::new(tokenizer),
@@ -231,26 +228,19 @@ impl Embedder {
     pub fn stub(dim: usize) -> Self {
         Self {
             inner: Box::new(EmbedderInner::Stub { dim }),
-            dim,
         }
     }
 
     /// Embed a batch of texts and return one unit-normalised vector per text.
     ///
     /// The returned `Vec` has the same length as `texts`; each inner `Vec<f32>`
-    /// has length `self.dim`.
-    pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        let result = embed_batch_inner(&mut self.inner, texts)?;
-        // Sync the public dim field from the inner enum.
-        match self.inner.as_ref() {
-            EmbedderInner::Tract { dim, .. } => self.dim = *dim,
-            EmbedderInner::Stub { dim } => self.dim = *dim,
-        }
-        Ok(result)
+    /// has length equal to the model's embedding dimension.
+    pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        embed_batch_inner(&self.inner, texts)
     }
 
     /// Convenience wrapper: embed a single text.
-    pub fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
+    pub fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
         let mut batch = self.embed_batch(&[text])?;
         batch
             .pop()
@@ -325,7 +315,7 @@ fn probe_dim(
 // Core inference (standalone to avoid self-borrow conflicts)
 // ---------------------------------------------------------------------------
 
-fn embed_batch_inner(inner: &mut EmbedderInner, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+fn embed_batch_inner(inner: &EmbedderInner, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
     match inner {
         EmbedderInner::Stub { dim } => {
             let d = *dim;
@@ -343,36 +333,43 @@ fn embed_batch_inner(inner: &mut EmbedderInner, texts: &[&str]) -> Result<Vec<Ve
                 return Ok(vec![]);
             }
 
-            // The model plan is compiled with fixed shape [1, max_tokens].
-            // Embed one text at a time.
             let seq = *max_tokens;
-            let mut results = Vec::with_capacity(texts.len());
+            let d = *dim;
+            let htti = *has_token_type_ids;
+            let pre_pooled = *is_pre_pooled;
 
-            for &text in texts {
-                let enc = tokenizer
-                    .encode(text, true)
-                    .map_err(|e| anyhow::anyhow!("tokenization failed: {}", e))?;
+            // Embed texts in parallel — TractModel::run(&self) and
+            // Tokenizer::encode(&self) are both Send + Sync.
+            use rayon::prelude::*;
 
-                let raw_ids = enc.get_ids();
-                if raw_ids.is_empty() {
-                    results.push(vec![0f32; *dim]);
-                    continue;
-                }
+            let results: Vec<Result<Vec<f32>>> = texts
+                .par_iter()
+                .map(|&text| {
+                    let enc = tokenizer
+                        .encode(text, true)
+                        .map_err(|e| anyhow::anyhow!("tokenization failed: {}", e))?;
 
-                let ids: Vec<i64> = (0..seq)
-                    .map(|i| raw_ids.get(i).copied().unwrap_or(0) as i64)
-                    .collect();
-                let mask: Vec<i64> = (0..seq)
-                    .map(|i| if i < raw_ids.len() { 1 } else { 0 })
-                    .collect();
-                let types: Vec<i64> = vec![0i64; seq];
+                    let raw_ids = enc.get_ids();
+                    if raw_ids.is_empty() {
+                        return Ok(vec![0f32; d]);
+                    }
 
-                let outputs = run_tract(model, *has_token_type_ids, 1, seq, &ids, &mask, &types)?;
-                let emb = extract_embeddings(&outputs, dim, *is_pre_pooled, &mask, 1, seq)?;
-                results.push(emb.into_iter().next().unwrap_or_else(|| vec![0f32; *dim]));
-            }
+                    let ids: Vec<i64> = (0..seq)
+                        .map(|i| raw_ids.get(i).copied().unwrap_or(0) as i64)
+                        .collect();
+                    let mask: Vec<i64> = (0..seq)
+                        .map(|i| if i < raw_ids.len() { 1 } else { 0 })
+                        .collect();
+                    let types: Vec<i64> = vec![0i64; seq];
 
-            Ok(results)
+                    let outputs = run_tract(model, htti, 1, seq, &ids, &mask, &types)?;
+                    let emb = extract_embeddings(&outputs, d, pre_pooled, &mask, 1, seq)?;
+                    Ok(emb.into_iter().next().unwrap_or_else(|| vec![0f32; d]))
+                })
+                .collect();
+
+            // Propagate the first error, if any.
+            results.into_iter().collect()
         }
     }
 }
@@ -434,7 +431,7 @@ fn run_tract(
 /// `is_pre_pooled` is detected once during `load()` and cached.
 fn extract_embeddings(
     outputs: &TVec<TValue>,
-    dim: &mut usize,
+    dim: usize,
     is_pre_pooled: bool,
     mask_flat: &[i64],
     batch_size: usize,
@@ -446,8 +443,7 @@ fn extract_embeddings(
     if is_pre_pooled {
         // Shape: [batch, emb_dim]
         let shape = out0.shape();
-        let emb_dim = shape.get(1).copied().unwrap_or(*dim);
-        *dim = emb_dim;
+        let emb_dim = shape.get(1).copied().unwrap_or(dim);
         // as_slice::<f32>() returns TractResult<&[f32]> (type-checked access to raw bytes)
         let data = out0
             .as_slice::<f32>()
@@ -465,8 +461,7 @@ fn extract_embeddings(
         let shape = out0.shape();
         let b = shape.first().copied().unwrap_or(batch_size);
         let s = shape.get(1).copied().unwrap_or(seq_len);
-        let emb_dim = shape.get(2).copied().unwrap_or(*dim);
-        *dim = emb_dim;
+        let emb_dim = shape.get(2).copied().unwrap_or(dim);
 
         let data = out0
             .as_slice::<f32>()
