@@ -45,4 +45,4 @@
 ## Distribution
 
 - [ ] **Nix flake** — `flake.nix` for NixOS users. One command to build, install, and get the model.
-- [ ] **Homebrew formula** — macOS users. vec is pure Rust + bundled SQLite, so it'd just work.
+- [ ] **Homebrew formula** — macOS users. vec is pure Rust + bundled SQLite, so it should work — but **macOS is untested**.

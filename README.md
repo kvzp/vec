@@ -18,6 +18,8 @@ Vector search. Proven security. Zero runtime dependencies.
 
 > **Status: active development — not yet in distro repositories.**
 > Build from source to try it. Packagers welcome — see [PACKAGING.md](PACKAGING.md).
+>
+> **Platform:** Tested on Linux (x86_64). macOS and Windows are **untested** — no hardware available. See [BUGS.md](BUGS.md).
 
 ---
 
