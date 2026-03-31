@@ -410,7 +410,14 @@ fn embed_batch_inner(inner: &EmbedderInner, texts: &[&str]) -> Result<Vec<Vec<f3
             if texts.is_empty() {
                 return Ok(vec![]);
             }
-            let mut embeddings = http_embed_request(url, model, texts)?;
+            // Send in small batches to avoid overwhelming the HTTP endpoint.
+            // The caller may pass hundreds of texts (scaled by thread count).
+            const HTTP_BATCH: usize = 32;
+            let mut embeddings = Vec::with_capacity(texts.len());
+            for chunk in texts.chunks(HTTP_BATCH) {
+                let mut batch = http_embed_request(url, model, chunk)?;
+                embeddings.append(&mut batch);
+            }
             // Normalise all vectors to unit length (Ollama doesn't always do this).
             for v in &mut embeddings {
                 normalise(v);
