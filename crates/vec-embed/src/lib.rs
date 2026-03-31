@@ -454,8 +454,13 @@ fn http_embed_request(url: &str, model: &str, texts: &[&str]) -> Result<Vec<Vec<
     let (host_port, _) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
     let api_path = "/api/embed";
 
-    // Build JSON body.
-    let input: Vec<&str> = texts.to_vec();
+    // Truncate texts to avoid exceeding the model's context window.
+    // Most embedding models have a 512-token context; ~4 chars/token is a safe estimate.
+    const MAX_CHARS: usize = 2048;
+    let input: Vec<&str> = texts
+        .iter()
+        .map(|t| if t.len() > MAX_CHARS { &t[..MAX_CHARS] } else { t })
+        .collect();
     let body = serde_json::json!({
         "model": model,
         "input": input,
@@ -503,12 +508,16 @@ fn http_embed_request(url: &str, model: &str, texts: &[&str]) -> Result<Vec<Vec<
 
     // Parse Ollama response: {"embeddings": [[f32, ...], ...]}
     let parsed: serde_json::Value = serde_json::from_str(&json_body)
-        .with_context(|| format!("parsing embed response JSON"))?;
+        .with_context(|| format!("parsing embed response JSON (body length: {} bytes)", json_body.len()))?;
 
     let embeddings = parsed
         .get("embeddings")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow::anyhow!("embed response missing 'embeddings' array"))?;
+        .ok_or_else(|| {
+            // Include the response in the error for debugging.
+            let preview = if json_body.len() > 200 { &json_body[..200] } else { &json_body };
+            anyhow::anyhow!("embed response missing 'embeddings' array. Response: {preview}")
+        })?;
 
     let mut result = Vec::with_capacity(embeddings.len());
     for emb in embeddings {
