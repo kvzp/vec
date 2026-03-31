@@ -254,7 +254,7 @@ No external service. No network calls. Text never leaves the process.
 
 ## AI Assistant Integration
 
-vec integrates with Claude Code and other AI assistants via two methods: **MCP server** and **Claude Code skill**. See [MCP.md](MCP.md) for full setup details, including how to make Claude use vec autonomously.
+vec integrates with Claude Code and other AI assistants via two methods: **MCP server** and **Claude Code skill**. See [AI-INTEGRATION.md](AI-INTEGRATION.md) for full setup details, including how to make Claude use vec autonomously.
 
 ---
 

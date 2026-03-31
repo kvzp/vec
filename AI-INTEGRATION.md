@@ -2,20 +2,43 @@
 
 vec integrates with AI assistants via two methods: an **MCP server** (tool-based, always-available) and a **Claude Code skill** (lightweight, on-demand). Both can be configured for autonomous use — where the assistant reaches for vec without being asked.
 
+This guide covers full installation for each method and how to combine them.
+
+---
+
+## Prerequisites
+
+Before setting up any integration, vec must be installed and indexed:
+
+```bash
+# Verify vec is installed
+vec --version
+
+# Verify the index is populated
+vec status
+
+# If not indexed yet:
+vec updatedb            # system-wide install
+# or for userland:
+vec --config ~/.config/vec/config.toml updatedb
+```
+
+If vec is not installed at all, see [README.md](README.md) for build and install instructions (system-wide or userland).
+
 ---
 
 ## Method 1: MCP Server (`vec serve`)
 
 `vec serve` starts an MCP server over stdio, exposing semantic file search as programmatic tools to any MCP-compatible assistant.
 
-### Tools
+### MCP Tools
 
 #### `search(query, limit?, path_filter?, min_score?)`
 Semantic search over the indexed corpus.
 - `query` — natural language or code fragment
 - `limit` — max results (default: from config)
 - `path_filter` — restrict to paths matching this prefix
-- `min_score` — minimum cosine similarity (0.0–1.0)
+- `min_score` — minimum cosine similarity (0.0-1.0)
 - Returns: `[{path, start_line, end_line, score, snippet}]`
 
 #### `context(file_path, line, window?)`
@@ -29,7 +52,7 @@ Raw file content around a line.
 Index health snapshot.
 - Returns: `{file_count, chunk_count, db_path, model, model_found}`
 
-### Setup
+### MCP Setup
 
 #### Claude Code
 
@@ -63,15 +86,7 @@ Any client that supports stdio transport works:
 - **Cursor:** add under `mcp.servers` in `~/.cursor/mcp.json`
 - **Continue:** add under `mcpServers` in `~/.continue/config.json`
 
-### Prerequisites
-
-The index must be populated before starting the server:
-
-```bash
-vec updatedb
-```
-
-### Transport
+### MCP Transport
 
 `vec serve` speaks the MCP protocol over stdin/stdout. No network port is opened. The client process manages the subprocess lifetime.
 
@@ -79,23 +94,27 @@ vec updatedb
 
 ## Method 2: Claude Code Skill (`/vec`)
 
-A `/vec` skill is included in `.claude/skills/vec/`. It invokes `vec` directly via the CLI — no MCP server process needed. Lower token overhead because the skill only loads into context when invoked, rather than keeping tool schemas in context permanently.
+A `/vec` skill invokes `vec` directly via the CLI — no MCP server process needed. Lower token overhead because the skill only loads into context when invoked, rather than keeping tool schemas in context permanently.
 
-### Setup
+### Skill Installation
 
-Copy the skill to your project or personal skills directory:
+The skill lives in `.claude/skills/vec/SKILL.md`. Install it at the scope you need:
 
 ```bash
-# Per-project (available only in this repo)
-cp -r .claude/skills/vec /path/to/your/project/.claude/skills/
+# Global — available in all projects (recommended)
+mkdir -p ~/.claude/skills/vec
+cp .claude/skills/vec/SKILL.md ~/.claude/skills/vec/
 
-# Global (available in all projects)
-cp -r .claude/skills/vec ~/.claude/skills/
+# Per-project — available only in that repo
+mkdir -p /path/to/project/.claude/skills/vec
+cp .claude/skills/vec/SKILL.md /path/to/project/.claude/skills/vec/
 ```
 
-### Usage
+After copying, restart Claude Code (or start a new session). The skill appears in the `/` menu.
 
-Type `/vec` followed by your query in Claude Code:
+### Skill Usage
+
+Type `/vec` followed by your query:
 
 ```
 /vec authentication middleware
@@ -104,6 +123,10 @@ Type `/vec` followed by your query in Claude Code:
 ```
 
 The skill instructs Claude to run `vec` via Bash, interpret the results, and optionally read context around matches using the Read tool.
+
+### Userland Note
+
+If vec is installed as userland (not in `$PATH`), the skill calls `~/.local/bin/vec --config ~/.config/vec/config.toml`. If your binary or config is elsewhere, edit the skill's `SKILL.md` to match your paths.
 
 ---
 
@@ -114,7 +137,7 @@ The skill instructs Claude to run `vec` via Bash, interpret the results, and opt
 | Token cost | Higher (schema always in context) | Lower (loaded on demand) |
 | Multi-step agent loops | Better (programmatic tool calls) | Manual |
 | Autonomous use | Native (tool always visible) | Requires hook or instruction |
-| Setup | Config in `~/.claude.json` | Copy skill directory |
+| Setup | Config in `~/.claude.json` | Copy `SKILL.md` to skills dir |
 | Requires running process | Yes (`vec serve` subprocess) | No |
 | Works with non-Claude clients | Yes (any MCP client) | No (Claude Code only) |
 
@@ -130,7 +153,7 @@ By default, Claude won't proactively use `/vec` unless prompted. There are four 
 
 A hook fires programmatically every time Claude is about to use a matching tool. It injects a reminder directly into the conversation context — impossible to forget or drift from.
 
-Add to `.claude/settings.local.json` (per-project) or `~/.claude/settings.json` (global):
+Add to `~/.claude/settings.json` (global) or `.claude/settings.local.json` (per-project):
 
 ```json
 {
@@ -153,9 +176,9 @@ Add to `.claude/settings.local.json` (per-project) or `~/.claude/settings.json` 
 **How it works:** Every time Claude is about to call `Grep` or spawn an `Agent` for search, the hook intercepts and prints a reminder. Claude sees this message in-context and decides whether vec is more appropriate.
 
 **Scope options:**
-- `.claude/settings.local.json` — this project only, not committed to git
-- `.claude/settings.json` — this project, committed to git (team-wide)
 - `~/.claude/settings.json` — all projects on this machine
+- `.claude/settings.json` — this project, committed to git (team-wide)
+- `.claude/settings.local.json` — this project only, not committed to git
 
 **Pros:** Fires at exactly the right moment. Cannot be forgotten. No token overhead until triggered.
 **Cons:** Adds a small message to context on every Grep/Agent call, even when Grep is the right tool.
@@ -181,14 +204,12 @@ A hook that fires once at the start of every Claude Code session, reminding Clau
 }
 ```
 
-**How it works:** Claude sees the reminder at the very start of the session, before any work begins. It sets the context for the entire conversation.
-
 **Pros:** One-time cost — only fires once per session. Sets expectations early.
-**Cons:** Can drift over long conversations as the reminder scrolls out of context. Less reliable than PreToolUse for long sessions.
+**Cons:** Can drift over long conversations as the reminder scrolls out of context.
 
 ### Method 3: CLAUDE.md Instruction
 
-Add a line to your project's `CLAUDE.md` (or `~/.claude/CLAUDE.md` for global):
+Add to your project's `CLAUDE.md` (or `~/.claude/CLAUDE.md` for global):
 
 ```markdown
 ## Semantic Search
@@ -197,8 +218,6 @@ This project has `vec` installed. Use `/vec <query>` for semantic code search
 when looking for code by concept or intent (e.g., "authentication middleware",
 "error handling", "where does X happen"). Use Grep only for exact string/regex matches.
 ```
-
-**How it works:** `CLAUDE.md` is loaded into Claude's system prompt at the start of every session. Claude reads it as project instructions.
 
 **Pros:** No JSON config needed — just a markdown file. Documents the convention for human readers too.
 **Cons:** Claude can drift from CLAUDE.md instructions over very long conversations. Less reliable than hooks.
@@ -215,26 +234,63 @@ description: Semantic file search — find files by meaning, not just name. Use 
 
 With `disable-model-invocation` not set (the default), Claude is *allowed* to auto-invoke the skill when a task matches the description.
 
-**How it works:** Claude checks available skills against the current task and may load the skill autonomously if the description matches.
-
 **Pros:** Zero configuration beyond the skill itself.
 **Cons:** Least reliable — Claude doesn't proactively scan available skills mid-task. Works better as a supplement to other methods.
 
-### Recommended Setup
+---
 
-Combine methods for maximum reliability:
+## Recommended Full Setup
 
-1. **Install the skill** — copy `.claude/skills/vec/` to your project or `~/.claude/skills/`
-2. **Add the PreToolUse hook** — catches the exact moment when vec would help
-3. **Add a CLAUDE.md line** — sets baseline awareness and documents the convention
+Combine methods for maximum reliability. Complete steps from scratch:
+
+### 1. Install the skill (global)
 
 ```bash
-# 1. Skill (already in this repo, or copy globally)
-cp -r .claude/skills/vec ~/.claude/skills/
-
-# 2. Hook — add to settings (see Method 1 above)
-
-# 3. CLAUDE.md — add the semantic search section (see Method 3 above)
+mkdir -p ~/.claude/skills/vec
+cp .claude/skills/vec/SKILL.md ~/.claude/skills/vec/
 ```
+
+### 2. Add the PreToolUse hook (global)
+
+Edit `~/.claude/settings.json` and add to the `hooks` object:
+
+```json
+"PreToolUse": [
+  {
+    "matcher": "Grep|Agent",
+    "hooks": [
+      {
+        "type": "command",
+        "command": "echo 'Before using grep or spawning an agent for code search: consider using /vec for semantic search. It finds code by meaning and is faster than grep when searching by concept rather than exact string. Use /vec for intent-based search, Grep for exact pattern matches.'"
+      }
+    ]
+  }
+]
+```
+
+If you already have `PreToolUse` hooks, add this as another entry in the array.
+
+### 3. Add a CLAUDE.md instruction (optional, per-project)
+
+Add to your project's `CLAUDE.md`:
+
+```markdown
+## Semantic Search
+
+This project has `vec` installed. Use `/vec <query>` for semantic code search
+when looking for code by concept or intent. Use Grep only for exact string/regex matches.
+```
+
+### 4. Verify
+
+Start a new Claude Code session and type:
+
+```
+/vec authentication middleware
+```
+
+Claude should run `vec`, return ranked results, and offer to read context around matches.
+
+---
 
 All three methods are idempotent and complement each other. The hook is the safety net; the CLAUDE.md is the instruction; the skill is the implementation.

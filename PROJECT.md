@@ -174,7 +174,7 @@ vec/
 ├── CONTRIBUTING.md     # Dev setup, tests, project structure, invariants
 ├── TESTING.md          # Test strategy, coverage table, known gaps, test conventions
 ├── CONFIG.md           # Full /etc/vec.conf reference with all settings and recipes
-├── MCP.md              # MCP server setup (vec serve) and tool reference
+├── AI-INTEGRATION.md   # AI assistant integration (MCP server, Claude Code skill, hooks)
 ├── PACKAGING.md        # Guide for distro packagers (Debian/RPM/BSD, system-sqlite)
 ├── CHANGELOG.md        # Version history following Keep a Changelog
 └── PROJECT.md          # Project positioning, mental model, and MVP scope
