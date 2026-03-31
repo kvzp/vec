@@ -5,6 +5,7 @@ After=network.target
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/vec updatedb
+ExecStartPost=/usr/bin/vec gc
 Nice=19
 IOSchedulingClass=idle
 # Allow enough time for full filesystem indexing
