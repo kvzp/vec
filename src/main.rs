@@ -201,15 +201,19 @@ async fn cmd_search(
                 result.start_line,
                 result.score
             );
-            // Read the file and slice the relevant bytes.
-            match std::fs::read(&result.path) {
-                Ok(bytes) => {
-                    let end = result.byte_end.min(bytes.len());
-                    let start = result.byte_offset.min(end);
-                    let slice = &bytes[start..end];
-                    let text = String::from_utf8_lossy(slice);
-                    for line in text.lines() {
-                        println!("    {}", line);
+            // Read the file and show snippet_lines lines around start_line.
+            match std::fs::read_to_string(&result.path) {
+                Ok(content) => {
+                    let lines: Vec<&str> = content.lines().collect();
+                    let ctx = cfg.search.snippet_lines;
+                    // start_line is 1-based; convert to 0-based index.
+                    let target = result.start_line.saturating_sub(1);
+                    let from = target.saturating_sub(ctx);
+                    let to = (target + ctx + 1).min(lines.len());
+                    for (i, line) in lines[from..to].iter().enumerate() {
+                        let lineno = from + i + 1;
+                        let marker = if lineno == result.start_line { ">" } else { " " };
+                        println!("{} {:>5}: {}", marker, lineno, line);
                     }
                 }
                 Err(e) => {

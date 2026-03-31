@@ -182,7 +182,7 @@ fn default_config() -> Config {
         },
         search: SearchConfig {
             default_limit: 10,
-            snippet_lines: 6,
+            snippet_lines: 3,
         },
         database: DatabaseConfig {
             db_path: default_db_path,
