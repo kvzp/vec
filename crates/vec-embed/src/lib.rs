@@ -454,16 +454,12 @@ fn http_embed_request(url: &str, model: &str, texts: &[&str]) -> Result<Vec<Vec<
     let (host_port, _) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
     let api_path = "/api/embed";
 
-    // Truncate texts to avoid exceeding the model's context window.
-    // Most embedding models have a 512-token context; ~4 chars/token is a safe estimate.
-    const MAX_CHARS: usize = 2048;
-    let input: Vec<&str> = texts
-        .iter()
-        .map(|t| if t.len() > MAX_CHARS { &t[..MAX_CHARS] } else { t })
-        .collect();
+    // Tell Ollama to truncate inputs that exceed the model's context window.
+    let input: Vec<&str> = texts.to_vec();
     let body = serde_json::json!({
         "model": model,
         "input": input,
+        "truncate": true,
     })
     .to_string();
 
