@@ -99,6 +99,54 @@ Embeddings run in-process via `tract-onnx` — pure Rust, no network calls, no e
 
 ---
 
+## System Installation and Root Privilege
+
+On a system-wide deployment, `vec` runs as root under systemd so it can read
+protected paths such as `/etc` and `/root`. This is intentional and equivalent
+to how `updatedb`/`mlocate` operate.
+
+### Why root is required
+
+`vec` needs read access to every file it indexes. Paths like `/etc` are not
+world-readable in their entirety. Privilege is used **only for reading** — no
+writes to indexed files, no capability escalation, no network listeners.
+
+### Single authoritative config
+
+On a system install there is exactly one config file: `/etc/vec.conf`.
+No per-user overrides exist. The indexed paths, model, and DB location are all
+visible there to any administrator.
+
+### System install layout
+
+```
+/usr/local/bin/vec            binary
+/etc/vec.conf                 single authoritative config (no per-user config)
+/var/lib/vec/vec.db           SQLite index (embeddings only, no file contents)
+/usr/share/vec/models/        ONNX embedding models
+/etc/systemd/system/          vec-watch.service  vec-updatedb.service/.timer
+```
+
+All systemd units specify `User=root` explicitly. The DB at `/var/lib/vec/`
+is readable by all users (mode 644) and contains no source text — only paths,
+byte offsets, and float vectors.
+
+### Comparison to established tools
+
+| Tool       | Runs as             | Privilege reason        | Network |
+|------------|---------------------|-------------------------|---------|
+| `updatedb` | root (setuid / cron)| Read protected paths    | None    |
+| `mlocate`  | root (cron)         | Read protected paths    | None    |
+| `vec`      | root (systemd)      | Read protected paths    | None    |
+
+To verify the running configuration at any time:
+
+```
+vec status
+```
+
+---
+
 ## Reporting a Vulnerability
 
 Please report security issues via [GitHub Security Advisories](https://github.com/kvzp/vec/security/advisories/new) — not as a public issue.
