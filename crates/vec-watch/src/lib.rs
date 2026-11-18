@@ -17,11 +17,15 @@
 //
 // Inotify watch limit: /proc/sys/fs/inotify/max_user_watches defaults to
 // 8192 on many kernels. The package postinst sets 65536 via
-// /etc/sysctl.d/99-vec.conf. Excluded directories still receive a watch
-// (one recursive watch per include path) — see BUGS.md.
+// /etc/sysctl.d/99-vec.conf. Only directories the indexer would walk get a
+// (non-recursive) watch: excluded trees (target/, node_modules/, a build
+// area, .gitignored directories, hidden directories) cost no kernel memory
+// and no watch slot. New directories are watched at the next flush, before
+// the batch that names them is indexed, so nothing created in them is missed
+// (the batch walk covers what happened before the watch existed).
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,8 +37,9 @@ use vec_index::{IndexFilter, update_paths};
 use vec_store::Store;
 
 /// Run the real-time watcher. Blocks until killed (SIGTERM/SIGINT).
-pub fn run_watch() -> Result<()> {
-    let cfg = Config::load(None).context("loading config")?;
+/// `cfg_path` is the global `--config` option (it used to be ignored here).
+pub fn run_watch(cfg_path: Option<&Path>) -> Result<()> {
+    let cfg = Config::load(cfg_path).context("loading config")?;
     let wcfg = cfg.watch.clone();
 
     anstream::eprintln!(
@@ -70,12 +75,12 @@ pub fn run_watch() -> Result<()> {
     let mut watcher = notify::RecommendedWatcher::new(handler, notify::Config::default())
         .context("creating filesystem watcher")?;
 
+    let mut walk_filter = IndexFilter::new(&cfg, &|_| {});
+    let mut watched: HashSet<PathBuf> = HashSet::new();
     for path in &cfg.index.include_paths {
         if path.exists() {
-            watcher
-                .watch(path, RecursiveMode::Recursive)
-                .with_context(|| format!("watching {}", path.display()))?;
-            anstream::eprintln!("  watching: {}", path.display());
+            let n = watch_tree(&mut watcher, path, &mut walk_filter, &mut watched);
+            anstream::eprintln!("  watching: {} ({n} director{})", path.display(), if n == 1 { "y" } else { "ies" });
         } else {
             anstream::eprintln!("  warn: path does not exist, skipping: {}", path.display());
         }
@@ -85,12 +90,80 @@ pub fn run_watch() -> Result<()> {
         let batch = wait_for_batch(&shared, &wcfg);
         anstream::eprintln!(
             "reindexing {} path(s) from {} event(s), oldest change {:.1}s ago",
-            batch.paths.len(),
+            if batch.overflow { 0 } else { batch.paths.len() },
             batch.events,
             batch.age.as_secs_f64(),
         );
-        index_batch(&cfg, &batch.paths);
+        // Watch first, index second: a directory created since the last flush
+        // gets its watch before the walk, so a file created in it later is an
+        // event and one created earlier is seen by the walk.
+        walk_filter.invalidate();
+        let mut added = 0;
+        for p in &batch.paths {
+            if p.is_dir() {
+                added += watch_tree(&mut watcher, p, &mut walk_filter, &mut watched);
+            }
+        }
+        if added > 0 {
+            anstream::eprintln!("  watching {added} new director{}", if added == 1 { "y" } else { "ies" });
+        }
+        let paths = if batch.overflow {
+            anstream::eprintln!("  pending set overflowed: rescanning the include paths");
+            cfg.index.include_paths.clone()
+        } else {
+            batch.paths
+        };
+        index_batch(&cfg, &paths);
     }
+}
+
+/// Every directory under `root` (inclusive) the indexer would walk, in walk
+/// order. Excluded directories are not descended into.
+fn allowed_dirs(root: &Path, filter: &mut IndexFilter) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        // The include root itself is never filtered (the walker does not filter its roots).
+        if dir != root && filter.is_excluded(&dir, true) {
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue; // vanished or unreadable: nothing to watch
+        };
+        for entry in rd.flatten() {
+            // `file_type` does not follow symlinks: the indexer does not either.
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                stack.push(entry.path());
+            }
+        }
+        out.push(dir);
+    }
+    out
+}
+
+/// Put a non-recursive watch on every allowed directory under `root` that has
+/// none yet. Returns how many were added.
+fn watch_tree(
+    watcher: &mut notify::RecommendedWatcher,
+    root: &Path,
+    filter: &mut IndexFilter,
+    watched: &mut HashSet<PathBuf>,
+) -> usize {
+    let mut added = 0;
+    for dir in allowed_dirs(root, filter) {
+        if watched.contains(&dir) {
+            continue;
+        }
+        match watcher.watch(&dir, RecursiveMode::NonRecursive) {
+            Ok(()) => {
+                watched.insert(dir);
+                added += 1;
+            }
+            // Gone since the walk, or out of inotify watches: say so, keep going.
+            Err(e) => anstream::eprintln!("  warn: cannot watch {}: {e}", dir.display()),
+        }
+    }
+    added
 }
 
 /// A set of changed paths ready to be indexed.
@@ -98,6 +171,9 @@ struct Batch {
     paths: Vec<PathBuf>,
     events: u64,
     age: Duration,
+    /// The pending set overflowed `max_pending` and could not be collapsed
+    /// further: the whole include paths must be re-walked.
+    overflow: bool,
 }
 
 /// Block until the pending set is due, then take it.
@@ -176,6 +252,10 @@ fn index_batch(cfg: &Config, paths: &[PathBuf]) {
 #[derive(Default)]
 struct Pending {
     paths: HashSet<PathBuf>,
+    /// Set when collapsing to parent directories could not get under the cap:
+    /// the set is dropped (the next flush re-walks the include paths) and
+    /// further inserts only count events, so an overflow costs O(1) per event.
+    overflow: bool,
     first_seen: Option<Instant>,
     last_event: Option<Instant>,
     events: u64,
@@ -183,12 +263,19 @@ struct Pending {
 
 impl Pending {
     fn insert(&mut self, path: PathBuf, now: Instant, max_pending: usize) {
-        self.paths.insert(path);
         self.first_seen.get_or_insert(now);
         self.last_event = Some(now);
         self.events += 1;
+        if self.overflow {
+            return;
+        }
+        self.paths.insert(path);
         if self.paths.len() > max_pending {
             self.collapse(max_pending);
+            if self.paths.len() > max_pending {
+                self.overflow = true;
+                self.paths = HashSet::new();
+            }
         }
     }
 
@@ -228,6 +315,7 @@ impl Pending {
             paths: taken.paths.into_iter().collect(),
             events: taken.events,
             age,
+            overflow: taken.overflow,
         }
     }
 }
@@ -317,6 +405,56 @@ mod tests {
                     p.paths
                 );
             }
+        }
+    }
+
+    #[test]
+    fn overflow_when_collapse_cannot_help_and_stays_cheap() {
+        let t0 = Instant::now();
+        // Ten files in ten different directories, cap 4: one level up nothing merges
+        // (ten distinct parents), which is where `collapse` stops, so the set stays over the cap.
+        let mut q = Pending::default();
+        for d in 0..10 {
+            q.insert(format!("/r/d{d}/f.rs").into(), t0, 4);
+        }
+        assert!(q.overflow, "an un-collapsible set over the cap must overflow");
+        assert!(q.paths.is_empty(), "an overflowed set holds nothing");
+        let before = q.events;
+        q.insert("/r/another/f.rs".into(), t0, 4);
+        assert_eq!(q.events, before + 1, "events are still counted");
+        assert!(q.paths.is_empty(), "inserts after overflow are no-ops on the set");
+        assert!(q.time_until_due(t0, &wcfg()).is_some(), "an overflowed set is still flushed on time");
+        let batch = q.take(t0 + Duration::from_secs(1));
+        assert!(batch.overflow && batch.paths.is_empty());
+        assert!(!q.overflow, "take() resets the overflow flag");
+
+        // Ten files in two directories collapse to those two directories: no overflow.
+        let mut p = Pending::default();
+        for d in ["a", "b"] {
+            for f in 0..5 {
+                p.insert(format!("/r/{d}/{f}.rs").into(), t0, 4);
+            }
+        }
+        assert!(!p.overflow && p.paths.len() <= 4);
+    }
+
+    #[test]
+    fn only_allowed_directories_are_listed_for_watching() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        for d in ["src/a", "target/debug/deps", "sub/target/x", ".cache/z", "builds/out", "keep/deep/er"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join(".gitignore"), "builds/\n").unwrap();
+        let cfg = test_cfg(&dir);
+        let mut filter = IndexFilter::new(&cfg, &|_| {});
+        let got: HashSet<PathBuf> = allowed_dirs(root, &mut filter).into_iter().collect();
+        for ok in ["", "src", "src/a", "sub", "keep", "keep/deep", "keep/deep/er"] {
+            assert!(got.contains(&root.join(ok)), "{ok:?} should be watched: {got:?}");
+        }
+        for no in ["target", "target/debug", "sub/target", "sub/target/x", ".cache", ".git", "builds", "builds/out", "db"] {
+            assert!(!got.contains(&root.join(no)), "{no:?} must not be watched: {got:?}");
         }
     }
 

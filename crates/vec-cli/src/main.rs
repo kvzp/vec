@@ -175,7 +175,7 @@ async fn main() -> Result<()> {
             action: ModelAction::Download,
         }) => cmd_model_download(cfg_path),
         Some(Command::Init { user }) => cmd_init(user),
-        Some(Command::Watch) => vec_watch::run_watch(),
+        Some(Command::Watch) => vec_watch::run_watch(cfg_path),
         Some(Command::Daemon) => cmd_daemon(cfg_path).await,
         Some(Command::Context { file_line, window }) => cmd_context(&file_line, window),
         Some(Command::Similar { file_line, limit }) => cmd_similar(&file_line, limit, cfg_path),
