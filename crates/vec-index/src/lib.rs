@@ -1337,7 +1337,14 @@ mod tests {
         let (_db_file, mut store) = open_temp_db();
         let embedder = vec_embed::Embedder::stub(768);
 
-        let stats = update_paths(&mut store, &embedder, &cfg, std::slice::from_ref(&sub_a), |_| {}).unwrap();
+        let stats = update_paths(
+            &mut store,
+            &embedder,
+            &cfg,
+            std::slice::from_ref(&sub_a),
+            |_| {},
+        )
+        .unwrap();
         assert_eq!(
             stats.files_visited, 1,
             "the 20 files in b/ must not be walked"
@@ -1385,7 +1392,14 @@ mod tests {
         let (_db_file, mut store) = open_temp_db();
         let embedder = vec_embed::Embedder::stub(768);
 
-        let stats = update_paths(&mut store, &embedder, &cfg, std::slice::from_ref(&deep), |_| {}).unwrap();
+        let stats = update_paths(
+            &mut store,
+            &embedder,
+            &cfg,
+            std::slice::from_ref(&deep),
+            |_| {},
+        )
+        .unwrap();
         assert_eq!(
             stats.files_visited, 0,
             "a walk root inside target/ is excluded"

@@ -80,7 +80,11 @@ pub fn run_watch(cfg_path: Option<&Path>) -> Result<()> {
     for path in &cfg.index.include_paths {
         if path.exists() {
             let n = watch_tree(&mut watcher, path, &mut walk_filter, &mut watched);
-            anstream::eprintln!("  watching: {} ({n} director{})", path.display(), if n == 1 { "y" } else { "ies" });
+            anstream::eprintln!(
+                "  watching: {} ({n} director{})",
+                path.display(),
+                if n == 1 { "y" } else { "ies" }
+            );
         } else {
             anstream::eprintln!("  warn: path does not exist, skipping: {}", path.display());
         }
@@ -105,7 +109,10 @@ pub fn run_watch(cfg_path: Option<&Path>) -> Result<()> {
             }
         }
         if added > 0 {
-            anstream::eprintln!("  watching {added} new director{}", if added == 1 { "y" } else { "ies" });
+            anstream::eprintln!(
+                "  watching {added} new director{}",
+                if added == 1 { "y" } else { "ies" }
+            );
         }
         let paths = if batch.overflow {
             anstream::eprintln!("  pending set overflowed: rescanning the include paths");
@@ -417,13 +424,22 @@ mod tests {
         for d in 0..10 {
             q.insert(format!("/r/d{d}/f.rs").into(), t0, 4);
         }
-        assert!(q.overflow, "an un-collapsible set over the cap must overflow");
+        assert!(
+            q.overflow,
+            "an un-collapsible set over the cap must overflow"
+        );
         assert!(q.paths.is_empty(), "an overflowed set holds nothing");
         let before = q.events;
         q.insert("/r/another/f.rs".into(), t0, 4);
         assert_eq!(q.events, before + 1, "events are still counted");
-        assert!(q.paths.is_empty(), "inserts after overflow are no-ops on the set");
-        assert!(q.time_until_due(t0, &wcfg()).is_some(), "an overflowed set is still flushed on time");
+        assert!(
+            q.paths.is_empty(),
+            "inserts after overflow are no-ops on the set"
+        );
+        assert!(
+            q.time_until_due(t0, &wcfg()).is_some(),
+            "an overflowed set is still flushed on time"
+        );
         let batch = q.take(t0 + Duration::from_secs(1));
         assert!(batch.overflow && batch.paths.is_empty());
         assert!(!q.overflow, "take() resets the overflow flag");
@@ -442,7 +458,14 @@ mod tests {
     fn only_allowed_directories_are_listed_for_watching() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
-        for d in ["src/a", "target/debug/deps", "sub/target/x", ".cache/z", "builds/out", "keep/deep/er"] {
+        for d in [
+            "src/a",
+            "target/debug/deps",
+            "sub/target/x",
+            ".cache/z",
+            "builds/out",
+            "keep/deep/er",
+        ] {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
         std::fs::create_dir(root.join(".git")).unwrap();
@@ -450,11 +473,35 @@ mod tests {
         let cfg = test_cfg(&dir);
         let mut filter = IndexFilter::new(&cfg, &|_| {});
         let got: HashSet<PathBuf> = allowed_dirs(root, &mut filter).into_iter().collect();
-        for ok in ["", "src", "src/a", "sub", "keep", "keep/deep", "keep/deep/er"] {
-            assert!(got.contains(&root.join(ok)), "{ok:?} should be watched: {got:?}");
+        for ok in [
+            "",
+            "src",
+            "src/a",
+            "sub",
+            "keep",
+            "keep/deep",
+            "keep/deep/er",
+        ] {
+            assert!(
+                got.contains(&root.join(ok)),
+                "{ok:?} should be watched: {got:?}"
+            );
         }
-        for no in ["target", "target/debug", "sub/target", "sub/target/x", ".cache", ".git", "builds", "builds/out", "db"] {
-            assert!(!got.contains(&root.join(no)), "{no:?} must not be watched: {got:?}");
+        for no in [
+            "target",
+            "target/debug",
+            "sub/target",
+            "sub/target/x",
+            ".cache",
+            ".git",
+            "builds",
+            "builds/out",
+            "db",
+        ] {
+            assert!(
+                !got.contains(&root.join(no)),
+                "{no:?} must not be watched: {got:?}"
+            );
         }
     }
 
