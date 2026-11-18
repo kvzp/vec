@@ -557,12 +557,10 @@ impl Store {
                 .conn
                 .prepare("SELECT id, path FROM files")
                 .context("preparing file list query")?;
-            let rows = stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
                 .context("listing files")?
                 .collect::<rusqlite::Result<Vec<_>>>()
-                .context("reading file list")?;
-            rows
+                .context("reading file list")?
         };
         self.delete_ids_if_missing(paths)
     }
@@ -729,7 +727,7 @@ pub fn pack_f32(v: &[f32]) -> Vec<u8> {
 ///
 /// Returns an empty Vec if `bytes.len()` is not a multiple of 4.
 pub fn unpack_f32(bytes: &[u8]) -> Vec<f32> {
-    if !bytes.len().is_multiple_of(4) {
+    if bytes.len() % 4 != 0 {
         return Vec::new();
     }
     bytes

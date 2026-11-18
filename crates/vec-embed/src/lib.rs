@@ -475,7 +475,7 @@ fn http_embed_request(url: &str, model: &str, texts: &[&str]) -> Result<Vec<Vec<
     use std::net::TcpStream;
 
     // Parse URL to extract host:port and path.
-    let url_str = if url.ends_with('/') { &url[..url.len() - 1] } else { url };
+    let url_str = url.strip_suffix('/').unwrap_or(url);
     let without_scheme = url_str
         .strip_prefix("http://")
         .ok_or_else(|| anyhow::anyhow!("embed URL must start with http://: {url}"))?;

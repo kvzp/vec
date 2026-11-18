@@ -199,6 +199,7 @@ async fn main() -> Result<()> {
 // vec <query>
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)] // one parameter per CLI flag; a struct would only move them
 async fn cmd_search(
     queries: &[String],
     limit: Option<usize>,
