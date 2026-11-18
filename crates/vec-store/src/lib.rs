@@ -14,6 +14,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 
+/// `true` only when `path` definitely does not exist. A permission or I/O
+/// error is not proof of absence (`Path::exists` would return `false` and
+/// a prune would delete a record that is still valid).
+pub fn is_gone(path: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
 // ---------------------------------------------------------------------------
 // Public record types
 // ---------------------------------------------------------------------------
@@ -552,55 +559,67 @@ impl Store {
     }
 
     pub fn delete_missing_files(&mut self) -> Result<usize> {
-        let paths: Vec<(i64, String)> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id, path FROM files")
-                .context("preparing file list query")?;
-            let rows = stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .context("listing files")?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .context("reading file list")?;
-            rows
-        };
-        self.delete_ids_if_missing(paths)
+        self.delete_files_where(None, is_gone)
     }
 
     /// Like [`Store::delete_missing_files`], but only considers records equal
-    /// to, or located under, one of `scopes`. Cost is proportional to the
-    /// number of records in scope, not the size of the whole index — this is
-    /// what makes `vec watch` re-indexes cheap.
+    /// to, or located under, one of `scopes`.
     pub fn delete_missing_files_under(&mut self, scopes: &[PathBuf]) -> Result<usize> {
-        let mut paths: Vec<(i64, String)> = Vec::new();
-        {
-            // Descendants of "/a/b" are exactly the strings in ["/a/b/", "/a/b0"),
-            // because '0' is the byte right after '/'. A range scan uses the
-            // UNIQUE index on files.path instead of scanning the table.
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id, path FROM files WHERE path = ?1 OR (path >= ?2 AND path < ?3)")
-                .context("preparing scoped file list query")?;
-            for scope in scopes {
-                let base = scope.to_string_lossy();
-                let base = base.trim_end_matches('/');
-                let lo = format!("{base}/");
-                let hi = format!("{base}0");
-                let rows = stmt
-                    .query_map(params![base, lo, hi], |row| Ok((row.get(0)?, row.get(1)?)))
-                    .context("listing scoped files")?
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                    .context("reading scoped file list")?;
-                paths.extend(rows);
-            }
-        }
-        paths.sort_unstable();
-        paths.dedup();
-        self.delete_ids_if_missing(paths)
+        self.delete_files_where(Some(scopes), is_gone)
     }
 
-    /// Delete the given records whose path no longer exists, in one transaction.
-    fn delete_ids_if_missing(&mut self, paths: Vec<(i64, String)>) -> Result<usize> {
+    /// Delete every file record (and, by cascade, its chunks) for which
+    /// `stale(path)` is true, in one transaction. Returns the number deleted.
+    ///
+    /// `scopes = None` considers every record. `Some(scopes)` considers only
+    /// records equal to or under one of them, with an index range scan, so
+    /// the cost is proportional to the records in scope — this is what keeps
+    /// `vec watch` re-indexes cheap.
+    pub fn delete_files_where(
+        &mut self,
+        scopes: Option<&[PathBuf]>,
+        mut stale: impl FnMut(&Path) -> bool,
+    ) -> Result<usize> {
+        let mut rows: Vec<(i64, String)> = Vec::new();
+        match scopes {
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT id, path FROM files")
+                    .context("preparing file list query")?;
+                rows = stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .context("listing files")?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .context("reading file list")?;
+            }
+            Some(scopes) => {
+                // Descendants of "/a/b" are exactly the strings in ["/a/b/", "/a/b0"),
+                // because '0' is the byte right after '/'. A range scan uses the
+                // UNIQUE index on files.path instead of scanning the table.
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT id, path FROM files WHERE path = ?1 OR (path >= ?2 AND path < ?3)",
+                    )
+                    .context("preparing scoped file list query")?;
+                for scope in scopes {
+                    let base = scope.to_string_lossy();
+                    let base = base.trim_end_matches('/');
+                    let lo = format!("{base}/");
+                    let hi = format!("{base}0");
+                    let found = stmt
+                        .query_map(params![base, lo, hi], |row| Ok((row.get(0)?, row.get(1)?)))
+                        .context("listing scoped files")?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .context("reading scoped file list")?;
+                    rows.extend(found);
+                }
+                rows.sort_unstable();
+                rows.dedup();
+            }
+        }
+
         let tx = self
             .conn
             .transaction()
@@ -610,15 +629,37 @@ impl Store {
             let mut del = tx
                 .prepare("DELETE FROM files WHERE id = ?1")
                 .context("preparing delete")?;
-            for (id, path) in paths {
-                if !Path::new(&path).exists() {
-                    del.execute(params![id]).context("deleting missing file")?;
+            for (id, path) in rows {
+                if stale(Path::new(&path)) {
+                    del.execute(params![id]).context("deleting stale file")?;
                     removed += 1;
                 }
             }
         }
         tx.commit().context("committing prune transaction")?;
         Ok(removed)
+    }
+
+    /// Store a key/value pair in the `meta` table (upsert).
+    pub fn set_meta(&mut self, key: &str, value: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )
+            .with_context(|| format!("writing meta.{key}"))?;
+        Ok(())
+    }
+
+    /// Read a value from the `meta` table.
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
+                r.get(0)
+            })
+            .optional()
+            .with_context(|| format!("reading meta.{key}"))
     }
 
     /// Delete all file and chunk records — used by `--full` re-index to ensure
@@ -729,7 +770,7 @@ pub fn pack_f32(v: &[f32]) -> Vec<u8> {
 ///
 /// Returns an empty Vec if `bytes.len()` is not a multiple of 4.
 pub fn unpack_f32(bytes: &[u8]) -> Vec<f32> {
-    if !bytes.len().is_multiple_of(4) {
+    if bytes.len() % 4 != 0 {
         return Vec::new();
     }
     bytes
@@ -980,6 +1021,29 @@ mod tests {
         assert_eq!(removed, 1, "only the record under the scope is pruned");
         let (files, _, _) = store.stats().unwrap();
         assert_eq!(files, 2);
+    }
+
+    #[test]
+    fn delete_files_where_uses_predicate_and_scope() {
+        let mut store = open_in_memory();
+        for p in ["/s/keep.rs", "/s/drop.rs", "/t/drop.rs"] {
+            store.upsert_file(Path::new(p), 1.0, "h").unwrap();
+        }
+        let removed = store
+            .delete_files_where(Some(&[PathBuf::from("/s")]), |p| p.ends_with("drop.rs"))
+            .unwrap();
+        assert_eq!(removed, 1, "only /s/drop.rs is in scope and stale");
+        assert!(store.get_file(Path::new("/t/drop.rs")).unwrap().is_some());
+        assert!(store.get_file(Path::new("/s/keep.rs")).unwrap().is_some());
+    }
+
+    #[test]
+    fn meta_roundtrip() {
+        let mut store = open_in_memory();
+        assert_eq!(store.get_meta("k").unwrap(), None);
+        store.set_meta("k", "1").unwrap();
+        store.set_meta("k", "2").unwrap();
+        assert_eq!(store.get_meta("k").unwrap().as_deref(), Some("2"));
     }
 
     #[test]

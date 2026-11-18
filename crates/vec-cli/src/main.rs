@@ -175,7 +175,7 @@ async fn main() -> Result<()> {
             action: ModelAction::Download,
         }) => cmd_model_download(cfg_path),
         Some(Command::Init { user }) => cmd_init(user),
-        Some(Command::Watch) => vec_watch::run_watch(),
+        Some(Command::Watch) => vec_watch::run_watch(cfg_path),
         Some(Command::Daemon) => cmd_daemon(cfg_path).await,
         Some(Command::Context { file_line, window }) => cmd_context(&file_line, window),
         Some(Command::Similar { file_line, limit }) => cmd_similar(&file_line, limit, cfg_path),
@@ -184,12 +184,7 @@ async fn main() -> Result<()> {
         Some(Command::Explain { file_line }) => cmd_explain(&file_line, cfg_path),
         Some(Command::Diff) => cmd_diff(cfg_path),
         Some(Command::Completions { shell }) => {
-            clap_complete::generate(
-                shell,
-                &mut Cli::command(),
-                "vec",
-                &mut std::io::stdout(),
-            );
+            clap_complete::generate(shell, &mut Cli::command(), "vec", &mut std::io::stdout());
             Ok(())
         }
     }
@@ -199,6 +194,7 @@ async fn main() -> Result<()> {
 // vec <query>
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)] // one parameter per CLI flag; a struct would only move them
 async fn cmd_search(
     queries: &[String],
     limit: Option<usize>,
@@ -211,8 +207,7 @@ async fn cmd_search(
 ) -> Result<()> {
     let cfg = Config::load(cfg_path).context("loading config")?;
 
-    let store =
-        Store::open(&cfg.database.db_path, cfg.database.wal).context("opening store")?;
+    let store = Store::open(&cfg.database.db_path, cfg.database.wal).context("opening store")?;
 
     let limit = limit.unwrap_or(cfg.search.default_limit);
     let min_score = min_score.unwrap_or(0.0);
@@ -247,14 +242,21 @@ async fn cmd_search(
             .collect();
         for r in &mut results {
             let path_lower = r.path.to_string_lossy().to_lowercase();
-            let matches = all_words.iter().filter(|w| path_lower.contains(w.as_str())).count();
+            let matches = all_words
+                .iter()
+                .filter(|w| path_lower.contains(w.as_str()))
+                .count();
             if matches > 0 {
                 r.score += path_boost * matches as f32;
             }
         }
     }
 
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     results.truncate(limit);
 
     // Apply --exclude filter.
@@ -278,10 +280,13 @@ async fn cmd_search(
         .collect();
 
     // Cache file contents to avoid re-reading the same file for best_line + snippet.
-    let mut file_cache: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
+    let mut file_cache: std::collections::HashMap<PathBuf, String> =
+        std::collections::HashMap::new();
 
     // Helper: get cached file content.
-    let read_cached = |cache: &mut std::collections::HashMap<PathBuf, String>, path: &std::path::Path| -> Option<String> {
+    let read_cached = |cache: &mut std::collections::HashMap<PathBuf, String>,
+                       path: &std::path::Path|
+     -> Option<String> {
         if let Some(content) = cache.get(path) {
             return Some(content.clone());
         }
@@ -313,11 +318,17 @@ async fn cmd_search(
 
     for result in &results {
         let content = read_cached(&mut file_cache, &result.path);
-        let best = content.as_ref()
+        let best = content
+            .as_ref()
             .and_then(|c| best_line_in_content(c, result, &query_words))
             .unwrap_or(result.start_line);
 
-        println!("{}:{} (score: {:.3})", result.path.display(), best, result.score);
+        println!(
+            "{}:{} (score: {:.3})",
+            result.path.display(),
+            best,
+            result.score
+        );
 
         if show_snippet {
             if let Some(ref content) = content {
@@ -410,6 +421,30 @@ async fn cmd_status(cfg_path: Option<&std::path::Path>) -> Result<()> {
         Err(_) => println!("Model path:   not found — run 'vec model download'"),
     }
 
+    // Watcher state, recorded by `vec watch` at each flush.
+    let meta = |k: &str| store.get_meta(k).ok().flatten().filter(|v| !v.is_empty());
+    match meta("watch.last_flush").and_then(|v| v.parse::<u64>().ok()) {
+        None => println!("Watcher:      no flush recorded"),
+        Some(ts) => {
+            println!(
+                "Watcher:      last flush {} ({} path(s)), watching {} directories",
+                fmt_unix_ts(ts),
+                meta("watch.last_paths").unwrap_or_else(|| "?".into()),
+                meta("watch.watched_dirs").unwrap_or_else(|| "?".into()),
+            );
+            if let Some(n) = meta("watch.watch_failures").filter(|n| n != "0") {
+                println!(
+                    "              WARNING: {n} director(ies) could not be watched — \
+                     changes there are only seen by 'vec updatedb' \
+                     (raise fs.inotify.max_user_watches)"
+                );
+            }
+            if let Some(e) = meta("watch.last_error") {
+                println!("              WARNING: last flush failed (retrying): {e}");
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -431,12 +466,16 @@ fn cmd_model_download(cfg_path: Option<&std::path::Path>) -> Result<()> {
         "  curl -L -o {dir}/model_int8.onnx \\",
         dir = model_dir.display()
     );
-    println!("    https://huggingface.co/onnx-community/gte-multilingual-base/resolve/main/onnx/model_int8.onnx");
+    println!(
+        "    https://huggingface.co/onnx-community/gte-multilingual-base/resolve/main/onnx/model_int8.onnx"
+    );
     println!(
         "  curl -L -o {dir}/tokenizer.json \\",
         dir = model_dir.display()
     );
-    println!("    https://huggingface.co/onnx-community/gte-multilingual-base/resolve/main/tokenizer.json");
+    println!(
+        "    https://huggingface.co/onnx-community/gte-multilingual-base/resolve/main/tokenizer.json"
+    );
     println!();
     println!("Then run: vec updatedb");
 
@@ -517,6 +556,8 @@ include_paths = ["{home}"]
 # debounce_ms = 3000    # re-index after this much quiet
 # max_wait_ms = 30000   # ...or at most this long after the first change
 # max_pending = 10000   # distinct pending paths before collapsing to parent dirs
+# retry_max_ms = 60000  # max retry delay after a failed re-index
+# startup_rescan = true # re-index include paths at start (changes while stopped)
 
 [database]
 db_path = "{db_path}"
@@ -556,8 +597,9 @@ db_path = "{db_path}"
 #                  "dpkg", "apt", "rpm", "cloud", "alternatives",
 #                  "dist-packages", "site-packages",
 #                  "apparmor.d", "iproute2", "abi"]
-#   (gitignore syntax: a bare name matches at any depth; absolute paths do
-#    NOT match. Your entries are added to the defaults above.)
+#   (gitignore syntax: a bare name matches at any depth; "/name" matches only
+#    directly under an include path; an absolute path under an include path
+#    matches that directory. Your entries are added to the defaults above.)
 # exclude_files = ["*.lock", "*.min.js", "*.map", "*.pyc",
 #                  ".env", ".env.*", "*.key", "*.pem", "*.p12",
 #                  "*.pfx", "*.onnx", "*.bin", "*.so", "*.dylib"]
@@ -570,6 +612,8 @@ db_path = "{db_path}"
 # debounce_ms = 3000    # re-index after this much quiet
 # max_wait_ms = 30000   # ...or at most this long after the first change
 # max_pending = 10000   # distinct pending paths before collapsing to parent dirs
+# retry_max_ms = 60000  # max retry delay after a failed re-index
+# startup_rescan = true # re-index include paths at start (changes while stopped)
 
 [database]
 # db_path = "/var/lib/vec/vec.db"
@@ -613,8 +657,7 @@ async fn cmd_daemon(cfg_path: Option<&std::path::Path>) -> Result<()> {
 
 fn cmd_context(file_line: &str, window: usize) -> Result<()> {
     let (path, line) = parse_file_line(file_line)?;
-    let content = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {path}"))?;
+    let content = std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
     let lines: Vec<&str> = content.lines().collect();
     let target = line.saturating_sub(1); // 1-based → 0-based
     let from = target.saturating_sub(window);
@@ -631,7 +674,11 @@ fn cmd_context(file_line: &str, window: usize) -> Result<()> {
 // vec similar
 // ---------------------------------------------------------------------------
 
-fn cmd_similar(file_line: &str, limit: Option<usize>, cfg_path: Option<&std::path::Path>) -> Result<()> {
+fn cmd_similar(
+    file_line: &str,
+    limit: Option<usize>,
+    cfg_path: Option<&std::path::Path>,
+) -> Result<()> {
     let cfg = Config::load(cfg_path).context("loading config")?;
     let store = Store::open(&cfg.database.db_path, cfg.database.wal).context("opening store")?;
     let limit = limit.unwrap_or(cfg.search.default_limit);
@@ -652,7 +699,12 @@ fn cmd_similar(file_line: &str, limit: Option<usize>, cfg_path: Option<&std::pat
         if r.path.to_string_lossy() == path && r.start_line <= line && r.end_line >= line {
             continue;
         }
-        println!("{}:{} (score: {:.3})", r.path.display(), r.start_line, r.score);
+        println!(
+            "{}:{} (score: {:.3})",
+            r.path.display(),
+            r.start_line,
+            r.score
+        );
     }
     Ok(())
 }
@@ -684,7 +736,12 @@ fn cmd_repl(cfg_path: Option<&std::path::Path>) -> Result<()> {
         let results = store.search(&embedding, cfg.search.default_limit, 0.0, None)?;
         for r in &results {
             if vec_core::util::can_read(&r.path) {
-                println!("{}:{} (score: {:.3})", r.path.display(), r.start_line, r.score);
+                println!(
+                    "{}:{} (score: {:.3})",
+                    r.path.display(),
+                    r.start_line,
+                    r.score
+                );
             }
         }
         println!();
@@ -698,13 +755,16 @@ fn cmd_repl(cfg_path: Option<&std::path::Path>) -> Result<()> {
 
 fn cmd_gc(cfg_path: Option<&std::path::Path>) -> Result<()> {
     let cfg = Config::load(cfg_path).context("loading config")?;
-    let mut store = Store::open(&cfg.database.db_path, cfg.database.wal).context("opening store")?;
+    let mut store =
+        Store::open(&cfg.database.db_path, cfg.database.wal).context("opening store")?;
 
     let size_before = std::fs::metadata(&cfg.database.db_path)
         .map(|m| m.len())
         .unwrap_or(0);
 
-    let deleted = store.delete_missing_files().context("pruning deleted files")?;
+    let deleted = store
+        .delete_missing_files()
+        .context("pruning deleted files")?;
     store.vacuum().context("vacuuming database")?;
 
     let size_after = std::fs::metadata(&cfg.database.db_path)
@@ -735,7 +795,10 @@ fn cmd_explain(file_line: &str, cfg_path: Option<&std::path::Path>) -> Result<()
 
     println!("{}:{} is covered by {} chunk(s):", path, line, chunks.len());
     for c in &chunks {
-        println!("  lines {}-{}  (bytes {}..{})", c.start_line, c.end_line, c.byte_offset, c.byte_end);
+        println!(
+            "  lines {}-{}  (bytes {}..{})",
+            c.start_line, c.end_line, c.byte_offset, c.byte_end
+        );
     }
 
     if let Some(record) = store.get_file(&std::path::PathBuf::from(&path))? {
@@ -785,9 +848,11 @@ fn cmd_diff(cfg_path: Option<&std::path::Path>) -> Result<()> {
 
 /// Parse a "file:line" string into (path, line_number).
 fn parse_file_line(s: &str) -> Result<(String, usize)> {
-    let (path, line_str) = s.rsplit_once(':')
+    let (path, line_str) = s
+        .rsplit_once(':')
         .ok_or_else(|| anyhow::anyhow!("expected file:line format, got: {s}"))?;
-    let line: usize = line_str.parse()
+    let line: usize = line_str
+        .parse()
         .with_context(|| format!("invalid line number: {line_str}"))?;
     Ok((path.to_string(), line))
 }

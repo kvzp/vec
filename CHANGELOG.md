@@ -37,6 +37,16 @@ Versioning follows [Semantic Versioning](https://semver.org/).
   - the store and the embedder are opened once per flush.
 - `[watch]` config section (`debounce_ms`, `max_wait_ms`, `max_pending`) replaces the hardcoded 3 s debounce.
 - `exclude_dirs` matching semantics documented in CONFIG.md, `vec init` and `contrib/vec.conf`.
+- **`vec watch` review fixes and correctness rework** (#3, #4):
+  - the walker is the single source of truth: scoped re-indexes walk from the include path along the changed paths, so ancestor `.gitignore`/`exclude_dirs` rules apply exactly; pruning removes exactly the records the walk did not accept (deleted, newly excluded or ignored, binary, too large), never records under a directory that could not be read; the watcher's own `.gitignore` emulation is gone;
+  - non-recursive watches, one per directory the walker enters, kept in sync by a watch-manager thread: excluded and ignored trees get no inotify watch; new/moved-in directories are watched and then re-indexed; deleted, moved-out and newly ignored ones lose their watch; `.gitignore`, `.ignore`, `.git` and `.git/info/exclude` changes re-decide their directory;
+  - `Pending` collapse is amortised O(1) per event, never climbs above an include path (a collapsed path above one was silently dropped), and degrades to an O(1) overflow state that rescans the include paths; a kernel queue overflow also rescans;
+  - a failed flush is re-queued with exponential backoff (`[watch] retry_max_ms`) instead of being lost; `[watch] startup_rescan` catches changes made while the watcher was stopped;
+  - `vec status` shows the watcher's last flush, watched directories, watch failures and last error;
+  - `vec --config <file> watch` now honours `--config` (from #4);
+  - incremental `vec updatedb` prunes newly excluded files (no `--full` needed); a permission error is no longer mistaken for a deleted file;
+  - `exclude_dirs` patterns are rooted at each include path: `"/builds"` and absolute paths inside an include path now match.
+- **CI** (from #4): clippy fixes, and the aarch64 cross-compile job installs `g++-aarch64-linux-gnu` and sets `CXX_aarch64_unknown_linux_gnu` (`esaxx-rs` compiles C++); it had failed since March.
 
 - ONNX model loading with `gte-multilingual-base` — cleared `value_info` symbolic dims that tract couldn't parse
 - Watcher feedback loop — events from the DB directory are now filtered out

@@ -14,19 +14,18 @@
 /// crate (ripgrep's engine — respects .gitignore), skips unchanged files
 /// (sha256 hash comparison), re-embeds changed files in batches, and keeps
 /// the `files` / `chunks` tables consistent.
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::overrides::{Override, OverrideBuilder};
 use sha2::{Digest, Sha256};
 
 use vec_core::config::{Config, IndexConfig};
 use vec_embed::Embedder;
-use vec_store::Store;
+use vec_store::{Store, is_gone};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -320,66 +319,60 @@ pub fn run_updatedb(
         return update_paths_inner(store, embedder, cfg, full, &[p], &progress);
     }
 
-    // -----------------------------------------------------------------------
-    // 1. Remove stale DB records.
-    //
-    // --full: wipe everything and start clean. This ensures files that were
-    // previously indexed but are now out-of-scope (due to changed include_paths
-    // or exclude_dirs) are purged — not just files deleted from disk.
-    //
-    // incremental: only remove records for files that no longer exist on disk.
-    // -----------------------------------------------------------------------
-    let deleted = if full {
-        let n = store
+    if cfg.index.include_paths.is_empty() {
+        progress("no include_paths configured; nothing to index");
+    }
+
+    // --full: wipe everything first and re-embed every file, so nothing
+    // stale can survive (also out-of-scope entries).
+    let mut cleared = 0;
+    if full {
+        cleared = store
             .delete_all_files()
             .context("clearing index for full re-index")?;
-        if n > 0 {
-            progress(&format!("cleared {n} entries for full re-index"));
+        if cleared > 0 {
+            progress(&format!("cleared {cleared} entries for full re-index"));
         }
-        n
+    }
+
+    let mut seen = WalkSeen::default();
+    let mut stats = IndexStats::default();
+    for builder in scoped_walkers(cfg, None, &progress) {
+        stats.add(&index_walk(
+            &builder, store, embedder, cfg, full, &progress, &mut seen,
+        )?);
+    }
+
+    // Incremental: after the walk, drop every record the walk did not accept
+    // (deleted, now excluded, outside include_paths, binary, too large …).
+    // The walker is the single source of truth, so the index ends up exactly
+    // as a --full run would leave it.
+    stats.files_deleted = if full {
+        cleared
     } else {
         let n = store
-            .delete_missing_files()
-            .context("pruning deleted files from store")?;
+            .delete_files_where(None, |p| seen.is_stale(p))
+            .context("pruning stale files from store")?;
         if n > 0 {
-            progress(&format!("pruned {n} deleted files from index"));
+            progress(&format!("pruned {n} stale files from index"));
         }
         n
     };
-
-    // -----------------------------------------------------------------------
-    // 2. Walk configured paths.
-    // -----------------------------------------------------------------------
-    let include_paths = &cfg.index.include_paths;
-    if include_paths.is_empty() {
-        progress("no include_paths configured; nothing to index");
-        return Ok(IndexStats {
-            files_deleted: deleted,
-            ..Default::default()
-        });
-    }
-
-    let mut builder = WalkBuilder::new(&include_paths[0]);
-    for extra in include_paths.iter().skip(1) {
-        builder.add(extra);
-    }
-    configure_walker(&mut builder, &cfg.index, &progress);
-
-    let mut stats = index_walk(&builder, store, embedder, cfg, full, &progress)?;
-    stats.files_deleted = deleted;
     Ok(stats)
 }
 
 /// Re-index exactly the given paths (files or directories) — used by `vec watch`.
 ///
-/// * Records equal to or under any of `paths` that no longer exist on disk
-///   are pruned (one transaction, scoped query — not a whole-index scan).
-/// * Existing paths that are not excluded (see [`IndexFilter`]) are walked
-///   with the same rules as a full `run_updatedb`; nested paths are walked once.
-/// * Paths outside `include_paths` are ignored.
-///
-/// Unchanged files are skipped by hash, so passing a directory whose files
-/// mostly did not change is cheap apart from reading them.
+/// The result for records equal to or under `paths` is exactly what a full
+/// `run_updatedb` would produce for them:
+/// * each path is walked from its include path with the real walker, which
+///   descends only along the way to the path, so every ancestor's
+///   `.gitignore` and `exclude_dirs` rule applies exactly as in a full walk;
+/// * records in scope that the walk did not accept (deleted, now excluded or
+///   ignored, outside `include_paths`, binary, too large) are pruned, in one
+///   transaction with a scoped query — not a whole-index scan;
+/// * records under a directory that could not be read are kept unless their
+///   file is gone.
 pub fn update_paths(
     store: &mut Store,
     embedder: &Embedder,
@@ -398,73 +391,202 @@ fn update_paths_inner(
     paths: &[PathBuf],
     progress: &dyn Fn(&str),
 ) -> Result<IndexStats> {
-    let deleted = store
-        .delete_missing_files_under(paths)
-        .context("pruning deleted files from store")?;
-    if deleted > 0 {
-        progress(&format!("pruned {deleted} deleted files from index"));
+    let mut seen = WalkSeen::default();
+    let mut stats = IndexStats::default();
+    for builder in scoped_walkers(cfg, Some(paths), progress) {
+        stats.add(&index_walk(
+            &builder, store, embedder, cfg, full, progress, &mut seen,
+        )?);
     }
-
-    let mut filter = IndexFilter::new(cfg, progress);
-    let mut roots: Vec<PathBuf> = paths
-        .iter()
-        .filter(|p| p.exists() && !filter.is_excluded(p, p.is_dir()))
-        .cloned()
-        .collect();
-    // Path ordering is component-wise, so every descendant sorts directly
-    // after its ancestor: comparing with the last kept root drops nested ones.
-    roots.sort();
-    let mut kept: Vec<PathBuf> = Vec::with_capacity(roots.len());
-    for r in roots {
-        if !kept.last().is_some_and(|k| r.starts_with(k)) {
-            kept.push(r);
-        }
+    stats.files_deleted = store
+        .delete_files_where(Some(paths), |p| seen.is_stale(p))
+        .context("pruning stale files from store")?;
+    if stats.files_deleted > 0 {
+        progress(&format!(
+            "pruned {} stale files from index",
+            stats.files_deleted
+        ));
     }
-
-    let Some(first) = kept.first() else {
-        return Ok(IndexStats {
-            files_deleted: deleted,
-            ..Default::default()
-        });
-    };
-    let mut builder = WalkBuilder::new(first);
-    for extra in kept.iter().skip(1) {
-        builder.add(extra);
-    }
-    configure_walker(&mut builder, &cfg.index, progress);
-
-    let mut stats = index_walk(&builder, store, embedder, cfg, full, progress)?;
-    stats.files_deleted = deleted;
     Ok(stats)
 }
 
-/// Apply vec's walking rules (gitignore, exclude_dirs, no symlinks) to a walker.
-fn configure_walker(builder: &mut WalkBuilder, icfg: &IndexConfig, progress: &dyn Fn(&str)) {
-    // Respect .gitignore files at every level if configured.
-    builder.git_ignore(icfg.gitignore);
-    builder.git_global(false); // keep behaviour predictable across machines
-    builder.git_exclude(icfg.gitignore);
-
-    // Directory exclusions (gitignore-style overrides — see [`exclude_override`]).
-    builder.overrides(exclude_override(icfg, progress));
-
-    // Follow symlinks is intentionally false (default) — avoids infinite loops.
-    builder.follow_links(false);
+/// Visit every directory the indexer would descend into, equal to or under
+/// one of `paths`, using the real walker (see [`update_paths`]). For a
+/// directory holding a git repository, `<dir>/.git/info` is visited too,
+/// because `.git/info/exclude` changes what is indexed.
+///
+/// Used by `vec watch` to place one non-recursive inotify watch per
+/// directory, so excluded and ignored trees never get a watch.
+pub fn visit_dirs(
+    cfg: &Config,
+    paths: &[PathBuf],
+    progress: &dyn Fn(&str),
+    mut f: impl FnMut(&Path),
+) {
+    for builder in scoped_walkers(cfg, Some(paths), progress) {
+        for entry in builder.build() {
+            let e = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    if !is_not_found(&e) {
+                        progress(&format!("warn: walk error: {e}"));
+                    }
+                    continue;
+                }
+            };
+            if !e.file_type().is_some_and(|t| t.is_dir()) {
+                continue;
+            }
+            // Skip the ancestors the walk passes through on its way down.
+            if !paths.iter().any(|p| e.path().starts_with(p)) {
+                continue;
+            }
+            f(e.path());
+            let info = e.path().join(".git/info");
+            if info.is_dir() {
+                f(&info);
+            }
+        }
+    }
 }
 
-/// Build the `exclude_dirs` matcher.
+/// Walkers covering `scopes` (`None` = everything), one per include path.
 ///
-/// Patterns use gitignore syntax rooted at "." (the process's working
-/// directory): a bare name such as `"build"` matches a file or directory of
-/// that name at any depth; a pattern containing `/` is anchored to the
-/// working directory, so absolute paths do **not** match as expected.
-fn exclude_override(icfg: &IndexConfig, progress: &dyn Fn(&str)) -> Override {
-    let mut override_builder = OverrideBuilder::new(".");
+/// A scope inside include path `I` is walked from `I`, with an entry filter
+/// that only lets the walk descend along ancestors of a scope and into the
+/// scope itself. That costs a directory listing per ancestor, but means the
+/// walker's own rules decide every ancestor — no re-implementation of
+/// `.gitignore` semantics that could disagree with a full run.
+fn scoped_walkers(
+    cfg: &Config,
+    scopes: Option<&[PathBuf]>,
+    progress: &dyn Fn(&str),
+) -> Vec<WalkBuilder> {
+    let mut out = Vec::new();
+    for root in &cfg.index.include_paths {
+        let mut builder = WalkBuilder::new(root);
+        builder.git_ignore(cfg.index.gitignore);
+        builder.git_global(false); // keep behaviour predictable across machines
+        builder.git_exclude(cfg.index.gitignore);
+        builder.overrides(exclude_override(&cfg.index, root, progress));
+        // Follow symlinks is intentionally false (default) — avoids infinite loops.
+        builder.follow_links(false);
+
+        if let Some(scopes) = scopes {
+            if !scopes.iter().any(|s| root.starts_with(s)) {
+                let inside: Vec<PathBuf> = scopes
+                    .iter()
+                    .filter(|s| s.starts_with(root))
+                    .cloned()
+                    .collect();
+                if inside.is_empty() {
+                    continue;
+                }
+                builder.filter_entry(move |e| {
+                    let p = e.path();
+                    inside.iter().any(|s| s.starts_with(p) || p.starts_with(s))
+                });
+            }
+        }
+        out.push(builder);
+    }
+    out
+}
+
+/// What a walk accepted, and where it could not see.
+#[derive(Default)]
+struct WalkSeen {
+    /// Files the walk accepted: their records must stay.
+    kept: HashSet<PathBuf>,
+    /// Paths that could not be read: records under them are only removed when
+    /// their file is definitely gone.
+    protected: Vec<PathBuf>,
+    /// An unreadable location of unknown path: no record is removed unless
+    /// its file is definitely gone.
+    unsure: bool,
+}
+
+impl WalkSeen {
+    fn record_error(&mut self, e: &ignore::Error) {
+        match error_scope(e, None) {
+            ErrScope::Harmless => {}
+            ErrScope::Path(p) => self.protected.push(p),
+            ErrScope::Unknown => self.unsure = true,
+        }
+    }
+
+    /// Should the record for `path` be deleted?
+    fn is_stale(&self, path: &Path) -> bool {
+        if self.kept.contains(path) {
+            return false;
+        }
+        if is_gone(path) {
+            return true;
+        }
+        !(self.unsure || self.protected.iter().any(|p| path.starts_with(p)))
+    }
+}
+
+/// The entry disappeared during the walk: not an error, just absence.
+fn is_not_found(e: &ignore::Error) -> bool {
+    e.io_error()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+}
+
+enum ErrScope {
+    /// Does not hide any entry (e.g. an invalid line in a .gitignore).
+    Harmless,
+    /// Entries under this path may have been skipped.
+    Path(PathBuf),
+    /// Entries may have been skipped somewhere.
+    Unknown,
+}
+
+fn error_scope(e: &ignore::Error, path: Option<&Path>) -> ErrScope {
+    use ignore::Error as E;
+    match e {
+        E::WithPath { path, err } => error_scope(err, Some(path)),
+        E::WithDepth { err, .. } | E::WithLineNumber { err, .. } => error_scope(err, path),
+        E::Partial(errs) => {
+            let mut worst = ErrScope::Harmless;
+            for err in errs {
+                match error_scope(err, path) {
+                    ErrScope::Unknown => return ErrScope::Unknown,
+                    ErrScope::Path(p) => worst = ErrScope::Path(p),
+                    ErrScope::Harmless => {}
+                }
+            }
+            worst
+        }
+        E::Glob { .. } | E::UnrecognizedFileType(_) | E::InvalidDefinition => ErrScope::Harmless,
+        E::Loop { child, .. } => ErrScope::Path(child.clone()),
+        _ => path.map_or(ErrScope::Unknown, |p| ErrScope::Path(p.to_path_buf())),
+    }
+}
+
+/// Build the `exclude_dirs` matcher for one include path.
+///
+/// Patterns use gitignore syntax rooted at `root`:
+/// * a bare name such as `"build"` matches a file or directory of that
+///   name at any depth;
+/// * a pattern with a leading or inner `/` is anchored to `root`
+///   (`"/builds"` matches only `<root>/builds`);
+/// * an absolute path under `root` (`"/home/me/builds"` with root
+///   `/home/me`) is rewritten to its anchored form, so it matches exactly
+///   that directory.
+fn exclude_override(icfg: &IndexConfig, root: &Path, progress: &dyn Fn(&str)) -> Override {
+    let mut override_builder = OverrideBuilder::new(root);
     for dir in &icfg.exclude_dirs {
+        let as_path = Path::new(dir);
+        let pattern = match as_path.strip_prefix(root) {
+            Ok(rel) if as_path.is_absolute() && root != Path::new("/") => {
+                format!("/{}", rel.display())
+            }
+            _ => dir.clone(),
+        };
         // The override builder uses gitignore syntax with inverted meaning:
         // "!pattern" means "ignore".
-        let pattern = format!("!{}", dir);
-        if let Err(e) = override_builder.add(&pattern) {
+        if let Err(e) = override_builder.add(&format!("!{pattern}")) {
             progress(&format!("warn: invalid exclude_dirs pattern '{dir}': {e}"));
         }
     }
@@ -474,7 +596,20 @@ fn exclude_override(icfg: &IndexConfig, progress: &dyn Fn(&str)) -> Override {
     })
 }
 
+impl IndexStats {
+    fn add(&mut self, o: &IndexStats) {
+        self.files_visited += o.files_visited;
+        self.files_updated += o.files_updated;
+        self.files_unchanged += o.files_unchanged;
+        self.files_deleted += o.files_deleted;
+        self.chunks_added += o.chunks_added;
+        self.errors += o.errors;
+    }
+}
+
 /// Walk `builder`'s roots, embed new/changed files, and write them to `store`.
+/// Every file the walk accepts (indexed, unchanged, or unreadable for a
+/// transient reason) is recorded in `seen`, which drives pruning.
 fn index_walk(
     builder: &WalkBuilder,
     store: &mut Store,
@@ -482,6 +617,7 @@ fn index_walk(
     cfg: &Config,
     full: bool,
     progress: &dyn Fn(&str),
+    seen: &mut WalkSeen,
 ) -> Result<IndexStats> {
     let mut stats = IndexStats::default();
     let icfg = &cfg.index;
@@ -604,8 +740,12 @@ fn index_walk(
         let entry = match result {
             Ok(e) => e,
             Err(e) => {
-                progress(&format!("warn: walk error: {e}"));
-                stats.errors += 1;
+                // Vanished while walking (deleted or renamed): plain absence.
+                if !is_not_found(&e) {
+                    progress(&format!("warn: walk error: {e}"));
+                    stats.errors += 1;
+                    seen.record_error(&e);
+                }
                 continue;
             }
         };
@@ -624,8 +764,12 @@ fn index_walk(
         let metadata = match std::fs::metadata(&path) {
             Ok(m) => m,
             Err(e) => {
-                progress(&format!("warn: metadata({}): {e}", path.display()));
-                stats.errors += 1;
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    // Exists but cannot be inspected right now: keep its record.
+                    progress(&format!("warn: metadata({}): {e}", path.display()));
+                    stats.errors += 1;
+                    seen.kept.insert(path);
+                }
                 continue;
             }
         };
@@ -663,8 +807,17 @@ fn index_walk(
         // ---- read as UTF-8 ----
         let content = match std::fs::read_to_string(&path) {
             Ok(s) => s,
-            Err(_) => {
-                // Binary file or encoding error — skip silently.
+            Err(e) => {
+                match e.kind() {
+                    // Binary / not UTF-8, or deleted meanwhile: not indexable.
+                    std::io::ErrorKind::InvalidData | std::io::ErrorKind::NotFound => {}
+                    // Transient failure: keep the existing record.
+                    _ => {
+                        progress(&format!("warn: read({}): {e}", path.display()));
+                        stats.errors += 1;
+                        seen.kept.insert(path);
+                    }
+                }
                 continue;
             }
         };
@@ -681,6 +834,7 @@ fn index_walk(
             if let Ok(Some(record)) = store.get_file(&path) {
                 if record.hash == hash {
                     stats.files_unchanged += 1;
+                    seen.kept.insert(path);
                     continue;
                 }
             }
@@ -699,6 +853,8 @@ fn index_walk(
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
+
+        seen.kept.insert(path.clone());
 
         // Queue chunks.
         for chunk in chunks {
@@ -725,158 +881,72 @@ fn index_walk(
 }
 
 // ---------------------------------------------------------------------------
-// IndexFilter — the indexer's exclusion rules, usable one path at a time
+// IndexFilter — exact, cheap exclusion rules for one path at a time
 // ---------------------------------------------------------------------------
 
-/// Decides, without walking, whether the indexer would skip a path.
+/// Decides, without touching the filesystem, whether the indexer will skip
+/// a path, using only the rules that can be decided exactly from the path:
+/// outside `include_paths`, inside the database directory, a hidden
+/// component, or an `exclude_dirs` match on any component.
 ///
-/// Used by `vec watch` to drop events before queueing (so excluded trees such
-/// as `target/` cost nothing) and by [`update_paths`] to reject roots inside
-/// excluded directories (a walk never filters its own root).
-///
-/// It mirrors the walker's rules: outside `include_paths`, inside the
-/// database directory, hidden components, `exclude_dirs`, `exclude_files`,
-/// and — when `gitignore = true` and inside a git repository — `.gitignore`
-/// files and `.git/info/exclude`. It may let through a path the walker would
-/// skip (the walk then drops it), but never the reverse.
+/// It never excludes a path the walker would index — so `vec watch` can
+/// drop such events safely. Everything else (`.gitignore`, `exclude_files`,
+/// size, binary content) is left to the walker, which is authoritative.
 pub struct IndexFilter {
-    include_paths: Vec<PathBuf>,
+    /// `(include path, its exclude_dirs matcher)`.
+    roots: Vec<(PathBuf, Override)>,
     db_dir: Option<PathBuf>,
-    exclude_dirs: Override,
-    exclude_files: Vec<String>,
-    gitignore: bool,
-    /// Per-directory matcher built from `<dir>/.gitignore` (+ info/exclude
-    /// at a repo root); `None` when the directory has no rules.
-    gi_cache: HashMap<PathBuf, Option<Gitignore>>,
-    /// Per-directory: nearest ancestor (inclusive) containing `.git`.
-    repo_cache: HashMap<PathBuf, Option<PathBuf>>,
 }
 
 impl IndexFilter {
     pub fn new(cfg: &Config, progress: &dyn Fn(&str)) -> Self {
         Self {
-            include_paths: cfg.index.include_paths.clone(),
+            roots: cfg
+                .index
+                .include_paths
+                .iter()
+                .map(|r| (r.clone(), exclude_override(&cfg.index, r, progress)))
+                .collect(),
             db_dir: cfg.database.db_path.parent().map(Path::to_path_buf),
-            exclude_dirs: exclude_override(&cfg.index, progress),
-            exclude_files: cfg.index.exclude_files.clone(),
-            gitignore: cfg.index.gitignore,
-            gi_cache: HashMap::new(),
-            repo_cache: HashMap::new(),
         }
     }
 
-    /// Forget cached ignore rules. Call when a `.gitignore` or `.git` changes.
-    pub fn invalidate(&mut self) {
-        self.gi_cache.clear();
-        self.repo_cache.clear();
-    }
-
-    /// `true` if the indexer would never index `path` (or anything under it,
-    /// when it is a directory). `is_dir` is a hint; pass `false` when unknown.
-    pub fn is_excluded(&mut self, path: &Path, is_dir: bool) -> bool {
+    /// `true` if the indexer will never index `path` nor anything under it.
+    pub fn is_excluded(&self, path: &Path) -> bool {
         if self.db_dir.as_deref().is_some_and(|d| path.starts_with(d)) {
             return true;
         }
-        let Some(root) = self
-            .include_paths
+        // Excluded only if *every* include path containing it excludes it
+        // (nested include paths are walked independently).
+        // A path outside every include path is excluded too.
+        self.roots
             .iter()
-            .filter(|r| path.starts_with(r))
-            .max_by_key(|r| r.components().count())
-        else {
-            return true;
-        };
-
-        // Components strictly below the include root (the walker never
-        // filters its roots). Ancestors are directories; the leaf uses is_dir.
-        let rel: Vec<_> = path
-            .strip_prefix(root)
-            .map(|r| r.components().collect())
-            .unwrap_or_default();
-        let mut cur = root.clone();
-        for (i, comp) in rel.iter().enumerate() {
-            cur.push(comp);
-            let leaf_is_dir = if i + 1 == rel.len() { is_dir } else { true };
-            if comp.as_os_str().to_string_lossy().starts_with('.') {
-                return true; // walker skips hidden entries
-            }
-            if self.exclude_dirs.matched(&cur, leaf_is_dir).is_ignore() {
-                return true;
-            }
-        }
-
-        if !is_dir {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if self.exclude_files.iter().any(|pat| glob_match(pat, name)) {
-                return true;
-            }
-        }
-
-        self.gitignore && self.is_gitignored(path, is_dir)
+            .filter(|(r, _)| path.starts_with(r))
+            .all(|(root, ov)| Self::excluded_under(root, ov, path))
     }
 
-    fn is_gitignored(&mut self, path: &Path, is_dir: bool) -> bool {
-        let Some(parent) = path.parent() else {
-            return false;
+    fn excluded_under(root: &Path, ov: &Override, path: &Path) -> bool {
+        let Ok(rel) = path.strip_prefix(root) else {
+            return true;
         };
-        let Some(repo) = self.repo_root(parent) else {
-            return false; // like the walker: .gitignore only applies inside a repo
-        };
-        // Deepest rules win, as in git.
-        let mut dir = Some(parent);
-        while let Some(d) = dir {
-            if !d.starts_with(&repo) {
-                break;
+        let mut cur = root.to_path_buf();
+        let n = rel.components().count();
+        for (i, comp) in rel.components().enumerate() {
+            cur.push(comp);
+            if comp.as_os_str().to_string_lossy().starts_with('.') {
+                return true; // the walker skips hidden entries
             }
-            let is_repo_root = d == repo;
-            let gi = self
-                .gi_cache
-                .entry(d.to_path_buf())
-                .or_insert_with(|| load_gitignore(d, is_repo_root));
-            if let Some(gi) = gi {
-                let m = gi.matched_path_or_any_parents(path, is_dir);
-                if m.is_ignore() {
-                    return true;
-                }
-                if m.is_whitelist() {
-                    return false;
-                }
+            // Ancestors are directories. For the leaf the type is unknown: a
+            // pattern that ignores it as a file ("name") also ignores it as a
+            // directory, while a directory-only pattern ("name/") does not
+            // ignore it as a file — so this never over-excludes.
+            let is_dir = i + 1 < n;
+            if ov.matched(&cur, is_dir).is_ignore() {
+                return true;
             }
-            dir = d.parent();
         }
         false
     }
-
-    fn repo_root(&mut self, dir: &Path) -> Option<PathBuf> {
-        if let Some(cached) = self.repo_cache.get(dir) {
-            return cached.clone();
-        }
-        let found = if dir.join(".git").exists() {
-            Some(dir.to_path_buf())
-        } else {
-            dir.parent().and_then(|p| self.repo_root(p))
-        };
-        self.repo_cache.insert(dir.to_path_buf(), found.clone());
-        found
-    }
-}
-
-fn load_gitignore(dir: &Path, is_repo_root: bool) -> Option<Gitignore> {
-    let mut b = GitignoreBuilder::new(dir);
-    let mut any = false;
-    for f in [dir.join(".gitignore")]
-        .into_iter()
-        .chain(is_repo_root.then(|| dir.join(".git/info/exclude")))
-    {
-        if f.is_file() {
-            // A partly invalid file still yields its valid rules.
-            let _ = b.add(&f);
-            any = true;
-        }
-    }
-    if !any {
-        return None;
-    }
-    b.build().ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1337,7 +1407,14 @@ mod tests {
         let (_db_file, mut store) = open_temp_db();
         let embedder = vec_embed::Embedder::stub(768);
 
-        let stats = update_paths(&mut store, &embedder, &cfg, std::slice::from_ref(&sub_a), |_| {}).unwrap();
+        let stats = update_paths(
+            &mut store,
+            &embedder,
+            &cfg,
+            std::slice::from_ref(&sub_a),
+            |_| {},
+        )
+        .unwrap();
         assert_eq!(
             stats.files_visited, 1,
             "the 20 files in b/ must not be walked"
@@ -1385,7 +1462,14 @@ mod tests {
         let (_db_file, mut store) = open_temp_db();
         let embedder = vec_embed::Embedder::stub(768);
 
-        let stats = update_paths(&mut store, &embedder, &cfg, std::slice::from_ref(&deep), |_| {}).unwrap();
+        let stats = update_paths(
+            &mut store,
+            &embedder,
+            &cfg,
+            std::slice::from_ref(&deep),
+            |_| {},
+        )
+        .unwrap();
         assert_eq!(
             stats.files_visited, 0,
             "a walk root inside target/ is excluded"
@@ -1393,36 +1477,225 @@ mod tests {
     }
 
     #[test]
-    fn index_filter_respects_gitignore_only_inside_repo() {
+    fn exclude_dirs_anchored_and_absolute_patterns() {
         let dir = tempfile::TempDir::new().unwrap();
-        let repo = dir.path().join("repo");
-        let norepo = dir.path().join("norepo");
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
-        std::fs::create_dir_all(&norepo).unwrap();
-        std::fs::write(
-            repo.join(".gitignore"),
-            "builds/
-*.tmp
-",
-        )
-        .unwrap();
-        std::fs::write(
-            norepo.join(".gitignore"),
-            "builds/
-",
-        )
-        .unwrap();
+        let root = dir.path();
+        let mut cfg = test_cfg_for_dir(&dir);
+        cfg.index.exclude_dirs = vec![
+            "/builds".into(),                                // anchored to include path
+            root.join("gen").to_string_lossy().into_owned(), // absolute path
+        ];
+        let f = IndexFilter::new(&cfg, &|_| {});
+        assert!(f.is_excluded(Path::new("/definitely/outside/x.rs")));
+        assert!(
+            !f.is_excluded(root),
+            "an include path itself is never excluded"
+        );
+        assert!(f.is_excluded(&root.join("builds/x.rs")));
+        assert!(f.is_excluded(&root.join("gen/y.rs")));
+        assert!(
+            !f.is_excluded(&root.join("sub/builds/x.rs")),
+            "an anchored pattern only matches at the include path"
+        );
+        assert!(!f.is_excluded(&root.join("sub/gen/y.rs")));
+    }
+
+    #[test]
+    fn visit_dirs_skips_excluded_hidden_and_gitignored_trees() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        for d in [
+            "src/a",
+            "target/debug/deps",
+            ".cache/x",
+            "builds/out",
+            ".git",
+        ] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join(".gitignore"), "builds/\n").unwrap();
+        let mut cfg = test_cfg_for_dir(&dir);
+        cfg.index.exclude_dirs = vec!["target".into()];
+        cfg.index.gitignore = true;
+
+        let mut seen = Vec::new();
+        visit_dirs(&cfg, &[root.to_path_buf()], &|_| {}, |d| {
+            seen.push(d.strip_prefix(root).unwrap().to_path_buf())
+        });
+        seen.sort();
+        let expect: Vec<PathBuf> = ["", "src", "src/a"].iter().map(PathBuf::from).collect();
+        assert_eq!(seen, expect);
+
+        // A new directory inside an excluded tree gets no watch.
+        let mut inner = Vec::new();
+        visit_dirs(&cfg, &[root.join("target/debug")], &|_| {}, |d| {
+            inner.push(d.to_path_buf())
+        });
+        assert!(inner.is_empty());
+    }
+
+    #[test]
+    fn gitignore_edit_prunes_and_unignores_on_scoped_update() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        write_lines(&root.join("a/x.txt"), 50);
+        write_lines(&root.join("b/y.txt"), 50);
         let mut cfg = test_cfg_for_dir(&dir);
         cfg.index.gitignore = true;
-        let mut f = IndexFilter::new(&cfg, &|_| {});
+        let (_db_file, mut store) = open_temp_db();
+        let embedder = vec_embed::Embedder::stub(768);
 
-        assert!(f.is_excluded(&repo.join("builds/x/a.rs"), false));
-        assert!(f.is_excluded(&repo.join("src/a.tmp"), false));
-        assert!(!f.is_excluded(&repo.join("src/a.rs"), false));
-        assert!(
-            !f.is_excluded(&norepo.join("builds/a.rs"), false),
-            "like the walker, .gitignore outside a git repo is not applied"
+        std::fs::write(root.join(".gitignore"), "b/\n").unwrap();
+        run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {}).unwrap();
+        assert!(store.get_file(&root.join("a/x.txt")).unwrap().is_some());
+        assert!(store.get_file(&root.join("b/y.txt")).unwrap().is_none());
+
+        // Flip the rule: a/ ignored, b/ allowed. A scoped update of the root
+        // must both prune a/x.txt and index b/y.txt.
+        std::fs::write(root.join(".gitignore"), "a/\n").unwrap();
+        let stats =
+            update_paths(&mut store, &embedder, &cfg, &[root.to_path_buf()], |_| {}).unwrap();
+        assert_eq!(stats.files_deleted, 1);
+        assert!(store.get_file(&root.join("a/x.txt")).unwrap().is_none());
+        assert!(store.get_file(&root.join("b/y.txt")).unwrap().is_some());
+    }
+
+    #[test]
+    fn incremental_updatedb_prunes_newly_excluded_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("vendor")).unwrap();
+        write_lines(&dir.path().join("vendor/v.txt"), 50);
+        let mut cfg = test_cfg_for_dir(&dir);
+        let (_db_file, mut store) = open_temp_db();
+        let embedder = vec_embed::Embedder::stub(768);
+        run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {}).unwrap();
+
+        cfg.index.exclude_dirs = vec!["vendor".into()];
+        let stats = run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {}).unwrap();
+        assert_eq!(
+            stats.files_deleted, 1,
+            "no --full needed after adding an exclusion"
         );
+    }
+
+    #[test]
+    fn scoped_update_applies_ancestor_gitignore_exactly() {
+        // The scope is deep inside an ignored directory: only the real walk
+        // from the include path can see that an ancestor is ignored.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("out/a/b")).unwrap();
+        std::fs::write(root.join(".gitignore"), "out/\n").unwrap();
+        write_lines(&root.join("out/a/b/gen.txt"), 50);
+        let mut cfg = test_cfg_for_dir(&dir);
+        cfg.index.gitignore = true;
+        let (_db_file, mut store) = open_temp_db();
+        let embedder = vec_embed::Embedder::stub(768);
+
+        let stats =
+            update_paths(&mut store, &embedder, &cfg, &[root.join("out/a/b")], |_| {}).unwrap();
+        assert_eq!(stats.files_visited, 0);
+        assert!(
+            store
+                .get_file(&root.join("out/a/b/gen.txt"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn scoped_and_full_runs_agree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        for d in ["src", "out", "node_modules/x", "keep"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join(".gitignore"), "out/\n*.tmp\n!keep/*.tmp\n").unwrap();
+        for f in [
+            "src/a.rs",
+            "src/b.tmp",
+            "out/c.rs",
+            "node_modules/x/d.js",
+            "keep/e.tmp",
+            "f.lock",
+        ] {
+            write_lines(&root.join(f), 50);
+        }
+        let mut cfg = test_cfg_for_dir(&dir);
+        cfg.index.gitignore = true;
+        cfg.index.exclude_dirs = vec!["node_modules".into()];
+        cfg.index.exclude_files = vec!["*.lock".into()];
+        let embedder = vec_embed::Embedder::stub(768);
+
+        let (_f1, mut full) = open_temp_db();
+        run_updatedb(&mut full, &embedder, &cfg, true, None, |_| {}).unwrap();
+        let (_f2, mut scoped) = open_temp_db();
+        let every: Vec<PathBuf> = [
+            "src/a.rs",
+            "src/b.tmp",
+            "out/c.rs",
+            "node_modules/x/d.js",
+            "keep/e.tmp",
+            "f.lock",
+        ]
+        .iter()
+        .map(|f| root.join(f))
+        .collect();
+        update_paths(&mut scoped, &embedder, &cfg, &every, |_| {}).unwrap();
+
+        for f in &every {
+            assert_eq!(
+                full.get_file(f).unwrap().is_some(),
+                scoped.get_file(f).unwrap().is_some(),
+                "full and scoped runs disagree on {}",
+                f.display()
+            );
+        }
+        assert!(full.get_file(&root.join("src/a.rs")).unwrap().is_some());
+        assert!(full.get_file(&root.join("keep/e.tmp")).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directory_keeps_its_records() {
+        use std::os::unix::fs::PermissionsExt;
+        if nix_is_root() {
+            return; // root ignores permissions
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let sub = dir.path().join("locked");
+        std::fs::create_dir_all(&sub).unwrap();
+        let f = sub.join("x.txt");
+        write_lines(&f, 50);
+        let cfg = test_cfg_for_dir(&dir);
+        let (_db_file, mut store) = open_temp_db();
+        let embedder = vec_embed::Embedder::stub(768);
+        run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {}).unwrap();
+
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let r1 = run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {});
+        let r2 = update_paths(&mut store, &embedder, &cfg, &[sub.clone()], |_| {});
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        r1.unwrap();
+        r2.unwrap();
+        assert!(
+            store.get_file(&f).unwrap().is_some(),
+            "a transient read error must not delete records"
+        );
+    }
+
+    fn nix_is_root() -> bool {
+        std::fs::metadata("/proc/self")
+            .map(|m| {
+                use std::os::unix::fs::MetadataExt;
+                m.uid() == 0
+            })
+            .unwrap_or(false)
     }
 
     #[test]
