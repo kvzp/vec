@@ -244,7 +244,8 @@ impl Embedder {
     pub fn http(url: &str, model: &str) -> Result<Self> {
         // Probe dimension with a test request.
         let probe = http_embed_request(url, model, &["hello"])?;
-        let dim = probe.first()
+        let dim = probe
+            .first()
             .ok_or_else(|| anyhow::anyhow!("HTTP embed probe returned empty result"))?
             .len();
 
@@ -414,8 +415,8 @@ fn embed_batch_inner(inner: &EmbedderInner, texts: &[&str]) -> Result<Vec<Vec<f3
             // times. A work-stealing pattern using an atomic counter ensures
             // a completed thread immediately picks up the next text.
             const MAX_CONCURRENT: usize = 4;
-            use std::sync::atomic::{AtomicUsize, Ordering};
             use std::sync::Mutex;
+            use std::sync::atomic::{AtomicUsize, Ordering};
 
             let next_idx = AtomicUsize::new(0);
             let results: Vec<Mutex<Option<Result<Vec<f32>>>>> =
@@ -429,9 +430,10 @@ fn embed_batch_inner(inner: &EmbedderInner, texts: &[&str]) -> Result<Vec<Vec<f3
                             if idx >= texts.len() {
                                 break;
                             }
-                            let result = http_embed_request(url, model, &[texts[idx]])
-                                .and_then(|mut v| {
-                                    v.pop().ok_or_else(|| anyhow::anyhow!("HTTP embed returned empty"))
+                            let result =
+                                http_embed_request(url, model, &[texts[idx]]).and_then(|mut v| {
+                                    v.pop()
+                                        .ok_or_else(|| anyhow::anyhow!("HTTP embed returned empty"))
                                 });
                             *results[idx].lock().unwrap() = Some(result);
                         }
@@ -442,7 +444,10 @@ fn embed_batch_inner(inner: &EmbedderInner, texts: &[&str]) -> Result<Vec<Vec<f3
             // Collect results in order.
             let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
             for slot in &results {
-                let r = slot.lock().unwrap().take()
+                let r = slot
+                    .lock()
+                    .unwrap()
+                    .take()
                     .unwrap_or_else(|| Err(anyhow::anyhow!("embedding slot was never filled")));
                 embeddings.push(r?);
             }
@@ -475,11 +480,13 @@ fn http_embed_request(url: &str, model: &str, texts: &[&str]) -> Result<Vec<Vec<
     use std::net::TcpStream;
 
     // Parse URL to extract host:port and path.
-    let url_str = if url.ends_with('/') { &url[..url.len() - 1] } else { url };
+    let url_str = url.strip_suffix('/').unwrap_or(url);
     let without_scheme = url_str
         .strip_prefix("http://")
         .ok_or_else(|| anyhow::anyhow!("embed URL must start with http://: {url}"))?;
-    let (host_port, _) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    let (host_port, _) = without_scheme
+        .split_once('/')
+        .unwrap_or((without_scheme, ""));
     let api_path = "/api/embed";
 
     // Truncate inputs client-side — Ollama's `truncate` flag is unreliable
@@ -543,15 +550,22 @@ fn http_embed_request(url: &str, model: &str, texts: &[&str]) -> Result<Vec<Vec<
     let raw_body = &response[header_end.1..];
 
     // Handle chunked transfer encoding: strip chunk-size lines.
-    let json_body = if headers.to_lowercase().contains("transfer-encoding: chunked") {
+    let json_body = if headers
+        .to_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
         decode_chunked(raw_body)
     } else {
         raw_body.to_string()
     };
 
     // Parse Ollama response: {"embeddings": [[f32, ...], ...]}
-    let parsed: serde_json::Value = serde_json::from_str(&json_body)
-        .with_context(|| format!("parsing embed response JSON (body length: {} bytes)", json_body.len()))?;
+    let parsed: serde_json::Value = serde_json::from_str(&json_body).with_context(|| {
+        format!(
+            "parsing embed response JSON (body length: {} bytes)",
+            json_body.len()
+        )
+    })?;
 
     let embeddings = parsed
         .get("embeddings")
@@ -592,7 +606,10 @@ fn decode_chunked(raw: &str) -> String {
             break;
         }
         // Read the hex chunk size.
-        let size_end = remaining.find('\r').or_else(|| remaining.find('\n')).unwrap_or(remaining.len());
+        let size_end = remaining
+            .find('\r')
+            .or_else(|| remaining.find('\n'))
+            .unwrap_or(remaining.len());
         let size_str = remaining[..size_end].trim();
         let size = usize::from_str_radix(size_str, 16).unwrap_or(0);
         if size == 0 {

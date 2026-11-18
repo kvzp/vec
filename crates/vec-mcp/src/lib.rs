@@ -19,9 +19,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use rmcp::{
+    ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::tool::{Parameters, ToolRouter},
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
-    schemars, tool, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
+    schemars, tool, tool_router,
 };
 use serde::{Deserialize, Serialize};
 
@@ -141,7 +142,8 @@ impl VecServer {
         // Convert to SearchResultItem, applying access() check and reading
         // trimmed snippets (±snippet_lines around best-matching line).
         let snippet_ctx = cfg.search.snippet_lines;
-        let query_words: Vec<String> = params.query
+        let query_words: Vec<String> = params
+            .query
             .split_whitespace()
             .map(|w| w.to_lowercase())
             .collect();
@@ -304,8 +306,8 @@ impl ServerHandler for VecServer {
 /// Reads JSON-RPC messages from stdin, writes responses to stdout.
 /// Blocks until the client closes the connection.
 pub async fn run_server() -> Result<()> {
-    use rmcp::service::RunningService;
     use rmcp::RoleServer;
+    use rmcp::service::RunningService;
 
     let server = VecServer::new()?;
 
