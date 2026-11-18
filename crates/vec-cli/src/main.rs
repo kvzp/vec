@@ -513,6 +513,11 @@ include_paths = ["{home}"]
 # default_limit = 10
 # snippet_lines = 6
 
+[watch]
+# debounce_ms = 3000    # re-index after this much quiet
+# max_wait_ms = 30000   # ...or at most this long after the first change
+# max_pending = 10000   # distinct pending paths before collapsing to parent dirs
+
 [database]
 db_path = "{db_path}"
 # wal = true
@@ -551,6 +556,8 @@ db_path = "{db_path}"
 #                  "dpkg", "apt", "rpm", "cloud", "alternatives",
 #                  "dist-packages", "site-packages",
 #                  "apparmor.d", "iproute2", "abi"]
+#   (gitignore syntax: a bare name matches at any depth; absolute paths do
+#    NOT match. Your entries are added to the defaults above.)
 # exclude_files = ["*.lock", "*.min.js", "*.map", "*.pyc",
 #                  ".env", ".env.*", "*.key", "*.pem", "*.p12",
 #                  "*.pfx", "*.onnx", "*.bin", "*.so", "*.dylib"]
@@ -558,6 +565,11 @@ db_path = "{db_path}"
 [search]
 # default_limit = 10
 # snippet_lines = 6
+
+[watch]
+# debounce_ms = 3000    # re-index after this much quiet
+# max_wait_ms = 30000   # ...or at most this long after the first change
+# max_pending = 10000   # distinct pending paths before collapsing to parent dirs
 
 [database]
 # db_path = "/var/lib/vec/vec.db"

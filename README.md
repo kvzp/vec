@@ -312,4 +312,4 @@ The DB contains no source code. Stealing it gives you vectors and paths — noth
 - **Pipe-friendly.** Default output is plain `file:line` paths. Works with `xargs`, `fzf`, editors.
 - **Incremental.** Hash-based change detection. `vec updatedb` only re-embeds changed files.
 - **Gitignore-aware.** Respects `.gitignore`. No indexing of build artifacts.
-- **Real-time.** `vec-watch.service` (inotify) re-indexes changed files within seconds.
+- **Real-time.** `vec-watch.service` (inotify) re-indexes changed files within seconds. Events in excluded or gitignored paths are dropped at intake, memory is bounded by distinct changed paths, and constant churn cannot delay indexing beyond `[watch] max_wait_ms` (see [CONFIG.md](CONFIG.md#watch)).

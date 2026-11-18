@@ -41,6 +41,12 @@ This means for `exclude_dirs` and `exclude_files` you only specify what you want
 
 For `include_paths`, you define the full list — it replaces `["/"]` entirely.
 
+**How `exclude_dirs` patterns match.** Entries use `.gitignore` syntax, rooted at the working directory of the `vec` process:
+
+- A bare name (`"builds"`) matches a directory **or file** of that name at any depth. This is almost always what you want.
+- A pattern containing `/` is anchored to the process's working directory, **not** to `include_paths`. An absolute path such as `"/home/me/builds"` therefore does **not** match. To skip one specific directory, use its name, or narrow `include_paths`.
+- Hidden entries (names starting with `.`) are always skipped.
+
 ---
 
 ## Settings reference
@@ -124,6 +130,20 @@ These are always excluded regardless of config:
 | `default_limit` | integer | `10` | Results returned when `--limit` is not specified |
 | `snippet_lines` | integer | `3` | Lines of context above and below the best-matching line shown with `--snippet` (±N, so 3 means 7 lines total) |
 | `path_boost` | float | `0.05` | Score bonus per query keyword found in the file path. Searching "auth" boosts `auth/middleware.rs` over `utils/helpers.rs` at equal embedding similarity. Set to `0.0` to disable. |
+
+---
+
+### `[watch]`
+
+Settings for `vec watch` (`vec-watch.service`). The watcher drops events for paths the indexer would skip (`exclude_dirs`, `exclude_files`, hidden entries, `.gitignore`, the database directory) before queueing them. It keeps one entry per distinct changed path, so memory does not grow with the number of events.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `debounce_ms` | integer (ms) | `3000` | Re-index once no event has arrived for this long |
+| `max_wait_ms` | integer (ms) | `30000` | Re-index at the latest this long after the first pending change, even if events keep arriving. Prevents starvation on trees with constant churn |
+| `max_pending` | integer | `10000` | Maximum distinct pending paths. Above it, pending paths are collapsed into their parent directories, which are then re-walked (unchanged files are skipped by hash) |
+
+Each re-index walks and prunes only the changed paths, not the whole of `include_paths`.
 
 ---
 

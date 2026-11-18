@@ -11,8 +11,8 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use anyhow::{Context, Result, bail};
+use rusqlite::{Connection, OptionalExtension, params};
 
 // ---------------------------------------------------------------------------
 // Public record types
@@ -564,17 +564,60 @@ impl Store {
                 .context("reading file list")?;
             rows
         };
+        self.delete_ids_if_missing(paths)
+    }
 
-        let mut removed = 0usize;
-        for (id, path) in paths {
-            if !Path::new(&path).exists() {
-                self.conn
-                    .execute("DELETE FROM files WHERE id = ?1", params![id])
-                    .context("deleting missing file")?;
-                removed += 1;
+    /// Like [`Store::delete_missing_files`], but only considers records equal
+    /// to, or located under, one of `scopes`. Cost is proportional to the
+    /// number of records in scope, not the size of the whole index — this is
+    /// what makes `vec watch` re-indexes cheap.
+    pub fn delete_missing_files_under(&mut self, scopes: &[PathBuf]) -> Result<usize> {
+        let mut paths: Vec<(i64, String)> = Vec::new();
+        {
+            // Descendants of "/a/b" are exactly the strings in ["/a/b/", "/a/b0"),
+            // because '0' is the byte right after '/'. A range scan uses the
+            // UNIQUE index on files.path instead of scanning the table.
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, path FROM files WHERE path = ?1 OR (path >= ?2 AND path < ?3)")
+                .context("preparing scoped file list query")?;
+            for scope in scopes {
+                let base = scope.to_string_lossy();
+                let base = base.trim_end_matches('/');
+                let lo = format!("{base}/");
+                let hi = format!("{base}0");
+                let rows = stmt
+                    .query_map(params![base, lo, hi], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .context("listing scoped files")?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .context("reading scoped file list")?;
+                paths.extend(rows);
             }
         }
+        paths.sort_unstable();
+        paths.dedup();
+        self.delete_ids_if_missing(paths)
+    }
 
+    /// Delete the given records whose path no longer exists, in one transaction.
+    fn delete_ids_if_missing(&mut self, paths: Vec<(i64, String)>) -> Result<usize> {
+        let tx = self
+            .conn
+            .transaction()
+            .context("starting prune transaction")?;
+        let mut removed = 0usize;
+        {
+            let mut del = tx
+                .prepare("DELETE FROM files WHERE id = ?1")
+                .context("preparing delete")?;
+            for (id, path) in paths {
+                if !Path::new(&path).exists() {
+                    del.execute(params![id]).context("deleting missing file")?;
+                    removed += 1;
+                }
+            }
+        }
+        tx.commit().context("committing prune transaction")?;
         Ok(removed)
     }
 
@@ -626,9 +669,11 @@ impl Store {
                    LIMIT 1";
         let result: Option<Vec<u8>> = self
             .conn
-            .query_row(sql, params![path.to_string_lossy().as_ref(), line as i64], |row| {
-                row.get(0)
-            })
+            .query_row(
+                sql,
+                params![path.to_string_lossy().as_ref(), line as i64],
+                |row| row.get(0),
+            )
             .optional()
             .context("looking up chunk embedding")?;
         Ok(result.map(|blob| unpack_f32(&blob)))
@@ -641,16 +686,19 @@ impl Store {
                    WHERE f.path = ?1 AND c.start_line <= ?2 AND c.end_line >= ?2";
         let mut stmt = self.conn.prepare(sql).context("preparing chunks query")?;
         let rows = stmt
-            .query_map(params![path.to_string_lossy().as_ref(), line as i64], |row| {
-                Ok(ChunkRecord {
-                    id: row.get(0)?,
-                    file_id: row.get(1)?,
-                    byte_offset: row.get::<_, i64>(2)? as usize,
-                    byte_end: row.get::<_, i64>(3)? as usize,
-                    start_line: row.get::<_, i64>(4)? as usize,
-                    end_line: row.get::<_, i64>(5)? as usize,
-                })
-            })
+            .query_map(
+                params![path.to_string_lossy().as_ref(), line as i64],
+                |row| {
+                    Ok(ChunkRecord {
+                        id: row.get(0)?,
+                        file_id: row.get(1)?,
+                        byte_offset: row.get::<_, i64>(2)? as usize,
+                        byte_end: row.get::<_, i64>(3)? as usize,
+                        start_line: row.get::<_, i64>(4)? as usize,
+                        end_line: row.get::<_, i64>(5)? as usize,
+                    })
+                },
+            )
             .context("querying chunks")?;
         let mut result = Vec::new();
         for r in rows {
@@ -914,6 +962,27 @@ mod tests {
     }
 
     #[test]
+    fn delete_missing_files_under_only_touches_scope() {
+        let mut store = open_in_memory();
+        // Both paths are missing on disk; only the one in scope may be pruned.
+        store
+            .upsert_file(Path::new("/nonexistent/scope/a.rs"), 1.0, "a")
+            .unwrap();
+        store
+            .upsert_file(Path::new("/nonexistent/scope-sibling/b.rs"), 1.0, "b")
+            .unwrap();
+        store
+            .upsert_file(Path::new("/nonexistent/other/c.rs"), 1.0, "c")
+            .unwrap();
+        let removed = store
+            .delete_missing_files_under(&[PathBuf::from("/nonexistent/scope")])
+            .unwrap();
+        assert_eq!(removed, 1, "only the record under the scope is pruned");
+        let (files, _, _) = store.stats().unwrap();
+        assert_eq!(files, 2);
+    }
+
+    #[test]
     fn stats_empty_db() {
         let store = open_in_memory();
         let (files, chunks, last_mtime) = store.stats().unwrap();
@@ -1156,5 +1225,4 @@ mod tests {
             "Store::open under /dev/null should return Err"
         );
     }
-
 }
