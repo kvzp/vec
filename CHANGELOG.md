@@ -30,6 +30,14 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`vec watch` unbounded memory growth and starvation** (#2). Root cause: every flush re-walked all of `include_paths` and checked every database row once per changed directory, and the model was reloaded per directory, while an unbounded channel queued every event. Now:
+  - scoped re-indexes (`vec watch`, `vec updatedb --path`) walk only the changed paths and prune only records under them, in one transaction;
+  - the watcher drops events for excluded, hidden, gitignored and database paths before queueing them, and de-duplicates them into a bounded set;
+  - flushes happen after `[watch] debounce_ms` of quiet or at most `[watch] max_wait_ms` after the first change; indexing no longer blocks event intake;
+  - the store and the embedder are opened once per flush.
+- `[watch]` config section (`debounce_ms`, `max_wait_ms`, `max_pending`) replaces the hardcoded 3 s debounce.
+- `exclude_dirs` matching semantics documented in CONFIG.md, `vec init` and `contrib/vec.conf`.
+
 - ONNX model loading with `gte-multilingual-base` — cleared `value_info` symbolic dims that tract couldn't parse
 - Watcher feedback loop — events from the DB directory are now filtered out
 

@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
@@ -27,6 +27,7 @@ pub struct Config {
     pub index: IndexConfig,
     pub search: SearchConfig,
     pub database: DatabaseConfig,
+    pub watch: WatchConfig,
 }
 
 /// Embedding model settings.
@@ -87,6 +88,20 @@ pub struct SearchConfig {
     pub snippet_lines: usize,
     /// Score boost when file path contains query keywords (0.0 = disabled).
     pub path_boost: f32,
+}
+
+/// `vec watch` settings.
+#[derive(Debug, Clone)]
+pub struct WatchConfig {
+    /// Re-index once no event has arrived for this long (milliseconds).
+    pub debounce_ms: u64,
+    /// Re-index at the latest this long after the first pending change, even
+    /// if events keep arriving (milliseconds). Prevents starvation on trees
+    /// with constant churn.
+    pub max_wait_ms: u64,
+    /// Maximum number of distinct pending paths. Above it, pending paths are
+    /// collapsed into their parent directories (which are then re-walked).
+    pub max_pending: usize,
 }
 
 /// SQLite database settings.
@@ -199,6 +214,11 @@ fn default_config() -> Config {
             db_path: default_db_path,
             wal: true,
         },
+        watch: WatchConfig {
+            debounce_ms: 3_000,
+            max_wait_ms: 30_000,
+            max_pending: 10_000,
+        },
     }
 }
 
@@ -216,6 +236,14 @@ struct RawConfig {
     index: Option<RawIndexConfig>,
     search: Option<RawSearchConfig>,
     database: Option<RawDatabaseConfig>,
+    watch: Option<RawWatchConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawWatchConfig {
+    debounce_ms: Option<u64>,
+    max_wait_ms: Option<u64>,
+    max_pending: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -328,6 +356,18 @@ fn merge(cfg: &mut Config, raw: &RawConfig) {
         }
         if let Some(v) = rs.path_boost {
             cfg.search.path_boost = v;
+        }
+    }
+
+    if let Some(ref rw) = raw.watch {
+        if let Some(v) = rw.debounce_ms {
+            cfg.watch.debounce_ms = v;
+        }
+        if let Some(v) = rw.max_wait_ms {
+            cfg.watch.max_wait_ms = v;
+        }
+        if let Some(v) = rw.max_pending {
+            cfg.watch.max_pending = v;
         }
     }
 

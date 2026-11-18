@@ -1,5 +1,13 @@
 # Known Bugs & Limitations
 
+## Known Limitations
+
+### `vec watch`
+
+- **Excluded directories still hold inotify watches.** `vec watch` places one recursive watch per include path, so excluded trees (`target/`, `node_modules/`) still count toward `fs.inotify.max_user_watches`. Their events are dropped at intake, so they cost no memory or indexing work. Watching only non-excluded directories would need manual tracking of newly created directories (#2).
+- **Ignore-rule changes are not applied retroactively.** Editing a `.gitignore` (or `exclude_dirs`) does not index newly un-ignored files, or remove newly ignored ones, until the next `vec updatedb` run.
+- **Pending-set size is not shown in `vec status`.** It is logged at each flush only.
+
 ## Untested Platforms
 
 ### macOS

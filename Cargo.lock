@@ -2698,6 +2698,7 @@ dependencies = [
  "anstream",
  "anyhow",
  "notify",
+ "tempfile",
  "vec-core",
  "vec-embed",
  "vec-index",
