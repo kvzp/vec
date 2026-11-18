@@ -102,6 +102,13 @@ pub struct WatchConfig {
     /// Maximum number of distinct pending paths. Above it, pending paths are
     /// collapsed into their parent directories (which are then re-walked).
     pub max_pending: usize,
+    /// Re-index the include paths when the watcher starts, to pick up
+    /// changes made while it was not running (unchanged files are skipped by
+    /// hash, but every file is read).
+    pub startup_rescan: bool,
+    /// Upper bound for the retry delay after a failed re-index (milliseconds).
+    /// Retries start at `debounce_ms` and double up to this value.
+    pub retry_max_ms: u64,
 }
 
 /// SQLite database settings.
@@ -218,6 +225,8 @@ fn default_config() -> Config {
             debounce_ms: 3_000,
             max_wait_ms: 30_000,
             max_pending: 10_000,
+            startup_rescan: true,
+            retry_max_ms: 60_000,
         },
     }
 }
@@ -244,6 +253,8 @@ struct RawWatchConfig {
     debounce_ms: Option<u64>,
     max_wait_ms: Option<u64>,
     max_pending: Option<usize>,
+    startup_rescan: Option<bool>,
+    retry_max_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -368,6 +379,12 @@ fn merge(cfg: &mut Config, raw: &RawConfig) {
         }
         if let Some(v) = rw.max_pending {
             cfg.watch.max_pending = v;
+        }
+        if let Some(v) = rw.startup_rescan {
+            cfg.watch.startup_rescan = v;
+        }
+        if let Some(v) = rw.retry_max_ms {
+            cfg.watch.retry_max_ms = v;
         }
     }
 

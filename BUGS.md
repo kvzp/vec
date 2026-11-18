@@ -4,9 +4,10 @@
 
 ### `vec watch`
 
-- **Excluded directories still hold inotify watches.** `vec watch` places one recursive watch per include path, so excluded trees (`target/`, `node_modules/`) still count toward `fs.inotify.max_user_watches`. Their events are dropped at intake, so they cost no memory or indexing work. Watching only non-excluded directories would need manual tracking of newly created directories (#2).
-- **Ignore-rule changes are not applied retroactively.** Editing a `.gitignore` (or `exclude_dirs`) does not index newly un-ignored files, or remove newly ignored ones, until the next `vec updatedb` run.
-- **Pending-set size is not shown in `vec status`.** It is logged at each flush only.
+- **Lost-event recovery is a full rescan.** An inotify queue overflow (the kernel drops events) or more than `[watch] max_pending` distinct changes makes the next flush re-walk all include paths: correct, but every file is read again.
+- **Watch limit.** A directory that cannot be watched (`fs.inotify.max_user_watches` exhausted) is reported in the log and by `vec status` (`watch_failures`); changes there are only seen by the next `vec updatedb`.
+- **`exclude_dirs` / `include_paths` edits need a restart** of `vec watch` (the config is read once). The next incremental `vec updatedb` prunes newly excluded files; `--full` is no longer needed for that.
+- **The kernel queue overflow path is covered by unit tests only.** A 40 000-event burst did not overflow the default queue in the end-to-end test; forcing it needs root (`fs.inotify.max_queued_events`).
 
 ## Untested Platforms
 

@@ -41,10 +41,11 @@ This means for `exclude_dirs` and `exclude_files` you only specify what you want
 
 For `include_paths`, you define the full list — it replaces `["/"]` entirely.
 
-**How `exclude_dirs` patterns match.** Entries use `.gitignore` syntax, rooted at the working directory of the `vec` process:
+**How `exclude_dirs` patterns match.** Entries use `.gitignore` syntax, rooted at each include path:
 
 - A bare name (`"builds"`) matches a directory **or file** of that name at any depth. This is almost always what you want.
-- A pattern containing `/` is anchored to the process's working directory, **not** to `include_paths`. An absolute path such as `"/home/me/builds"` therefore does **not** match. To skip one specific directory, use its name, or narrow `include_paths`.
+- A pattern with a leading or inner `/` (`"/builds"`, `"web/dist"`) is anchored to the include path: `"/builds"` matches only `<include_path>/builds`.
+- An absolute path inside an include path (`"/home/me/builds"` with `include_paths = ["/home/me"]`) matches exactly that directory.
 - Hidden entries (names starting with `.`) are always skipped.
 
 ---
@@ -135,15 +136,23 @@ These are always excluded regardless of config:
 
 ### `[watch]`
 
-Settings for `vec watch` (`vec-watch.service`). The watcher drops events for paths the indexer would skip (`exclude_dirs`, `exclude_files`, hidden entries, `.gitignore`, the database directory) before queueing them. It keeps one entry per distinct changed path, so memory does not grow with the number of events.
+Settings for `vec watch` (`vec-watch.service`).
+
+**Correctness model.** The indexer's walker is the only judge of what belongs in the index; the watcher never re-implements its rules in a way that could disagree. After the watcher settles, the index is exactly what `vec updatedb --full` would produce (verified by a randomised end-to-end test that compares the two after file/directory creates, edits, deletes, renames, moves in and out, `.gitignore`/`.ignore`/`.git/info/exclude` edits, database write failures and overflow).
+
+- **Watches**: one non-recursive inotify watch per directory the walker would enter. Excluded, hidden and ignored trees (`target/`, `node_modules/`, gitignored build areas) get no watch, which saves kernel memory (counted against the service's `MemoryMax`) and `fs.inotify.max_user_watches`, and makes startup fast. Watches follow changes: new and moved-in directories are watched at once and then re-indexed (so files written before their watch existed are not missed); deleted, moved-out and newly ignored directories lose theirs.
+- **Events**: dropped early only when the path alone proves the walker would skip it (outside `include_paths`, the database directory, a hidden component, an `exclude_dirs` match). Everything else is de-duplicated into a bounded set, so memory does not grow with the number of events.
+- **Re-index**: a flush walks only the changed paths, from their include path, so every ancestor's ignore rules apply exactly. Records in scope that the walk did not accept are pruned; records under a directory that could not be read are kept unless their file is definitely gone.
+- **Nothing is dropped**: a failed flush (e.g. the database is not writable) is put back and retried with exponential backoff; an inotify queue overflow, or more distinct changes than `max_pending`, becomes a rescan of the include paths.
+- **Status**: each flush records its time, size, error and the number of watched directories / watch failures in the database; `vec status` shows them.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `debounce_ms` | integer (ms) | `3000` | Re-index once no event has arrived for this long |
+| `debounce_ms` | integer (ms) | `3000` | Re-index once no event has arrived for this long. Also the first retry delay after a failed re-index |
 | `max_wait_ms` | integer (ms) | `30000` | Re-index at the latest this long after the first pending change, even if events keep arriving. Prevents starvation on trees with constant churn |
-| `max_pending` | integer | `10000` | Maximum distinct pending paths. Above it, pending paths are collapsed into their parent directories, which are then re-walked (unchanged files are skipped by hash) |
-
-Each re-index walks and prunes only the changed paths, not the whole of `include_paths`.
+| `max_pending` | integer | `10000` | Maximum distinct pending paths. Above it, pending paths are collapsed into their parent directories (never above an include path), which are then re-walked (unchanged files are skipped by hash). If that cannot get the set small enough, the next flush re-indexes all include paths instead. Also caps the queue of directories waiting for a watch update (overflow: re-walk the include paths) |
+| `retry_max_ms` | integer (ms) | `60000` | Upper bound of the retry delay after a failed re-index (the delay doubles from `debounce_ms`) |
+| `startup_rescan` | bool | `true` | Re-index the include paths when the watcher starts, to catch changes made while it was not running. Unchanged files are skipped by hash, but every file is read; set `false` if the daily `vec updatedb` is enough |
 
 ---
 
