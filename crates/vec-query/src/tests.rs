@@ -286,6 +286,15 @@ fn status_reports_index_watcher_and_daemon() {
     assert_eq!(r.index_model.as_ref().map(|m| m.dim), Some(DIM));
     assert!(!r.model_mismatch);
     assert!(r.last_updatedb.is_some());
+    let runtime = Embedder::stub(DIM).runtime();
+    assert_eq!(r.runtime_first_write, runtime);
+    assert_eq!(r.runtime_last_write, runtime);
+    let canary = r
+        .canary
+        .as_ref()
+        .expect("canary recorded by the first write");
+    assert_eq!(canary.text, fx.cfg.embed.canary_text);
+    assert_eq!(canary.runtime, runtime);
     assert_eq!(r.watcher, None);
     // Regression (review 2026-11-19 #10): plain status does not connect to
     // the daemon socket (that would start a socket-activated daemon).

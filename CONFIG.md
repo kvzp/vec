@@ -60,6 +60,12 @@ a warning, when the same file also sets `[daemon] socket`). Move it.
 | `http_concurrency` | `4` | ollama: requests in flight at once | > 0 |
 | `http_max_input_bytes` | `1200` | ollama: texts are cut to this many bytes (at a character boundary) before sending | > 0 |
 | `http_error_preview_chars` | `200` | ollama: characters of an error response body quoted in errors | > 0 |
+| `http_tags_path` | `"/api/tags"` | ollama: path (appended to the path of `embed_url`) of the model list; the digest of `model`'s entry is recorded as the model's sha256, so a model re-pulled with other weights under the same name is a model mismatch. A server without it leaves the digest unknown | starts with `/` |
+| `http_version_path` | `"/api/version"` | ollama: path of the server version, recorded as the embedding runtime (`ollama <version>`) | starts with `/` |
+| `http_default_tag` | `"latest"` | ollama: tag the server assumes for a model name without one (`model = "m"` finds the entry `m:latest`) | non-empty, no `:` |
+| `canary_text` | a fixed sentence | text whose vector is stored at the first write to an index (the **embedding canary**) and re-embedded to detect drift. The text stored in the index is the one re-embedded: a change applies to new or fully rebuilt indexes | non-empty |
+| `canary_warn_cosine` | `0.999` | canary cosine at or above: ok; below: one warning line naming the runtime versions, indexing goes on | `canary_min_cosine <= canary_warn_cosine <= 1` |
+| `canary_min_cosine` | `0.98` | canary cosine below: **drift**. Writers refuse to write (`vec watch` pauses and retries with backoff) until `vec updatedb --full`; `vec doctor` reports FAIL | `0 < canary_min_cosine` |
 | `model_search_path` | `["/usr/share/vec/models"]` | onnx: directories searched in order for a short model name | non-empty, absolute |
 | `model_files` | `["model_int8.onnx", "model.onnx"]` | onnx: file names tried inside `{dir}/{model}/` | non-empty entries |
 | `batch_size` | `16` | texts per embedding call during indexing (per HTTP request; per indexing work unit for onnx) | > 0 |
@@ -79,6 +85,14 @@ model identity (name, dimension, sha256 of the model file) in the index and
 refuses to mix: queries and incremental updates fail with a "model mismatch"
 error until you run `vec updatedb --full`. See
 [ARCHITECTURE.md](ARCHITECTURE.md#model-identity).
+
+**Same model, other vectors.** An Ollama or tract upgrade, or a model re-pulled
+with other weights, can move vectors while the name stays the same. The index
+records the embedding runtime of its first and last write (`vec status`) and an
+embedding canary (`canary_*` above): writers (`vec updatedb`, `vec watch`
+flushes), the daemon at start-up and `vec doctor` re-embed it and compare. See
+[ARCHITECTURE.md](ARCHITECTURE.md#embedding-runtime-and-canary) and
+[FAILURE-ZONE.md](FAILURE-ZONE.md#model).
 
 ## `[index]`
 

@@ -20,10 +20,26 @@ How each failure behaves and how to recover: [FAILURE-ZONE.md](FAILURE-ZONE.md).
 
 ## Model identity
 
-- **Queries do not hash the model file.** A model file replaced in place with the
-  same name and dimension is detected by writers (`vec updatedb`, `vec watch`,
-  `vec daemon`) and by queries only once the per-user sha256 cache knows the new
-  file; until a writer runs, queries can compare new-model vectors with old ones.
+- **Queries do not hash the model file** (ONNX). A model file replaced in place
+  with the same name and dimension is detected by writers (`vec updatedb`,
+  `vec watch`, `vec daemon`) and by queries only once the per-user sha256 cache
+  knows the new file; until a writer runs, queries can compare new-model vectors
+  with old ones. (HTTP: queries get the model digest from the server, so a
+  re-pulled model is detected when the server reports digests.)
+- **Queries do not check the embedding canary**: only writers, the daemon at
+  start-up and `vec doctor` do. After a runtime upgrade, queries run with the new
+  runtime against the old vectors until a writer or `vec doctor` reports it.
+- **The canary is one text.** A runtime change that moves most texts but not the
+  canary's (or moves them less than `canary_warn_cosine` allows) is not seen.
+- **Adoption trusts the current runtime.** An index built before canaries existed
+  records its canary with whatever runtime writes next; if the runtime changed
+  in between, the drift is not seen. Run `vec updatedb --full` once if unsure.
+- **Digest best effort.** The Ollama digest is fetched once when the embedder is
+  created; a failed fetch (or a server without `/api/tags`) leaves it unknown
+  without a message, and a long-running `vec watch` keeps the digest it started
+  with (a re-pull meanwhile is caught by the canary, not the identity).
+- **A completed `--full` with per-file errors** replaces the canary although the
+  failed files keep vectors of the previous runtime (they are listed as `warn:`).
 
 ## Search and diagnostics
 

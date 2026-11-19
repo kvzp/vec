@@ -163,4 +163,8 @@ async fn index_status_reports_the_model() {
     let s: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(s["files"], 2);
     assert_eq!(s["index_model"]["dim"], DIM);
+    // The embedding runtime and canary recorded at index time.
+    assert!(s["runtime_last_write"].is_string(), "{out}");
+    assert!(s["runtime_first_write"].is_string(), "{out}");
+    assert!(s["canary"]["text"].is_string(), "{out}");
 }

@@ -4,9 +4,10 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 use vec_core::config::Config;
-use vec_embed::ModelIdentity;
+use vec_embed::{Embedder, ModelIdentity};
 use vec_query::Searcher;
 use vec_query::status::{DaemonStatus, StatusReport, WatcherStatus, daemon_status};
+use vec_store::{CanaryLimits, CanaryVerdict};
 
 use super::{fmt_size, fmt_unix_ts, load_config};
 
@@ -38,6 +39,19 @@ fn print_status(r: &StatusReport) {
     println!("Files:         {}", r.files);
     println!("Chunks:        {}", r.chunks);
     println!("Last updatedb: {}", when(r.last_updatedb));
+    let unknown = |v: &Option<String>| v.clone().unwrap_or_else(|| "not recorded".to_owned());
+    println!(
+        "Runtime:       first write {}, last write {}",
+        unknown(&r.runtime_first_write),
+        unknown(&r.runtime_last_write)
+    );
+    match &r.canary {
+        Some(c) => println!(
+            "Canary:        recorded with {} ('vec doctor' re-embeds it)",
+            unknown(&c.runtime)
+        ),
+        None => println!("Canary:        not recorded yet (the next write records it)"),
+    }
     println!(
         "Index model:   {}",
         r.index_model.as_ref().map_or_else(
@@ -155,8 +169,8 @@ pub fn doctor(cfg_path: Option<&Path>) -> Result<()> {
         Err(e) => report.fail("config", format!("{e:#}")),
     }
 
-    let model = check_model(&cfg, &mut report);
-    let index_model = check_index(&cfg, model.as_ref(), &mut report);
+    let loaded = check_model(&cfg, &mut report);
+    let index_model = check_index(&cfg, loaded.as_ref(), &mut report);
     println!(
         "[info] daemon: asking the daemon at {} (with systemd socket activation, this starts it)",
         cfg.daemon.socket.display()
@@ -198,8 +212,9 @@ pub fn doctor(cfg_path: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-/// Resolve and load the configured model; its identity (with sha256).
-fn check_model(cfg: &Config, report: &mut Report) -> Option<ModelIdentity> {
+/// Resolve and load the configured model; the embedder and its identity
+/// (with sha256).
+fn check_model(cfg: &Config, report: &mut Report) -> Option<(Embedder, ModelIdentity)> {
     if cfg.embed.backend == vec_core::config::EmbedBackend::Onnx {
         match cfg.resolve_model_path() {
             Ok(p) => report.ok("model file", p.display()),
@@ -210,12 +225,15 @@ fn check_model(cfg: &Config, report: &mut Report) -> Option<ModelIdentity> {
         }
     }
     let cache = vec_core::model_sha::ShaCache::for_user().ok().flatten();
-    let loaded = vec_core::load_embedder(cfg)
-        .and_then(|e| vec_core::model_sha::writer_identity(&e, cache.as_ref()));
+    let loaded = vec_core::load_embedder(cfg).and_then(|e| {
+        let id = vec_core::model_sha::writer_identity(&e, cache.as_ref())?;
+        Ok((e, id))
+    });
     match loaded {
-        Ok(id) => {
-            report.ok("model", format!("loads: {id}"));
-            Some(id)
+        Ok((e, id)) => {
+            let runtime = e.runtime().unwrap_or_else(|| "unknown".to_owned());
+            report.ok("model", format!("loads: {id}, runtime {runtime}"));
+            Some((e, id))
         }
         Err(e) => {
             report.fail("model", format!("{e:#}"));
@@ -224,13 +242,14 @@ fn check_model(cfg: &Config, report: &mut Report) -> Option<ModelIdentity> {
     }
 }
 
-/// Open the index read-only and compare its model with `model`; the index's
-/// model.
+/// Open the index read-only, compare its model with the loaded one and
+/// re-embed its canary; the index's model.
 fn check_index(
     cfg: &Config,
-    model: Option<&ModelIdentity>,
+    loaded: Option<&(Embedder, ModelIdentity)>,
     report: &mut Report,
 ) -> Option<ModelIdentity> {
+    let model = loaded.map(|(_, id)| id);
     let store = match Searcher::new(cfg.clone()).open_store() {
         Ok(s) => s,
         Err(e) => {
@@ -264,5 +283,48 @@ fn check_index(
         ),
         (Some(s), None) => report.warn("index model", format!("{s} (configured model not loaded)")),
     }
+    match store.runtime_history() {
+        Ok(h) => {
+            let name = |v: Option<String>| v.unwrap_or_else(|| "not recorded".to_owned());
+            println!(
+                "[info] index runtime: first write {}, last write {}",
+                name(h.first_write),
+                name(h.last_write)
+            );
+        }
+        Err(e) => report.fail("index runtime", format!("{e:#}")),
+    }
+    match loaded {
+        Some((embedder, id)) if stored.as_ref().is_some_and(|s| s.is_compatible_with(id)) => {
+            check_canary(cfg, &store, embedder, report);
+        }
+        _ => report.warn(
+            "canary",
+            "not checked (the configured model is not the index's)",
+        ),
+    }
     stored
+}
+
+/// Re-embed the index's canary with `embedder` (see `[embed] canary_*`).
+fn check_canary(cfg: &Config, store: &vec_store::Store, embedder: &Embedder, report: &mut Report) {
+    let limits = CanaryLimits::from_config(&cfg.embed);
+    match store.check_canary(|t| embedder.embed_one(t), embedder.runtime(), limits) {
+        Ok(None) => report.warn(
+            "canary",
+            "none recorded: the next 'vec updatedb' or watcher flush records it",
+        ),
+        Ok(Some(c)) => match c.verdict {
+            CanaryVerdict::Ok => report.ok("canary", c),
+            CanaryVerdict::Warn => report.warn("canary", c),
+            CanaryVerdict::Drift => report.fail(
+                "canary",
+                format!(
+                    "{c}: the vectors drifted, writers refuse to index; run 'vec updatedb --full' \
+                     (or restore the previous runtime)"
+                ),
+            ),
+        },
+        Err(e) => report.fail("canary", format!("{e:#}")),
+    }
 }

@@ -57,6 +57,35 @@ http_concurrency = 4
 http_max_input_bytes = 1200
 # ollama only: characters of an error response body quoted in error messages.
 http_error_preview_chars = 200
+# ollama only: path (appended to the path of embed_url) of the model list. The
+# list's digest for [embed] model is recorded as the model's sha256, so a model
+# re-pulled under the same name with other weights is detected (vec refuses to
+# mix its vectors and asks for `vec updatedb --full`). A server without it
+# leaves the digest unknown.
+http_tags_path = "/api/tags"
+# ollama only: path (appended to the path of embed_url) of the server version,
+# recorded in the index as the runtime that computed the vectors.
+http_version_path = "/api/version"
+# ollama only: tag the server assumes for a model name without one; used to
+# find [embed] model in the model list.
+http_default_tag = "latest"
+
+# Embedding canary. The first write to an index stores the vector of this text;
+# writers (updatedb, vec watch flushes), the daemon at start-up and vec doctor
+# embed it again and compare (cosine) with the stored vector. A model re-pulled
+# with other weights, or an embedding runtime upgrade (Ollama, tract) that moves
+# vectors, shows up here even when the model name is unchanged. The text stored
+# with the canary is the one re-embedded, so changing canary_text only affects
+# indexes created (or rebuilt with --full) afterwards.
+canary_text = "vec embedding canary: a fixed sentence whose vector must not move."
+# Cosine at or above this: ok. Below it (but at least canary_min_cosine): a
+# one-line warning naming the runtime versions; indexing goes on.
+canary_warn_cosine = 0.999
+# Cosine below this: the vectors drifted. Writers refuse to write (vec watch
+# pauses indexing and retries with backoff) until `vec updatedb --full`
+# re-embeds everything; vec doctor reports FAIL. 0 < canary_min_cosine <=
+# canary_warn_cosine <= 1.
+canary_min_cosine = 0.98
 
 # onnx only: directories searched, in order, for a short model name. Each
 # directory is tried for {name}.onnx, then {name}/<each model_files entry>.

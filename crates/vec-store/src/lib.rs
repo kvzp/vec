@@ -4,7 +4,8 @@
 //! upgraded in place when opened for writing):
 //!
 //! - `meta(key, value)`: the model identity (`model_name`, `embedding_dim`,
-//!   `model_sha256`) and free-form keys (watcher status, ...).
+//!   `model_sha256`), the embedding canary and runtime history (`canary.*`,
+//!   `runtime.*`, see [`CanaryCheck`]) and free-form keys (watcher status, ...).
 //! - `files(id, path UNIQUE, mtime, size, hash)`: one row per indexed file.
 //!   `size` is NULL for rows written before version 1.
 //! - `chunks(id, file_id, byte_offset, byte_end, start_line, end_line, text_hash,
@@ -44,6 +45,11 @@ use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 use vec_embed::ModelIdentity;
+
+mod canary;
+pub use canary::{
+    Canary, CanaryCheck, CanaryLimits, CanaryVerdict, EmbeddingDrift, RuntimeHistory,
+};
 
 /// `true` only when `path` definitely does not exist. A permission or I/O
 /// error is not proof of absence (`Path::exists` would return `false` and
@@ -332,7 +338,9 @@ impl Store {
     }
 
     /// Empty the index and record `id` as its model, in one transaction (for a
-    /// full rebuild with a different model).
+    /// full rebuild with a different model). The embedding canary and the
+    /// runtime history belong to the old vectors and are removed too; the
+    /// writer records new ones ([`Store::set_canary`]).
     pub fn reset_model(&mut self, id: &ModelIdentity) -> Result<()> {
         if id.dim == 0 {
             bail!("model {id} has dimension 0");
@@ -340,6 +348,10 @@ impl Store {
         let tx = write_tx(&mut self.conn)?;
         tx.execute_batch("DELETE FROM chunks; DELETE FROM files;")
             .context("emptying the index")?;
+        for key in canary::META_KEYS {
+            tx.execute("DELETE FROM meta WHERE key = ?1", params![key])
+                .with_context(|| format!("clearing meta.{key}"))?;
+        }
         write_model(&tx, id)?;
         tx.commit().context("committing the model reset")
     }
@@ -1371,10 +1383,52 @@ mod tests {
     fn reset_model_empties_index_and_records_new_identity() {
         let mut store = open_in_memory();
         put(&mut store, "/p/a.rs", &[chunk(1, E1)]);
+        store
+            .set_canary(&Canary {
+                text: "c".into(),
+                vector: E1.to_vec(),
+                runtime: None,
+            })
+            .unwrap();
+        store.record_write_runtime("rt", false).unwrap();
         let new = ModelIdentity::new("bigger", 8);
         store.reset_model(&new).unwrap();
         assert_eq!(store.stats().unwrap(), (0, 0, None));
         assert_eq!(store.model().unwrap(), Some(new));
+        assert_eq!(
+            store.canary().unwrap(),
+            None,
+            "the old model's canary is gone"
+        );
+        assert_eq!(store.runtime_history().unwrap(), RuntimeHistory::default());
+    }
+
+    /// An index whose identity has no sha256 (built before the HTTP backend
+    /// reported model digests, or with a server that reports none) adopts
+    /// the digest at the next write, then enforces it: a re-pulled model
+    /// with another digest is a typed mismatch.
+    #[test]
+    fn digest_is_adopted_by_an_index_without_one_then_enforced() {
+        let mut store = open_in_memory();
+        put(&mut store, "/p/a.rs", &[chunk(1, E1)]);
+        assert_eq!(store.model().unwrap().unwrap().sha256, None);
+        let pulled = ModelIdentity {
+            sha256: Some("d1".into()),
+            ..model()
+        };
+        store.ensure_model(&pulled).unwrap();
+        assert_eq!(store.model().unwrap(), Some(pulled));
+        assert!(store.get_file(Path::new("/p/a.rs")).unwrap().is_some());
+        let repulled = ModelIdentity {
+            sha256: Some("d2".into()),
+            ..model()
+        };
+        assert!(
+            store
+                .ensure_model(&repulled)
+                .unwrap_err()
+                .is::<ModelMismatch>()
+        );
     }
 
     // --- replace_file ---

@@ -124,6 +124,13 @@ Rule reminder: no tunable, path, model name, timeout, URL or limit as a literal 
 - [x] #15 Removed `Store::get_missing_file_paths`, `delete_all_files`, `delete_missing_files_under`, `Embedder::is_stub`; `resolve_path_filter` uses `absolute_lexical`. `TAKEN` kept (soundness guard, documented)
 - [x] #16 `updatedb --full` help text; #17 `snippet_lines` documented as a radius
 
+## Model / runtime versioning (branch `ollama-versioning`)
+- [x] HTTP identity: `sha256` = Ollama model digest from `[embed] http_tags_path` (matched with `http_default_tag`), fetched once in `Embedder::http`; none reported → `None`; an index without a digest adopts it (tests: fake server, store + index level)
+- [x] `Embedder::runtime()`: `ollama <version>` (`http_version_path`, live), `tract <version> (vec <version>)` (tract version from Cargo.lock via build.rs); recorded as `runtime.first_write` / `runtime.last_write`; shown in `vec status`, `vec doctor`, MCP `index_status`
+- [x] Embedding canary (`[embed] canary_text`, `canary_warn_cosine`, `canary_min_cosine`, validated 0 < min <= warn <= 1): recorded at first write / reset / adoption (with a note); writers check before writing (typed `EmbeddingDrift`), watch at start-up/reload/each flush (pauses with backoff), daemon at start-up (logs), doctor (FAIL); unscoped `--full` replaces it when the run completes (a run that dies keeps the old one)
+- [x] Tests: digest parse + fake server, runtime, stub seed, store canary/limits/runtime history, index drift/warn/full/midway/adopt/reset/digest fill-in, watch pause on drift, config validation, status/MCP fields; ignored live-Ollama test (`VEC_TEST_OLLAMA_URL`, `VEC_TEST_OLLAMA_MODEL`)
+- [x] Docs: CONFIG, FAILURE-ZONE, ARCHITECTURE, AI-INTEGRATION, CHANGELOG, README Upgrading, BUGS
+
 ## Phase C — docs and verification
 - [x] README, ARCHITECTURE, CONFIG, AI-INTEGRATION, SECURITY, TESTING, PACKAGING, CHANGELOG, BUGS, TODO in sync with code
   - Also new FAILURE-ZONE.md; CONTRIBUTING, PROJECT rewritten; debian/rpm ship `vec-embed.{socket,service}` disabled and the user units as docs; `contrib/vec.spec` license fixed (MIT, `LICENSE`); `Documentation=` of the embed units points at CONFIG.md (no man page exists).

@@ -27,6 +27,12 @@
 //!    file reuses its vector, the others are embedded in batches;
 //! 5. the file's record and all its chunks are replaced in one transaction.
 //!
+//! Before anything is written, a run checks the model identity
+//! (`Store::ensure_model`) and re-embeds the index's embedding canary: a
+//! drifted runtime stops the run with `vec_store::EmbeddingDrift` unless it is
+//! an unscoped `--full`, which replaces the canary when it completes (see
+//! ARCHITECTURE.md, "Embedding runtime and canary").
+//!
 //! A file whose embedding fails is counted as an error and keeps its previous
 //! entry. After the walk, records the walk did not accept are pruned, so the
 //! index ends up as a fresh full run would leave it. [`diff_files`] uses the same
@@ -46,7 +52,9 @@ use sha2::{Digest, Sha256};
 
 use vec_core::config::{Config, EmbedBackend, IndexConfig};
 use vec_embed::{Embedder, ModelIdentity};
-use vec_store::{FileRecord, ModelMismatch, NewChunk, Store, is_gone};
+use vec_store::{
+    Canary, CanaryLimits, CanaryVerdict, FileRecord, ModelMismatch, NewChunk, Store, is_gone,
+};
 
 // ---------------------------------------------------------------------------
 // Chunk
@@ -342,6 +350,7 @@ fn index_with(
     let cache = vec_core::model_sha::ShaCache::for_user()?;
     let identity = vec_core::model_sha::writer_identity(embedder, cache.as_ref())
         .context("hashing the model file")?;
+    let runtime = embedder.runtime();
     let threads = EmbedThreads::new(cfg)?;
     let embed = |texts: &[&str]| match &threads.pool {
         Some(pool) => pool.install(|| embedder.embed_batch(texts)),
@@ -350,6 +359,7 @@ fn index_with(
     let run = Run::new(
         store,
         identity,
+        runtime,
         &embed,
         cfg,
         threads.batch_size,
@@ -358,6 +368,13 @@ fn index_with(
         progress,
     )?;
     run.execute(scopes)
+}
+
+/// Embed one text with a run's embedding function.
+fn embed_one(embed: &EmbedFn<'_>, text: &str) -> Result<Vec<f32>> {
+    embed(&[text])?
+        .pop()
+        .ok_or_else(|| anyhow!("the embedder returned no vector"))
 }
 
 /// Where embedding work runs, and how many chunks one call receives.
@@ -494,6 +511,10 @@ struct Run<'a> {
     /// The model that computes this run's vectors (checked by the store on
     /// every write).
     identity: ModelIdentity,
+    /// [`Embedder::runtime`] of the embedder, recorded with the writes.
+    runtime: Option<String>,
+    /// `runtime` was recorded as the runtime of the last write.
+    runtime_recorded: bool,
     /// A full run over an index built by another model: the index is emptied
     /// and `identity` recorded right before the first write.
     reset_pending: bool,
@@ -508,6 +529,7 @@ impl<'a> Run<'a> {
     fn new(
         store: &'a mut Store,
         identity: ModelIdentity,
+        runtime: Option<String>,
         embed: &'a EmbedFn<'a>,
         cfg: &'a Config,
         batch_size: usize,
@@ -529,7 +551,7 @@ impl<'a> Run<'a> {
             ));
             reset_pending = true;
         }
-        Ok(Self {
+        let mut run = Self {
             store,
             embed,
             cfg,
@@ -538,12 +560,74 @@ impl<'a> Run<'a> {
             batch_size,
             db_files: DbFiles::new(cfg),
             identity,
+            runtime,
+            runtime_recorded: false,
             reset_pending,
             seen: WalkSeen::default(),
             stats: IndexStats::default(),
             pending: Vec::new(),
             pending_chunks: 0,
-        })
+        };
+        // After a model reset the old canary means nothing: `reset` records one.
+        if !run.reset_pending {
+            run.check_canary(full && scopes.is_none())?;
+        }
+        Ok(run)
+    }
+
+    /// Re-embed the index's canary before writing anything. No canary: record
+    /// one (a new index, or one built before canaries existed: adopted, with
+    /// a note). Drift: an [`vec_store::EmbeddingDrift`] error, unless
+    /// `rebuild` (an unscoped `--full`): every file is re-embedded and the
+    /// canary is replaced when the run completes ([`Run::execute`]), so a run
+    /// that dies midway leaves the old canary and the next write still sees
+    /// the drift.
+    fn check_canary(&mut self, rebuild: bool) -> Result<()> {
+        let limits = CanaryLimits::from_config(&self.cfg.embed);
+        let embed = self.embed;
+        let check = self
+            .store
+            .check_canary(|t| embed_one(embed, t), self.runtime.clone(), limits)
+            .context("checking the embedding canary")?;
+        let Some(check) = check else {
+            let files = self.store.stats().context("reading index stats")?.0;
+            if files > 0 {
+                (self.progress)(&format!(
+                    "note: the index has no embedding canary (built before vec recorded one); \
+                     recording it now with runtime {}, which is assumed to have built the index",
+                    self.runtime.as_deref().unwrap_or("unknown")
+                ));
+            }
+            return self.record_canary();
+        };
+        match check.verdict {
+            CanaryVerdict::Ok => Ok(()),
+            CanaryVerdict::Warn => {
+                (self.progress)(&format!("warn: {check}"));
+                Ok(())
+            }
+            CanaryVerdict::Drift if rebuild => {
+                (self.progress)(&format!(
+                    "warn: embedding drift: {check}. Every file is re-embedded; the canary is \
+                     replaced when this run completes."
+                ));
+                Ok(())
+            }
+            CanaryVerdict::Drift => Err(self.store.drift_error(check).into()),
+        }
+    }
+
+    /// Embed `[embed] canary_text` and store it as the index's canary.
+    fn record_canary(&mut self) -> Result<()> {
+        let text = self.cfg.embed.canary_text.clone();
+        let vector = embed_one(self.embed, &text).context("embedding the canary text")?;
+        self.store
+            .set_canary(&Canary {
+                text,
+                vector,
+                runtime: self.runtime.clone(),
+            })
+            .context("recording the embedding canary")
     }
 
     /// Walk every scope, write what changed, then prune what the walk did
@@ -566,6 +650,16 @@ impl<'a> Run<'a> {
             (self.progress)(&format!("pruned {pruned} stale files from index"));
         }
         self.stats.files_deleted += pruned;
+        if self.full && scopes.is_none() {
+            // Every file was re-embedded by this runtime: it is now the
+            // reference (see `check_canary`).
+            self.record_canary()?;
+            if let Some(runtime) = &self.runtime {
+                self.store
+                    .record_write_runtime(runtime, true)
+                    .context("recording the runtime")?;
+            }
+        }
         Ok(self.stats)
     }
 
@@ -741,12 +835,23 @@ impl<'a> Run<'a> {
         (self.progress)(&format!(
             "cleared {cleared} entries built by the previous model"
         ));
-        Ok(())
+        // The index holds only this model's vectors from now on, even if the
+        // run dies midway: the new canary is valid at once.
+        self.runtime_recorded = false;
+        self.record_canary()
     }
 
     fn write(&mut self, f: PendingFile) -> Result<()> {
         if self.reset_pending {
             self.reset()?;
+        }
+        if !self.runtime_recorded {
+            if let Some(runtime) = &self.runtime {
+                self.store
+                    .record_write_runtime(runtime, false)
+                    .context("recording the runtime")?;
+            }
+            self.runtime_recorded = true;
         }
         let new_chunks: Vec<NewChunk> = f
             .chunks
@@ -2550,6 +2655,7 @@ mod tests {
         Run::new(
             store,
             identity,
+            None,
             embed,
             cfg,
             cfg.embed.batch_size,
@@ -2690,6 +2796,7 @@ mod tests {
         let err = Run::new(
             &mut store,
             s.identity().clone(),
+            None,
             &embed,
             &cfg,
             cfg.embed.batch_size,
@@ -2791,8 +2898,10 @@ mod tests {
         let (_db, mut store) = open_temp_db();
         let calls = std::cell::Cell::new(0usize);
         let s = stub();
+        // Texts of the files only, not the embedding canary.
         let embed = |t: &[&str]| {
-            calls.set(calls.get() + t.len());
+            let files = t.iter().filter(|x| **x != cfg.embed.canary_text).count();
+            calls.set(calls.get() + files);
             s.embed_batch(t)
         };
         let log = RefCell::new(Vec::new());
@@ -2851,8 +2960,10 @@ mod tests {
             .unwrap();
         let calls = std::cell::Cell::new(0usize);
         let s = stub();
+        // Texts of the files only, not the embedding canary.
         let embed = |t: &[&str]| {
-            calls.set(calls.get() + t.len());
+            let files = t.iter().filter(|x| **x != cfg.embed.canary_text).count();
+            calls.set(calls.get() + files);
             s.embed_batch(t)
         };
         let log = RefCell::new(Vec::new());
@@ -2882,8 +2993,10 @@ mod tests {
         std::fs::write(&f, &content).unwrap();
         let calls = std::cell::Cell::new(0usize);
         let s = stub();
+        // Texts of the files only, not the embedding canary.
         let embed = |t: &[&str]| {
-            calls.set(calls.get() + t.len());
+            let files = t.iter().filter(|x| **x != cfg.embed.canary_text).count();
+            calls.set(calls.get() + files);
             s.embed_batch(t)
         };
         let log = RefCell::new(Vec::new());
@@ -3257,5 +3370,294 @@ mod tests {
         let stats = run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {}).unwrap();
         assert!(stats.chunks_reused > 0);
         check(&store);
+    }
+
+    // -----------------------------------------------------------------------
+    // Embedding canary and runtime record
+    // -----------------------------------------------------------------------
+
+    /// The stub with another seed: same identity, other vectors (a runtime
+    /// that drifted).
+    fn drifted() -> vec_embed::Embedder {
+        vec_embed::Embedder::stub_with_seed(TEST_DIM, 1)
+    }
+
+    fn is_drift(e: &anyhow::Error) -> bool {
+        e.chain().any(|c| c.is::<vec_store::EmbeddingDrift>())
+    }
+
+    #[test]
+    fn first_write_records_canary_and_runtime() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_lines(&dir.path().join("a.txt"), 50);
+        let cfg = test_cfg_for_dir(&dir);
+        let (_db, mut store) = open_temp_db();
+        run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap();
+        let canary = store.canary().unwrap().expect("canary recorded");
+        assert_eq!(canary.text, cfg.embed.canary_text);
+        let fresh = stub().embed_one(&cfg.embed.canary_text).unwrap();
+        assert!((vec_store::dot(&canary.vector, &fresh).unwrap() - 1.0).abs() < 1e-6);
+        assert_eq!(canary.runtime, stub().runtime());
+        let h = store.runtime_history().unwrap();
+        assert_eq!(h.first_write, stub().runtime());
+        assert_eq!(h.last_write, stub().runtime());
+    }
+
+    #[test]
+    fn writers_refuse_a_drifted_runtime_and_write_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = dir.path().join("a.txt");
+        write_lines(&f, 50);
+        let cfg = test_cfg_for_dir(&dir);
+        let (_db, mut store) = open_temp_db();
+        run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap();
+        let before = store.get_file(&f).unwrap().unwrap();
+
+        write_lines(&dir.path().join("b.txt"), 60);
+        std::fs::write(&f, "changed content line\n".repeat(30)).unwrap();
+        let err = run_updatedb(&mut store, &drifted(), &cfg, false, None, |_| {}).unwrap_err();
+        assert!(is_drift(&err), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("vec updatedb --full"),
+            "{err:#}"
+        );
+        let err = update_paths(
+            &mut store,
+            &drifted(),
+            &cfg,
+            std::slice::from_ref(&f),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(is_drift(&err), "{err:#}");
+        // A scoped --full cannot fix drift either: it would leave a mix.
+        let err =
+            run_updatedb(&mut store, &drifted(), &cfg, true, Some(dir.path()), |_| {}).unwrap_err();
+        assert!(is_drift(&err), "{err:#}");
+
+        assert_eq!(
+            store.get_file(&f).unwrap().unwrap(),
+            before,
+            "nothing written"
+        );
+        assert!(store.get_file(&dir.path().join("b.txt")).unwrap().is_none());
+        assert_eq!(
+            store.runtime_history().unwrap().last_write,
+            stub().runtime()
+        );
+    }
+
+    #[test]
+    fn a_small_move_is_a_warning_and_indexing_goes_on() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_lines(&dir.path().join("a.txt"), 50);
+        let cfg = test_cfg_for_dir(&dir);
+        let (_db, mut store) = open_temp_db();
+        run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap();
+
+        // The canary moves by cos ≈ 1/sqrt(1.01) ≈ 0.995: between the
+        // default limits (0.98, 0.999).
+        let s = stub();
+        let other = s.embed_one("an unrelated text").unwrap();
+        let nudged = |t: &[&str]| -> Result<Vec<Vec<f32>>> {
+            let mut out = s.embed_batch(t)?;
+            for (text, v) in t.iter().zip(&mut out) {
+                if *text == cfg.embed.canary_text {
+                    v.iter_mut().zip(&other).for_each(|(x, o)| *x += 0.1 * o);
+                }
+            }
+            Ok(out)
+        };
+        write_lines(&dir.path().join("b.txt"), 60);
+        let log = RefCell::new(Vec::new());
+        let stats = run_with(&mut store, &cfg, false, s.identity().clone(), &nudged, &log).unwrap();
+        assert_eq!(stats.files_updated, 1);
+        assert!(
+            log.borrow()
+                .iter()
+                .any(|m| m.starts_with("warn: embedding canary cosine 0.99")),
+            "{:?}",
+            log.borrow()
+        );
+    }
+
+    #[test]
+    fn full_rebuild_accepts_drift_and_replaces_the_canary_at_the_end() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_lines(&dir.path().join("a.txt"), 50);
+        let cfg = test_cfg_for_dir(&dir);
+        let (_db, mut store) = open_temp_db();
+        run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap();
+
+        let log = RefCell::new(Vec::new());
+        let stats = run_updatedb(&mut store, &drifted(), &cfg, true, None, |m| {
+            log.borrow_mut().push(m.to_owned());
+        })
+        .unwrap();
+        assert_eq!(stats.files_updated, 1);
+        assert!(log.borrow().iter().any(|m| m.contains("embedding drift")));
+        let canary = store.canary().unwrap().unwrap();
+        assert_eq!(canary.runtime, drifted().runtime());
+        let h = store.runtime_history().unwrap();
+        assert_eq!(
+            (h.first_write, h.last_write),
+            (drifted().runtime(), drifted().runtime())
+        );
+        // The drifted runtime is now the reference; the old one drifts.
+        run_updatedb(&mut store, &drifted(), &cfg, false, None, |_| {}).unwrap();
+        let err = run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap_err();
+        assert!(is_drift(&err), "{err:#}");
+    }
+
+    /// A `--full` that dies midway must not leave a canary matching only the
+    /// files it rewrote: the old canary stays, so the index (now a mix) keeps
+    /// being refused until a `--full` completes.
+    #[test]
+    fn a_full_rebuild_that_dies_midway_keeps_the_old_canary() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            write_lines(&dir.path().join(name), 50);
+        }
+        let mut cfg = test_cfg_for_dir(&dir);
+        cfg.embed.batch_size = 1; // one file per flush
+        let (_db, mut store) = open_temp_db();
+        run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap();
+        let old = store.canary().unwrap().unwrap();
+
+        let d = drifted();
+        let file_batches = std::cell::Cell::new(0usize);
+        let dies = |t: &[&str]| -> Result<Vec<Vec<f32>>> {
+            if !t.contains(&cfg.embed.canary_text.as_str()) {
+                file_batches.set(file_batches.get() + 1);
+                if file_batches.get() > 1 {
+                    bail!("backend went away");
+                }
+            }
+            d.embed_batch(t)
+        };
+        let log = RefCell::new(Vec::new());
+        assert!(run_with(&mut store, &cfg, true, d.identity().clone(), &dies, &log).is_err());
+        assert_eq!(store.canary().unwrap().unwrap(), old, "canary unchanged");
+        let err = run_updatedb(&mut store, &d, &cfg, false, None, |_| {}).unwrap_err();
+        assert!(is_drift(&err), "{err:#}");
+        // A completed --full fixes it.
+        run_updatedb(&mut store, &d, &cfg, true, None, |_| {}).unwrap();
+        run_updatedb(&mut store, &d, &cfg, false, None, |_| {}).unwrap();
+    }
+
+    #[test]
+    fn an_index_without_canary_adopts_one_with_a_note() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_lines(&dir.path().join("a.txt"), 50);
+        let cfg = test_cfg_for_dir(&dir);
+        let (db, mut store) = open_temp_db();
+        run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap();
+        // As written by a vec without canaries.
+        rusqlite::Connection::open(db.path())
+            .unwrap()
+            .execute(
+                "DELETE FROM meta WHERE key LIKE 'canary.%' OR key LIKE 'runtime.%'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(store.canary().unwrap(), None);
+
+        let log = RefCell::new(Vec::new());
+        run_updatedb(&mut store, &stub(), &cfg, false, None, |m| {
+            log.borrow_mut().push(m.to_owned());
+        })
+        .unwrap();
+        assert!(
+            log.borrow()
+                .iter()
+                .any(|m| m.starts_with("note: the index has no embedding canary")),
+            "{:?}",
+            log.borrow()
+        );
+        assert_eq!(store.canary().unwrap().unwrap().runtime, stub().runtime());
+        // A new, empty index records its canary without a note.
+        let (_db2, mut empty) = open_temp_db();
+        let log = RefCell::new(Vec::new());
+        run_updatedb(&mut empty, &stub(), &cfg, false, None, |m| {
+            log.borrow_mut().push(m.to_owned());
+        })
+        .unwrap();
+        assert!(!log.borrow().iter().any(|m| m.starts_with("note:")));
+    }
+
+    #[test]
+    fn a_model_reset_records_the_new_models_canary() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_lines(&dir.path().join("a.txt"), 50);
+        let cfg = test_cfg_for_dir(&dir);
+        let (_db, mut store) = open_temp_db();
+        run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap();
+        let other = vec_embed::Embedder::stub_with_seed(TEST_DIM * 2, 3);
+        run_updatedb(&mut store, &other, &cfg, true, None, |_| {}).unwrap();
+        let canary = store.canary().unwrap().unwrap();
+        assert_eq!(canary.vector.len(), TEST_DIM * 2);
+        assert_eq!(canary.runtime, other.runtime());
+        run_updatedb(&mut store, &other, &cfg, false, None, |_| {}).unwrap();
+    }
+
+    /// An index recorded without a model digest (HTTP backend before digests,
+    /// or a server that reports none) gets the digest at the next write.
+    #[test]
+    fn a_missing_model_digest_is_filled_in_by_the_next_write() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_lines(&dir.path().join("a.txt"), 50);
+        let cfg = test_cfg_for_dir(&dir);
+        let (_db, mut store) = open_temp_db();
+        let s = stub();
+        let embed = |t: &[&str]| s.embed_batch(t);
+        let log = RefCell::new(Vec::new());
+        run_with(&mut store, &cfg, false, s.identity().clone(), &embed, &log).unwrap();
+        assert_eq!(store.model().unwrap().unwrap().sha256, None);
+        let with_digest = ModelIdentity {
+            sha256: Some("feed".into()),
+            ..s.identity().clone()
+        };
+        run_with(&mut store, &cfg, false, with_digest.clone(), &embed, &log).unwrap();
+        assert_eq!(store.model().unwrap(), Some(with_digest));
+    }
+
+    /// End to end against a live Ollama-compatible server (read-only use:
+    /// lists models, reads the version, embeds). Run with
+    /// `VEC_TEST_OLLAMA_URL=http://ollama.example:11434 VEC_TEST_OLLAMA_MODEL=<name>
+    /// cargo test -p vec-index -- --ignored live_ollama`.
+    #[test]
+    #[ignore = "needs a live Ollama in VEC_TEST_OLLAMA_URL / VEC_TEST_OLLAMA_MODEL"]
+    fn live_ollama_records_digest_runtime_and_canary() {
+        let url = std::env::var("VEC_TEST_OLLAMA_URL").expect("set VEC_TEST_OLLAMA_URL");
+        let model = std::env::var("VEC_TEST_OLLAMA_MODEL").expect("set VEC_TEST_OLLAMA_MODEL");
+        let dir = tempfile::TempDir::new().unwrap();
+        write_lines(&dir.path().join("a.txt"), 50);
+        let mut cfg = test_cfg_for_dir(&dir);
+        cfg.embed.backend = vec_core::config::EmbedBackend::Ollama;
+        cfg.embed.embed_url = Some(url);
+        cfg.embed.model = model;
+        let embedder = vec_core::load_embedder(&cfg).unwrap();
+        let digest = embedder
+            .identity()
+            .sha256
+            .clone()
+            .expect("the server reports a digest");
+        assert!(
+            digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{digest}"
+        );
+        let runtime = embedder.runtime().expect("the server reports its version");
+
+        let (_db, mut store) = open_temp_db();
+        run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {}).unwrap();
+        assert_eq!(store.model().unwrap().unwrap().sha256, Some(digest));
+        assert_eq!(store.runtime_history().unwrap().last_write, Some(runtime));
+        let limits = CanaryLimits::from_config(&cfg.embed);
+        let check = store
+            .check_canary(|t| embedder.embed_one(t), embedder.runtime(), limits)
+            .unwrap()
+            .unwrap();
+        assert_eq!(check.verdict, CanaryVerdict::Ok, "{check}");
+        eprintln!("{check}");
     }
 }
