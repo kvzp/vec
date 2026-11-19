@@ -773,14 +773,9 @@ pub fn unpack_f32(bytes: &[u8]) -> Vec<f32> {
     if !bytes.len().is_multiple_of(4) {
         return Vec::new();
     }
-    bytes
-        .chunks_exact(4)
-        .map(|b| {
-            // Convert a 4-byte slice to [u8; 4] then interpret as little-endian f32.
-            let arr: [u8; 4] = [b[0], b[1], b[2], b[3]];
-            f32::from_le_bytes(arr)
-        })
-        .collect()
+    // The length check above guarantees an empty remainder.
+    let (words, _) = bytes.as_chunks::<4>();
+    words.iter().map(|w| f32::from_le_bytes(*w)).collect()
 }
 
 /// Return a new vector scaled so that its L2 norm equals 1.0.
