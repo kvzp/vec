@@ -1,0 +1,26 @@
+# vec-embed.socket (userland) — socket activation for the OPTIONAL daemon
+#
+# systemd listens and starts vec-embed.service on the first query; with
+# [daemon] idle_exit_secs set in ~/.config/vec/config.toml the daemon exits
+# when idle and frees its memory. The query that starts it waits for the
+# model to load and be hashed, bounded by [daemon] reply_timeout_ms (see the
+# system-level vec-embed.socket for why start-up is eager).
+#
+# The path must equal [daemon] socket in ~/.config/vec/config.toml
+# (`vec init --user` writes ~/.local/share/vec/embed.sock).
+#
+# HOW TO ENABLE
+#   systemctl --user enable --now vec-embed.socket
+# HOW TO DISABLE
+#   systemctl --user disable --now vec-embed.socket vec-embed.service
+
+[Unit]
+Description=vec embedding daemon socket (userland, OPTIONAL)
+
+[Socket]
+ListenStream=%h/.local/share/vec/embed.sock
+SocketMode=0600
+Accept=no
+
+[Install]
+WantedBy=sockets.target

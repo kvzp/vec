@@ -3,15 +3,19 @@ name = "vec-daemon"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "vec persistent embedding daemon over Unix socket"
+description = "vec persistent embedding daemon over Unix socket, and its client"
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-vec-embed = { path = "../vec-embed" }
-anyhow    = "1"
-anstream  = "0.6"
+vec-core   = { path = "../vec-core" }
+vec-embed  = { path = "../vec-embed" }
+anyhow     = "1"
+anstream   = "0.6"
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["fs", "poll", "socket"] }
 
 [dev-dependencies]
-vec-store = { path = "../vec-store" }
-tempfile  = "3"
+tempfile = "3"

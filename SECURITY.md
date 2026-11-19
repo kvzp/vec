@@ -1,154 +1,103 @@
 # Security Model
 
-## The Core Property
+## Core properties
 
-**The vec database contains no source code.**
-
-It stores: file paths, byte offsets, and embedding vectors.
-
-Embedding vectors encode semantic meaning as floats. You cannot reconstruct source text from them. If someone obtains `vec.db`, they learn which files exist and how many chunks each has — nothing else.
-
-Snippets are read from the live source file at display time, subject to normal filesystem permissions.
-
-This property is verifiable without trusting the application: inspect the schema, confirm there is no `content` column in `chunks`.
-
----
-
-## Implementation Language
-
-vec is written in Rust. Memory safety is enforced at compile time — no buffer overflows, no use-after-free, no data races.
-
----
-
-## Database Security
-
-Central system-wide DB at `/var/lib/vec/vec.db`, mode `644`, owned by root.
-
-Readable by all users. Contains no source text — only paths, byte offsets, and embedding vectors. Per-user access enforcement happens at query time via `access(path, R_OK)`.
-
----
-
-## Access Control Flow
-
-No daemon. The CLI runs as the user and calls `access(path, R_OK)` on every result before displaying it:
+- **The index holds no source text.** It stores paths, byte offsets, line
+  numbers, file/chunk hashes and embedding vectors (`chunks` has no content
+  column; check with `sqlite3 vec.db .schema`). A stolen DB reveals which files
+  exist, their sha256 and vectors, not their text. Vectors are not designed to be
+  inverted, but they do carry semantic information: treat the DB as you would a
+  `locate` database plus a hint of each file's topic.
+- **The filesystem is the ACL.** Every search, `similar`, `explain` and `context`
+  result is checked with `access(path, R_OK)` for the querying user (real
+  UID/GID) before it is shown; unreadable results are dropped silently, before
+  the limit is applied. Revoke read access and the result disappears on the next
+  query; no re-index needed.
+- **Snippets come from the live file**, opened with `O_NOFOLLOW | O_NONBLOCK`,
+  required to be a regular file, read up to `[index] max_file_size` bytes.
 
 ```
-user runs: vec "query"
-    → embed query
-    → cosine similarity → top-k hits from DB
-    → for each hit:
-          access(path, R_OK)    # checked as the running user
-          if denied: drop silently
-    → read snippet from live file
-    → stdout
+vec "query" (as the user)
+  → embed query → scan vectors → keep results with access(path, R_OK)
+  → read snippet from the live file → stdout
 ```
 
-The filesystem is the single source of truth. No separate ACL. No user list in the DB. No daemon.
+## Indexer
 
-### Revoking Access
+The system units run `vec updatedb` / `vec watch` as root so they can read
+protected paths, like `updatedb` for `locate`. Privilege is used only to read:
 
-Revoke filesystem read on the relevant paths. The user's next `vec` query will fail the `access()` check for those files and silently drop them — no index changes needed.
+- `CapabilityBoundingSet=CAP_DAC_READ_SEARCH` (read anything, nothing else),
+  `NoNewPrivileges`, `ProtectSystem=strict` with `StateDirectory=vec` as the
+  only writable path, `ProtectHome=read-only`, `PrivateDevices`, kernel/cgroup/
+  clock protections, `MemoryDenyWriteExecute`, `SystemCallFilter=@system-service`.
+  `PrivateTmp` is deliberately **not** set: it would hide `/tmp` and `/var/tmp`
+  and their records would be pruned. `AF_INET`/`AF_INET6` are allowed only for the
+  optional HTTP backend.
+- **Symlink-safe reads.** Symlinks are never followed by the walker. Each file is
+  opened component by component below its include path with
+  `openat(O_NOFOLLOW)`, and the open file's `(st_dev, st_ino)` must equal the
+  walker's `lstat`: swapping a directory or file for a symlink between walk and
+  read cannot make a root indexer read another file. `O_NONBLOCK` means a FIFO
+  swapped in cannot block it; reads are capped at `max_file_size`.
+- Default `exclude_files` skip secret material (`.env`, `.env.*`, `*.key`,
+  `*.pem`, `*.p12`, `*.pfx`). Add your own (`secrets.yaml`, `credentials.json`);
+  a path appearing in results can leak information even without text.
 
----
+**Configuration trust.** System services read `/etc/vec.conf` and, as for any
+user, root's own per-user file (`~root/.config/vec/config.toml`) unless
+`--config` is given. Keep both admin-controlled. A user's per-user config only
+affects that user's own commands (their queries still pass `access()`).
 
-## What to Exclude from Indexing
+## Embedding daemon
 
-`vec` respects `.gitignore` automatically. Additionally, configure exclusions in `/etc/vec.conf`:
+Optional (`vec-embed.socket`). It returns vectors for texts a client sends, and
+nothing else, so the default socket mode `0666` lets any local user connect
+(use `SocketMode=0660` + `SocketGroup=` to restrict). The threat is resource
+abuse by a local client; the limits:
 
-```toml
-[index]
-exclude_files = [".env", ".env.*", "*.key", "*.pem", "*.p12", "*.pfx",
-                 "secrets.*", "credentials.*"]
-exclude_dirs  = [".secrets", "private"]
-```
+| Threat | Mitigation |
+|--------|------------|
+| Huge request | `max_request_bytes` (headers included), `max_texts_per_request`; checked before reading the body |
+| Many cheap texts (CPU, reply size) | `max_texts_per_request`: each text costs one inference and `dim × 4` reply bytes |
+| Slowloris (idle, trickling or non-reading client) | one deadline (`io_timeout_ms`) for each whole request and each whole reply write, recomputed before every read/write |
+| Connection flood | `max_connections` threads; extra clients get an immediate "busy" reply |
+| `accept()` failure loop (EMFILE) | `accept_retry_ms` pause |
+| Information leak in errors | clients get "embedding failed (details in the daemon log)"; invalid UTF-8 is rejected |
+| Socket hijack | a stale socket is removed only if nothing listens; a live socket or a non-socket file is never replaced |
+| Hung/malicious daemon (client side) | `reply_timeout_ms` / `io_timeout_ms` whole-read deadlines, replies bounded by what was asked, identity checked; any problem → in-process embedding |
 
-Files matching these patterns are never indexed — no embedding, no entry in the DB.
+The system unit runs with `DynamicUser=yes`, `PrivateNetwork=yes`,
+`RestrictAddressFamilies=AF_UNIX`, `ProtectHome=yes`, `PrivateTmp=yes`, empty
+capability set and the same syscall filter (`systemd-analyze security`: 0.9).
+User units use only the seccomp-based options (namespacing needs unprivileged
+user namespaces). `vec status` never connects to it unless asked (`--daemon`).
 
-**Recommended exclusions for teams:**
-- Environment files: `.env`, `.env.*`
-- Key material: `*.key`, `*.pem`, `*.p12`, `*.pfx`
-- Secret stores: `*.vault`, `secrets/`, `credentials/`
+## MCP server
 
----
+`vec serve` runs as the user who started it, on stdio (no network port). A
+prompt-injected client must not turn it into a file reader, so:
 
-## Embedding Model Security
+- `context` serves only files **in the index**, readable by the user, regular
+  files (symlinks not followed), at most `max_file_size` bytes.
+- `similar` and `explain` require read access to the file.
+- `search` results pass the same `access()` filter as the CLI.
 
-### Embedding backend
+Errors are returned as tool errors (`isError: true`) with a message.
 
-Embeddings run in-process via `tract-onnx` — pure Rust, no network calls, no external service. Text never leaves the process. The ONNX model is loaded from a local file at startup; no runtime download.
+## Embedding backends
 
-**Exception:** when `[embed] backend = "ollama"` is explicitly configured, text chunks are sent over HTTP to the configured Ollama endpoint for embedding. This is opt-in — the default backend (`onnx`) makes zero network calls. If using Ollama, ensure the endpoint is on a trusted network.
+ONNX runs in-process: no network, no runtime download. With
+`backend = "ollama"`, chunk text is sent over **plain HTTP** to `embed_url`:
+use it only on a trusted host or network.
 
----
+## Out of scope
 
-## Threat Model
+Encryption at rest (use disk encryption), authentication beyond Unix
+credentials, audit logging.
 
-| Threat | Mitigated? | How |
-|--------|------------|-----|
-| DB file stolen | Yes | No source text in DB; vectors are non-invertible |
-| Unauthorized result shown | Yes | `access(path, R_OK)` checked on every result before display |
-| Stale access after permission change | Yes | `access()` checked live on every query — no caching |
-| Sensitive file indexed accidentally | Partial | `.gitignore` + exclude config; defense is configuration |
-| Local embedding leaks data | N/A | tract-onnx runs in-process; no network calls, no external service |
+## Reporting a vulnerability
 
-## Out of Scope
-
-- Encryption at rest (the DB is non-sensitive by design; if required, use full-disk encryption)
-- Authentication beyond Unix credentials (use VPN/firewall on multi-tenant hosts)
-- Audit logging (not implemented in MVP; add as needed)
-
----
-
-## System Installation and Root Privilege
-
-On a system-wide deployment, `vec` runs as root under systemd so it can read
-protected paths such as `/etc` and `/root`. This is intentional and equivalent
-to how `updatedb`/`mlocate` operate.
-
-### Why root is required
-
-`vec` needs read access to every file it indexes. Paths like `/etc` are not
-world-readable in their entirety. Privilege is used **only for reading** — no
-writes to indexed files, no capability escalation, no network listeners.
-
-### Single authoritative config
-
-On a system install there is exactly one config file: `/etc/vec.conf`.
-No per-user overrides exist. The indexed paths, model, and DB location are all
-visible there to any administrator.
-
-### System install layout
-
-```
-/usr/local/bin/vec            binary
-/etc/vec.conf                 single authoritative config (no per-user config)
-/var/lib/vec/vec.db           SQLite index (embeddings only, no file contents)
-/usr/share/vec/models/        ONNX embedding models
-/etc/systemd/system/          vec-watch.service  vec-updatedb.service/.timer
-```
-
-All systemd units specify `User=root` explicitly. The DB at `/var/lib/vec/`
-is readable by all users (mode 644) and contains no source text — only paths,
-byte offsets, and float vectors.
-
-### Comparison to established tools
-
-| Tool       | Runs as             | Privilege reason        | Network |
-|------------|---------------------|-------------------------|---------|
-| `updatedb` | root (setuid / cron)| Read protected paths    | None    |
-| `mlocate`  | root (cron)         | Read protected paths    | None    |
-| `vec`      | root (systemd)      | Read protected paths    | None    |
-
-To verify the running configuration at any time:
-
-```
-vec status
-```
-
----
-
-## Reporting a Vulnerability
-
-Please report security issues via [GitHub Security Advisories](https://github.com/kvzp/vec/security/advisories/new) — not as a public issue.
-
-Include: what you found, steps to reproduce, and the impact as you see it. You will receive a response within 7 days.
+Use [GitHub Security Advisories](https://github.com/kvzp/vec/security/advisories/new),
+not a public issue. Include what you found, how to reproduce it and the impact.
+You will get a response within 7 days.

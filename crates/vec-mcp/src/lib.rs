@@ -1,20 +1,31 @@
-// src/mcp.rs — MCP server for vec, exposing three tools:
-//
-//   search(query, limit?, path_filter?) -> JSON array of SearchResultItem
-//   context(file_path, line, window?)   -> string of surrounding lines
-//   index_status()                      -> JSON object with index stats
-//
-// Transport: stdio (read from stdin, write to stdout) — the standard MCP
-// transport for CLI-launched servers like vec.
-//
-// rmcp 3 API used here:
-//   - `#[tool_router]` on an impl block registers tools via the ToolRouter.
-//   - `#[tool(description = "...")]` marks each method.
-//   - Parameters are extracted using the `Parameters<T>` newtype wrapper.
-//   - `ServerHandler` is implemented to provide server metadata.
-//   - `.serve(stdio())` connects the handler to the stdio transport.
-//   - `.waiting().await` blocks until the connection closes.
+//! vec-mcp — the MCP server of vec (`vec serve`), on stdio.
+//!
+//! Tools:
+//!
+//! | tool | does |
+//! |---|---|
+//! | `search` | semantic search: one or more queries, path filter, excludes, min score |
+//! | `similar` | chunks similar to the one at `file_path:line` (stored vector, no model) |
+//! | `explain` | the chunks covering `file_path:line` and the file's index entry |
+//! | `context` | lines around `file_path:line` of an indexed file |
+//! | `index_status` | index, model, watcher and daemon state |
+//!
+//! Search and ranking are [`vec_query::Searcher`]'s, exactly as in the CLI.
+//! The server keeps one searcher, so the in-process model is loaded at most
+//! once, on the first query that needs it (the embedding daemon is used when it
+//! serves the index's model). Every tool runs on the blocking thread pool
+//! (SQLite, file reads and model inference block).
+//!
+//! `context` only reads files that are in the index, readable by the user
+//! running the server, regular (symlinks are not followed) and at most
+//! `[index] max_file_size` bytes: a prompt-injected client cannot use it to
+//! read arbitrary files such as `~/.ssh/id_*` or `/dev/zero`.
+//!
+//! Relative paths in parameters are resolved against the server's working
+//! directory. A tool failure is returned as an error result (`isError`) whose
+//! text says what to fix.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -29,258 +40,265 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 use vec_core::config::Config;
-use vec_embed::Embedder;
-use vec_store::Store;
-
-// ---------------------------------------------------------------------------
-// Public return types (serialised to JSON for MCP clients)
-// ---------------------------------------------------------------------------
-
-/// One search result returned by the `search` tool.
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct SearchResultItem {
-    /// Absolute path to the source file.
-    pub path: String,
-    /// First line of the matching chunk (1-based).
-    pub start_line: usize,
-    /// Last line of the matching chunk (1-based).
-    pub end_line: usize,
-    /// Cosine similarity score in [0, 1].
-    pub score: f32,
-    /// Text snippet (the raw chunk bytes read from the live file).
-    pub snippet: Option<String>,
-}
-
-/// Index statistics returned by the `index_status` tool.
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct IndexStatusResult {
-    /// Number of files indexed.
-    pub file_count: usize,
-    /// Number of chunks (embedding rows) in the index.
-    pub chunk_count: usize,
-    /// Path to the SQLite database.
-    pub db_path: String,
-    /// Configured embedding model name.
-    pub model: String,
-    /// Whether the model file was found on disk.
-    pub model_found: bool,
-}
+use vec_query::{SearchRequest, Searcher};
 
 // ---------------------------------------------------------------------------
 // Tool parameter types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+/// Parameters of `search`.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct SearchParams {
     /// The semantic search query.
-    pub query: String,
-    /// Maximum number of results to return (default: from config).
+    pub query: Option<String>,
+    /// More queries; the results of all queries are merged (best score per
+    /// chunk). At least one of `query` and `queries` is required.
+    pub queries: Option<Vec<String>>,
+    /// Maximum number of results (default: from config).
     pub limit: Option<u32>,
-    /// Only return results whose file path starts with this prefix.
+    /// Only return files equal to or under this path.
     pub path_filter: Option<String>,
-    /// Minimum cosine similarity score (0.0–1.0); results below this are suppressed.
+    /// Drop files equal to or under these paths.
+    pub exclude: Option<Vec<String>>,
+    /// Minimum cosine similarity (-1.0 to 1.0; default: from config).
     pub min_score: Option<f32>,
 }
 
+/// A location in a file.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LocationParams {
+    /// Path of the file (absolute, or relative to the server's directory).
+    pub file_path: String,
+    /// Line number (1-based).
+    pub line: u32,
+}
+
+/// Parameters of `context`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ContextParams {
-    /// Absolute path to the source file.
+    /// Path of an indexed file (absolute, or relative to the server's directory).
     pub file_path: String,
     /// Target line number (1-based).
     pub line: u32,
-    /// Number of lines of context on each side of `line` (default: 10).
+    /// Lines of context on each side of `line` (default: from config).
     pub window: Option<u32>,
 }
 
+/// Parameters of `similar`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct IndexStatusParams {}
+pub struct SimilarParams {
+    /// Path of an indexed file (absolute, or relative to the server's directory).
+    pub file_path: String,
+    /// A line covered by the chunk to compare with (1-based).
+    pub line: u32,
+    /// Maximum number of results (default: from config).
+    pub limit: Option<u32>,
+}
+
+/// `index_status` parameters.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct IndexStatusParams {
+    /// Also ask the embedding daemon for its model. Off by default:
+    /// connecting starts a socket-activated daemon, which loads the model.
+    #[serde(default)]
+    pub probe_daemon: bool,
+}
+
+/// One result of `search` or `similar` (serialised as JSON).
+#[derive(Debug, Serialize)]
+pub struct ResultItem {
+    /// Absolute path of the file.
+    pub path: String,
+    /// The line of the chunk that best matches the query (1-based); the
+    /// chunk's first line for `similar`.
+    pub line: usize,
+    /// First line of the matching chunk (1-based).
+    pub start_line: usize,
+    /// Last line of the matching chunk (1-based).
+    pub end_line: usize,
+    /// Ranking score: cosine similarity, plus the path boost for `search`.
+    pub score: f32,
+    /// Up to `[search] snippet_lines` lines before and after `line` (a radius), read from the live file,
+    /// as `> NNNNN: text` rows (`>` marks `line`); absent when the file
+    /// cannot be read.
+    pub snippet: Option<String>,
+}
 
 // ---------------------------------------------------------------------------
-// Server struct
+// Server
 // ---------------------------------------------------------------------------
 
-/// The MCP server — holds the loaded config (cheaply Arc'd so it is Clone).
+/// The MCP server: one shared [`Searcher`] (config + lazily loaded model).
 #[derive(Clone)]
 pub struct VecServer {
-    config: Arc<Config>,
-    #[allow(dead_code)]
+    searcher: Arc<Searcher>,
+    #[allow(dead_code)] // read by the code #[tool_handler] generates
     tool_router: ToolRouter<Self>,
+}
+
+/// Run `f` with the searcher on the blocking pool; an error becomes an error
+/// result the client sees.
+async fn blocking(
+    searcher: &Arc<Searcher>,
+    f: impl FnOnce(&Searcher) -> Result<String> + Send + 'static,
+) -> Result<CallToolResult, McpError> {
+    let searcher = Arc::clone(searcher);
+    let out = tokio::task::spawn_blocking(move || f(&searcher))
+        .await
+        .map_err(|e| McpError::internal_error(format!("tool task failed: {e}"), None))?;
+    Ok(match out {
+        Ok(text) => CallToolResult::success(vec![Content::text(text)]),
+        Err(e) => CallToolResult::error(vec![Content::text(format!("{e:#}"))]),
+    })
+}
+
+fn to_json(value: &impl Serialize) -> Result<String> {
+    Ok(serde_json::to_string_pretty(value)?)
+}
+
+fn items(annotated: Vec<vec_query::Annotated>) -> Vec<ResultItem> {
+    annotated
+        .into_iter()
+        .map(|a| ResultItem {
+            path: a.path.to_string_lossy().into_owned(),
+            line: a.line,
+            start_line: a.start_line,
+            end_line: a.end_line,
+            score: a.score,
+            snippet: a.snippet,
+        })
+        .collect()
+}
+
+fn location(file_path: &str) -> Result<PathBuf> {
+    vec_core::util::absolute_lexical(Path::new(file_path))
 }
 
 #[tool_router]
 impl VecServer {
-    /// Search indexed files by semantic meaning.
-    #[tool(
-        description = "Search files by semantic meaning using vector embeddings. Returns file paths, line numbers, and optional snippets ranked by relevance."
-    )]
-    fn search(
-        &self,
-        Parameters(params): Parameters<SearchParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let cfg = &self.config;
-
-        // Open the store (WAL mode allows concurrent readers).
-        let store = Store::open(&cfg.database.db_path, cfg.database.wal)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        // Load embedder (stub fallback if model not ready).
-        let embedder = load_embedder_for_mcp(cfg);
-
-        let limit = params
-            .limit
-            .map(|l| l as usize)
-            .unwrap_or(cfg.search.default_limit);
-        let min_score = params.min_score.unwrap_or(0.0);
-        let path_filter = params.path_filter.as_deref().map(std::path::Path::new);
-
-        let embedding = embedder
-            .embed_one(&params.query)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        let raw_results = store
-            .search(&embedding, limit, min_score, path_filter)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        // Convert to SearchResultItem, applying access() check and reading
-        // trimmed snippets (±snippet_lines around best-matching line).
-        let snippet_ctx = cfg.search.snippet_lines;
-        let query_words: Vec<String> = params
-            .query
-            .split_whitespace()
-            .map(|w| w.to_lowercase())
-            .collect();
-
-        let mut items: Vec<SearchResultItem> = Vec::new();
-        for result in raw_results {
-            if !vec_core::util::can_read(&result.path) {
-                continue;
-            }
-
-            let (best_line, snippet) = match std::fs::read_to_string(&result.path) {
-                Ok(content) => {
-                    let best = best_line_in_content(&content, &result, &query_words)
-                        .unwrap_or(result.start_line);
-                    let lines: Vec<&str> = content.lines().collect();
-                    let target = best.saturating_sub(1);
-                    let from = target.saturating_sub(snippet_ctx);
-                    let to = (target + snippet_ctx + 1).min(lines.len());
-                    let snip: String = lines[from..to]
-                        .iter()
-                        .enumerate()
-                        .map(|(i, l)| {
-                            let lineno = from + i + 1;
-                            let marker = if lineno == best { ">" } else { " " };
-                            format!("{} {:>5}: {}", marker, lineno, l)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    (best, Some(snip))
-                }
-                Err(_) => (result.start_line, None),
-            };
-
-            items.push(SearchResultItem {
-                path: result.path.to_string_lossy().into_owned(),
-                start_line: best_line,
-                end_line: result.end_line,
-                score: result.score,
-                snippet,
-            });
-        }
-
-        let json = serde_json::to_string_pretty(&items)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+    /// A server for `cfg`.
+    #[must_use]
+    pub fn new(cfg: Config) -> Self {
+        Self::with_searcher(Searcher::new(cfg))
     }
 
-    /// Get source lines around a specific file location.
-    #[tool(
-        description = "Return a window of source lines centred on a given line in a file. Useful for reading context around a search result."
-    )]
-    fn context(
-        &self,
-        Parameters(params): Parameters<ContextParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let window = params.window.unwrap_or(10) as usize;
-        let target_line = params.line as usize; // 1-based
-
-        // Security: check read permission before returning file content.
-        let path = std::path::Path::new(&params.file_path);
-        if !vec_core::util::can_read(path) {
-            return Err(McpError::invalid_params(
-                format!("Permission denied: {}", params.file_path),
-                None,
-            ));
-        }
-
-        let content = std::fs::read_to_string(path).map_err(|e| {
-            McpError::internal_error(format!("Could not read {}: {e}", params.file_path), None)
-        })?;
-
-        let lines: Vec<&str> = content.lines().collect();
-        let total = lines.len();
-
-        if total == 0 || target_line == 0 {
-            return Ok(CallToolResult::success(vec![Content::text(String::new())]));
-        }
-
-        // Convert 1-based target to 0-based index, clamp to file bounds.
-        let idx = (target_line - 1).min(total - 1);
-        let start = idx.saturating_sub(window);
-        let end = (idx + window + 1).min(total);
-
-        let mut out = String::new();
-        for (i, line) in lines[start..end].iter().enumerate() {
-            let lineno = start + i + 1; // back to 1-based for display
-            let marker = if lineno == target_line { ">" } else { " " };
-            out.push_str(&format!("{} {:>5}: {}\n", marker, lineno, line));
-        }
-
-        Ok(CallToolResult::success(vec![Content::text(out)]))
-    }
-
-    /// Return index statistics (file count, chunk count, model info).
-    #[tool(
-        description = "Return statistics about the vec index: number of files, chunks, database path, and configured model."
-    )]
-    fn index_status(
-        &self,
-        Parameters(_params): Parameters<IndexStatusParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let cfg = &self.config;
-
-        let store = Store::open(&cfg.database.db_path, cfg.database.wal)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        let (file_count, chunk_count, _last_mtime) = store
-            .stats()
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        let model_found = cfg.resolve_model_path().is_ok();
-
-        let result = IndexStatusResult {
-            file_count,
-            chunk_count,
-            db_path: cfg.database.db_path.to_string_lossy().into_owned(),
-            model: cfg.embed.model.clone(),
-            model_found,
-        };
-
-        let json = serde_json::to_string_pretty(&result)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        Ok(CallToolResult::success(vec![Content::text(json)]))
-    }
-}
-
-impl VecServer {
-    fn new() -> Result<Self> {
-        let config = Config::load(None)?;
-        Ok(Self {
+    /// A server using `searcher` (tests, or an embedder already loaded).
+    #[must_use]
+    pub fn with_searcher(searcher: Searcher) -> Self {
+        Self {
+            searcher: Arc::new(searcher),
             tool_router: Self::tool_router(),
-            config: Arc::new(config),
+        }
+    }
+
+    /// Semantic search.
+    #[tool(
+        description = "Search indexed files by meaning. Give `query` and/or `queries` (results \
+                       merged); optional `path_filter`, `exclude` paths, `limit`, `min_score`. \
+                       Returns JSON: path, best-matching line, chunk lines, score, snippet."
+    )]
+    pub async fn search(
+        &self,
+        Parameters(p): Parameters<SearchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        blocking(&self.searcher, move |s| {
+            let req = SearchRequest {
+                queries: p
+                    .query
+                    .into_iter()
+                    .chain(p.queries.into_iter().flatten())
+                    .collect(),
+                limit: p.limit.map(|l| l as usize),
+                min_score: p.min_score,
+                path_filter: p.path_filter.map(PathBuf::from),
+                exclude: p.exclude.into_iter().flatten().map(PathBuf::from).collect(),
+            };
+            let store = s.open_store()?;
+            let hits = s.search(&store, &req)?;
+            let out = s.annotate(&hits, &req.queries, Some(s.config().search.snippet_lines));
+            to_json(&items(out))
         })
+        .await
+    }
+
+    /// Chunks similar to a location.
+    #[tool(
+        description = "Find code or text similar to the indexed chunk covering file_path:line \
+                       (uses its stored vector). Returns JSON like `search`."
+    )]
+    pub async fn similar(
+        &self,
+        Parameters(p): Parameters<SimilarParams>,
+    ) -> Result<CallToolResult, McpError> {
+        blocking(&self.searcher, move |s| {
+            let path = location(&p.file_path)?;
+            let store = s.open_store()?;
+            let hits = s.similar(&store, &path, p.line as usize, p.limit.map(|l| l as usize))?;
+            let out = s.annotate(&hits, &[], Some(s.config().search.snippet_lines));
+            to_json(&items(out))
+        })
+        .await
+    }
+
+    /// The index entry of a location.
+    #[tool(
+        description = "Explain how file_path:line is indexed: the chunks covering the line \
+                       (line and byte ranges), the file's indexed hash, and whether it changed \
+                       since. JSON."
+    )]
+    pub async fn explain(
+        &self,
+        Parameters(p): Parameters<LocationParams>,
+    ) -> Result<CallToolResult, McpError> {
+        blocking(&self.searcher, move |s| {
+            let path = location(&p.file_path)?;
+            let store = s.open_store()?;
+            to_json(&s.explain(&store, &path, p.line as usize)?)
+        })
+        .await
+    }
+
+    /// Lines around a location of an indexed file.
+    #[tool(
+        description = "Return the lines around file_path:line of an indexed file (the line is \
+                       marked with '>'). Useful to read more of a search result."
+    )]
+    pub async fn context(
+        &self,
+        Parameters(p): Parameters<ContextParams>,
+    ) -> Result<CallToolResult, McpError> {
+        blocking(&self.searcher, move |s| {
+            let path = location(&p.file_path)?;
+            let store = s.open_store()?;
+            let content = s.read_indexed(&store, &path)?;
+            let window = p
+                .window
+                .map_or(s.config().search.context_window, |w| w as usize);
+            vec_query::context(&content, &path, p.line as usize, window)
+        })
+        .await
+    }
+
+    /// Index statistics.
+    #[tool(
+        description = "Return the state of the vec index: files, chunks, schema, the model the \
+                       index was built with vs the configured one, last updatedb run, watcher \
+                       state, and whether the embedding daemon socket exists (probe_daemon: \
+                       ask the daemon for its model, which starts a socket-activated one). JSON."
+    )]
+    pub async fn index_status(
+        &self,
+        Parameters(p): Parameters<IndexStatusParams>,
+    ) -> Result<CallToolResult, McpError> {
+        blocking(&self.searcher, move |s| {
+            let store = s.open_store()?;
+            to_json(&vec_query::status::status(
+                s.config(),
+                &store,
+                p.probe_daemon,
+            )?)
+        })
+        .await
     }
 }
 
@@ -294,8 +312,8 @@ impl ServerHandler for VecServer {
             ))
             .with_instructions(
                 "vec — semantic file search. Use `search` to find files by meaning, \
-             `context` to read lines around a result, `index_status` to check \
-             the index.",
+                 `context` to read lines around a result, `similar` to find related code, \
+                 `explain` to see how a location is indexed, `index_status` to check the index.",
             )
     }
 }
@@ -304,71 +322,22 @@ impl ServerHandler for VecServer {
 // run_server — public entry point called from main.rs
 // ---------------------------------------------------------------------------
 
-/// Start the MCP server using stdio transport.
+/// Serve MCP on stdio with `cfg` until the client closes the connection.
 ///
-/// Reads JSON-RPC messages from stdin, writes responses to stdout.
-/// Blocks until the client closes the connection.
-pub async fn run_server() -> Result<()> {
-    use rmcp::RoleServer;
-    use rmcp::service::RunningService;
-
-    let server = VecServer::new()?;
-
-    let service: RunningService<RoleServer, VecServer> = server
+/// # Errors
+///
+/// The transport fails to start or stops with an error.
+pub async fn run_server(cfg: Config) -> Result<()> {
+    let service = VecServer::new(cfg)
         .serve(rmcp::transport::stdio())
         .await
         .map_err(|e| anyhow::anyhow!("MCP server initialise error: {e}"))?;
-
     service
         .waiting()
         .await
         .map_err(|e| anyhow::anyhow!("MCP server join error: {e}"))?;
-
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Helper: load embedder with stub fallback (no stderr from within MCP tools
-// since stderr may interfere with the JSON-RPC framing on some hosts)
-// ---------------------------------------------------------------------------
-
-fn load_embedder_for_mcp(cfg: &Config) -> Embedder {
-    if let Ok(model_path) = cfg.resolve_model_path()
-        && let Ok(e) = Embedder::load(&model_path, cfg.embed.max_tokens)
-    {
-        return e;
-    }
-    Embedder::stub(768)
-}
-
-/// Find the line within a chunk that best matches query keywords.
-fn best_line_in_content(
-    content: &str,
-    result: &vec_store::SearchResult,
-    query_words: &[String],
-) -> Option<usize> {
-    let end = result.byte_end.min(content.len());
-    let start = result.byte_offset.min(end);
-    let chunk = &content[start..end];
-
-    let mut best_score = 0usize;
-    let mut best_offset = 0usize;
-
-    for (i, line) in chunk.lines().enumerate() {
-        let lower = line.to_lowercase();
-        let score: usize = query_words
-            .iter()
-            .filter(|w| lower.contains(w.as_str()))
-            .count();
-        if score > best_score {
-            best_score = score;
-            best_offset = i;
-        }
-    }
-
-    if best_score > 0 {
-        Some(result.start_line + best_offset)
-    } else {
-        None
-    }
-}
+#[cfg(test)]
+mod tests;

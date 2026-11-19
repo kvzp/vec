@@ -1,265 +1,48 @@
-# vec — Semantic locate for your codebase
+# vec — Semantic locate
 
 > `locate` finds files by name. `vec` finds files by meaning.
 
----
+## The problem
 
-## The Problem
-
-`locate auth` finds files named `auth*`.
-But you want the file *containing* auth logic — regardless of what it's called.
-
-`grep -r "authentication" .` finds literal strings.
-But you want everything *related to* authentication — even if the word never appears.
-
-No existing tool does this at the system level. `vec` does.
-
----
+`locate auth` finds files *named* `auth*`. `grep -r authentication` finds the
+literal string. Neither finds the code that *does* authentication when it is
+called something else. Semantic search does, but most tools for it are developer
+add-ons (Python runtimes, cloud APIs, per-project indexes) that are not built
+for multi-user machines or system packaging.
 
 ## Positioning
 
-Most semantic code search tools are developer toys: installed via `pip install`, require Python runtimes, bundle their own dependencies, and aren't designed for multi-user or system-level deployment.
+vec is infrastructure, in the spirit of `locate`:
 
-**vec is infrastructure.** It ships as a static binary with no runtime dependencies, integrates with systemd, uses filesystem permissions as the sole access control mechanism, and is designed to be packaged by Linux distributions. The security model is auditable without reading application code — inspect the schema, see no `content` column, done.
+| locate | vec | role |
+|--------|-----|------|
+| `updatedb` | `vec updatedb` | build / update the index |
+| `mlocate.db` | `/var/lib/vec/vec.db` | central index (paths + vectors, no text) |
+| `/etc/updatedb.conf` | `/etc/vec.conf` | what to index |
+| cron | systemd timer + `vec watch` | keep it fresh |
 
----
+`locate` can share one database because it stores paths only. vec keeps that
+property: it stores vectors and byte offsets, never text, and checks each result
+against the caller's file permissions. Embedding runs locally on the CPU.
 
-## The Mental Model
-
-```
-locate "filename pattern"    →  matched file paths
-vec    "concept or question" →  semantically relevant file paths + line ranges
-```
-
-`vec` is to `locate` what semantic search is to ctrl+F.
-
-It works because it pre-indexes your filesystem with embeddings (via local CPU inference), exactly like `updatedb` pre-indexes your filesystem with file paths. Query time is sub-second — the heavy work is done upfront.
-
----
-
-## Usage
-
-```bash
-# Search (the main thing)
-vec "authentication middleware"
-vec "database connection pooling"
-vec "where does error handling happen"
-vec "payment processing"
-
-# With snippets
-vec "JWT token validation" --snippet
-
-# Limit results
-vec "cache invalidation" --limit 5
-
-# Restrict to a path
-vec "auth logic" --path ~/projects/backend
-
-# Update the index (like updatedb)
-vec updatedb
-
-# Show index stats
-vec status
-```
-
----
-
-## Output
-
-`file:line (score)` by default — pipe-friendly, with relevance score always visible:
+## Mental model
 
 ```
-/home/user/projects/backend/src/auth/middleware.rs:42 (score: 0.943)
-/home/user/projects/backend/src/auth/jwt.rs:17 (score: 0.891)
-/home/user/projects/frontend/src/hooks/useAuth.ts:34 (score: 0.823)
-/home/user/projects/shared/lib/permissions.rs:88 (score: 0.798)
+locate "filename pattern"    →  matching paths
+vec    "concept or question" →  relevant paths + lines, ranked by similarity
 ```
 
-With `--snippet` — adds ±3 lines of context around the best-matching line:
+The heavy work (embedding) happens at index time; a query embeds one string and
+scans the stored vectors.
 
-```
-/home/user/projects/backend/src/auth/middleware.rs:42 (score: 0.943)
-    39: impl AuthMiddleware {
-    40:     pub fn new(secret: &str) -> Self {
->   42:     pub fn verify_token(req: &Request) -> Result<Claims, AuthError> {
-    43:         let token = req.headers().get("Authorization")
-    44:             .and_then(|v| v.to_str().ok())
-    45:             .ok_or(AuthError::Missing)?;
-```
+## Scope
 
----
+In: semantic search over local text files for shells, editors and AI agents
+(MCP); system-wide and per-user installs; incremental and real-time indexing;
+distro packaging.
 
-## Architecture
+Out (for now): language-aware parsing (tree-sitter), hosted/remote indexes,
+non-Linux platforms as tested targets. See [TODO.md](TODO.md).
 
-Mirrors `locate` in structure, diverges on one critical point: **the DB never stores code text**.
-
-| locate               | vec                    | purpose                               |
-|----------------------|------------------------|---------------------------------------|
-| `updatedb`           | `vec updatedb`         | rebuild/update the index              |
-| `mlocate.db`         | `vec.db`               | central index (vectors + paths only)  |
-| `/etc/updatedb.conf` | `/etc/vec.conf`        | what to index, what to skip           |
-| cron job             | systemd unit           | keep index fresh automatically        |
-
-`locate` is safe to share because it only stores paths, not content. `vec` achieves the same property by storing **only embeddings and byte offsets** — never the source text. Snippets are read from the live filesystem on demand. Stealing the DB gives you vectors and paths. Useless without the source files.
-
-### Database Schema
-
-```sql
-CREATE TABLE meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-    -- stores: model_name, model_sha256, embedding_dim
-    -- vec refuses to search if model_name != configured model
-);
-
-CREATE TABLE files (
-    id      INTEGER PRIMARY KEY,
-    path    TEXT UNIQUE NOT NULL,
-    mtime   REAL NOT NULL,
-    hash    TEXT NOT NULL      -- sha256, skip re-embedding if unchanged
-);
-
-CREATE TABLE chunks (
-    id           INTEGER PRIMARY KEY,
-    file_id      INTEGER REFERENCES files(id) ON DELETE CASCADE,
-    byte_offset  INTEGER NOT NULL,  -- start byte in file
-    byte_end     INTEGER NOT NULL,  -- end byte in file
-    start_line   INTEGER NOT NULL,
-    end_line     INTEGER NOT NULL,
-    embedding    BLOB NOT NULL      -- float32[N], little-endian; N from meta.embedding_dim
-    -- NO content column — text is read from the live file on demand
-);
-
-CREATE INDEX idx_chunks_file ON chunks(file_id);
-```
-
-### Deployment
-
-Central system-wide DB:
-
-```
-/var/lib/vec/vec.db   chmod 644, owned by root
-```
-
-The CLI reads the DB directly. `access(path, R_OK)` is called on every result before display — enforces per-user file visibility at query time with no daemon or separate ACL.
-
----
-
-## Project Layout
-
-```
-vec/
-├── Cargo.toml
-├── Cargo.lock
-├── src/
-│   ├── vec-core/       # Config, util, load_embedder
-│   ├── vec-embed/      # ONNX inference (tract, tokenizer, rayon)
-│   ├── vec-store/      # SQLite, cosine similarity search
-│   ├── vec-index/      # File walker, chunker, incremental indexer, diff
-│   ├── vec-watch/      # inotify real-time watcher
-│   ├── vec-daemon/     # Unix socket embedding daemon
-│   ├── vec-mcp/        # MCP server: search, context, index_status
-│   └── vec-cli/        # Clap CLI — all subcommands
-├── contrib/
-│   ├── vec.conf               # /etc/vec.conf template (all defaults commented)
-│   ├── vec-updatedb.service   # systemd oneshot service
-│   ├── vec-updatedb.timer     # daily timer (Persistent=true)
-│   ├── vec-watch.service      # inotify real-time watcher service
-│   ├── 99-vec.conf            # sysctl: inotify watch limit
-│   ├── vec.spec               # RPM spec (binary)
-│   ├── vec-model-base.spec    # RPM spec (base model package)
-│   └── debian/                # Debian packaging
-├── README.md           # Quick start, usage, schema overview, crate dependencies
-├── ARCHITECTURE.md     # Core design decisions and data flow
-├── SECURITY.md         # Security model: no-content DB, access() ACL, threat analysis
-├── CONTRIBUTING.md     # Dev setup, tests, project structure, invariants
-├── TESTING.md          # Test strategy, coverage table, known gaps, test conventions
-├── CONFIG.md           # Full /etc/vec.conf reference with all settings and recipes
-├── AI-INTEGRATION.md   # AI assistant integration (MCP server, Claude Code skill, hooks)
-├── PACKAGING.md        # Guide for distro packagers (Debian/RPM/BSD, system-sqlite)
-├── CHANGELOG.md        # Version history following Keep a Changelog
-└── PROJECT.md          # Project positioning, mental model, and MVP scope
-```
-
----
-
-## Config
-
-`/etc/vec.conf` — mirrors `/etc/updatedb.conf` in spirit
-
-```toml
-[embed]
-# model   = "gte-multilingual-base"        # short name resolved via model_search_path
-# model_search_path = ["/usr/share/vec/models"]
-# batch_size = 16
-# max_tokens = 128
-
-[index]
-# chunk_size    = 40
-# chunk_overlap = 10
-# include_paths = ["/"]
-# exclude_dirs  = ["vendor", "third_party"]   # appends to compiled defaults
-# exclude_files = ["*.generated.ts"]          # appends to compiled defaults
-
-[database]
-# db_path = "/var/lib/vec/vec.db"
-# wal     = true
-```
-
----
-
-## Embedding Backend
-
-Runs ONNX models in-process via `tract-onnx` (pure Rust, no C deps, no system libs, no network calls). Text never leaves the process — unless `backend = "ollama"` is explicitly configured.
-
-| Package | Model | Size | Languages |
-|---------|-------|------|-----------|
-| `vec-model-base` | `gte-multilingual-base` | ~90 MB | 50+ |
-
----
-
-## Crate Dependencies
-
-```toml
-[dependencies]
-clap         = { version = "4", features = ["derive"] }      # CLI
-rusqlite     = { version = "0.31", features = ["bundled"] }  # SQLite (or system)
-tokenizers   = "0.21"                                        # HuggingFace tokenizers
-serde        = { version = "1", features = ["derive"] }
-serde_json   = "1"
-toml         = "0.8"
-ignore       = "0.4"    # gitignore-aware walker (ripgrep's engine)
-sha2         = "0.10"
-hex          = "0.4"
-rmcp         = { version = "0.3", features = ["server", "transport-io"] }
-tokio        = { version = "1", features = ["rt-multi-thread", "macros"] }
-anstream     = "0.6"
-anyhow       = "1"
-dirs         = "5"
-notify       = "6"      # inotify-based real-time watching
-tract-onnx   = "0.21"   # pure-Rust ONNX inference (no C deps)
-ndarray      = "0.17"
-
-[target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["user", "fs"] }  # access() syscall
-
-[features]                           # vec-store; exactly one must be enabled
-default        = ["bundled-sqlite"]
-bundled-sqlite = ["rusqlite/bundled"]
-system-sqlite  = []                 # link against system libsqlite3 (distro builds, --no-default-features)
-```
-
----
-
-## MVP Scope
-
-- [x] `src/store.rs` — SQLite schema (no content col) + cosine similarity
-- [x] `src/embed.rs` — tract-onnx CPU inference (local ONNX, no HTTP backend)
-- [x] `src/index.rs` — file walker + chunker + gitignore filter + hash-based incremental
-- [x] `src/main.rs` — `vec`, `vec updatedb`, `vec status`, `vec model download`, `vec watch`, `vec serve`
-- [x] `src/config.rs` — TOML config with compiled-in defaults
-- [x] `src/watch.rs` — inotify watcher with debounce
-- [x] `src/mcp.rs` — MCP server with `search`, `context`, `index_status`
-- [x] `Cargo.toml` — features (system-sqlite)
-- [x] `contrib/` — systemd units, sysctl, RPM spec skeleton, Debian skeleton
-- [x] `README.md` — quick start and usage guide
+Where to go next: [README.md](README.md) (usage), [ARCHITECTURE.md](ARCHITECTURE.md),
+[SECURITY.md](SECURITY.md).

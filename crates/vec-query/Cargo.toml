@@ -1,0 +1,25 @@
+[package]
+name = "vec-query"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "vec read side shared by the CLI and the MCP server: search, ranking, status"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vec-core  = { path = "../vec-core" }
+vec-embed = { path = "../vec-embed" }
+vec-store = { path = "../vec-store", default-features = false }
+vec-index = { path = "../vec-index" }
+vec-watch = { path = "../vec-watch" }
+anyhow    = "1"
+anstream  = "0.6"
+serde     = { version = "1", features = ["derive"] }
+
+[target.'cfg(unix)'.dependencies]
+vec-daemon = { path = "../vec-daemon" }
+
+[dev-dependencies]
+vec-store = { path = "../vec-store", features = ["bundled-sqlite"] }
+tempfile  = "3"

@@ -2,7 +2,7 @@ Name:           vec
 Version:        0.1.0
 Release:        1%{?dist}
 Summary:        Semantic file search — find files by meaning
-License:        MIT OR Apache-2.0
+License:        MIT
 URL:            https://github.com/kvzp/vec
 Source0:        %{name}-%{version}.tar.gz
 
@@ -45,33 +45,40 @@ install -D -m 0644 contrib/vec-updatedb.timer \
     %{buildroot}%{_unitdir}/vec-updatedb.timer
 install -D -m 0644 contrib/vec-watch.service \
     %{buildroot}%{_unitdir}/vec-watch.service
+# Optional embedding daemon (socket-activated): shipped disabled
+install -D -m 0644 contrib/vec-embed.service \
+    %{buildroot}%{_unitdir}/vec-embed.service
+install -D -m 0644 contrib/vec-embed.socket \
+    %{buildroot}%{_unitdir}/vec-embed.socket
 
 # sysctl: raise inotify watch limit for real-time indexing
 install -D -m 0644 contrib/99-vec.conf \
     %{buildroot}%{_prefix}/lib/sysctl.d/99-vec.conf
 
-# Doc
-install -d %{buildroot}%{_docdir}/vec
+# Userland units for users to copy, shipped as %doc (-> %{_pkgdocdir}/contrib/user).
+# Defaults and file locations are compiled in: nothing else to install.
+mkdir -p userdoc/contrib && cp -pr contrib/user userdoc/contrib/
 
 %post
 %systemd_post vec-updatedb.timer vec-watch.service
 
 %preun
-%systemd_preun vec-updatedb.timer vec-watch.service
+%systemd_preun vec-updatedb.timer vec-watch.service vec-embed.socket vec-embed.service
 
 %postun
-%systemd_postun_with_restart vec-watch.service
+%systemd_postun_with_restart vec-watch.service vec-embed.service
 
 %files
-%license LICENSE-MIT LICENSE-APACHE
-%doc README.md
+%license LICENSE
+%doc README.md userdoc/contrib
 %{_bindir}/vec
 %config(noreplace) %{_sysconfdir}/vec.conf
 %{_unitdir}/vec-updatedb.service
 %{_unitdir}/vec-updatedb.timer
 %{_unitdir}/vec-watch.service
+%{_unitdir}/vec-embed.service
+%{_unitdir}/vec-embed.socket
 %{_prefix}/lib/sysctl.d/99-vec.conf
-%dir %{_docdir}/vec
 
 %changelog
 * Tue Mar 03 2026 Gilles <gdevos@gmail.com> - 0.1.0-1

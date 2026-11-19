@@ -1,300 +1,139 @@
 # Packaging Guide
 
-This document is for Linux distribution packagers. It covers everything needed to produce correct, well-integrated packages for `vec`.
+For distribution packagers. Ready-made files: `contrib/debian/`, `contrib/vec.spec`,
+`contrib/vec-model-base.spec`.
 
----
+## Package split
 
-## Package Split
-
-vec ships as **two or three packages**:
-
-| Package | Content | Type |
+| Package | Content | Arch |
 |---------|---------|------|
-| `vec` | Binary, systemd units, sysctl config, `/etc/vec.conf` | Architecture-dependent |
-| `vec-model-base` | `gte-multilingual-base` ONNX + tokenizer (~90MB, 50+ languages) | Architecture-independent (noarch/all) |
+| `vec` | binary, systemd units, sysctl drop-in, `/etc/vec.conf`, userland units as docs | any |
+| `vec-model-base` | `gte-multilingual-base` int8 ONNX + `tokenizer.json` (~90 MB) | all / noarch |
 
-`vec` recommends `vec-model-base`. The package is optional — `vec` works without it if you point `model` at an absolute path to a custom ONNX file.
-
-This mirrors how other data-heavy tools are packaged: `tesseract-ocr` + language packs, `hunspell` + dictionaries.
-
----
+`vec` recommends `vec-model-base` (users may instead point `[embed] model` at
+any ONNX file, or use the HTTP backend).
 
 ## Building `vec`
 
-### Build dependencies
-
-| Distro | Packages |
-|--------|---------|
+| Distro | Build dependencies |
+|--------|--------------------|
 | Debian / Ubuntu | `cargo`, `rustc`, `libsqlite3-dev`, `pkg-config` |
 | Fedora / RHEL | `cargo`, `rust`, `sqlite-devel`, `pkg-config` |
 | Arch | `rust`, `sqlite`, `pkg-config` |
 
-**Rust ≥ 1.89** is required (`rust-version` in `Cargo.toml`). Debian 13 (trixie) ships `rustc` 1.85, which is too old: use a newer toolchain (rustup, or a backport) on that release.
-
-No `protobuf-compiler`. No Python. No HuggingFace tooling. No network access at build time.
-
-### Build command
+**Rust ≥ 1.89** (`rust-version` in `Cargo.toml`); Debian 13 ships 1.85, so use a
+newer toolchain there. No Python, no protoc, no network at build time beyond
+fetching crates.
 
 ```bash
 cargo build --release -p vec-cli --no-default-features --features system-sqlite
+ldd target/release/vec | grep sqlite      # must list libsqlite3.so.0
 ```
 
 | Feature | Effect |
 |---------|--------|
-| `bundled-sqlite` (default) | Compiles SQLite into the binary. For development and binary releases. |
-| `system-sqlite` | Links against the system `libsqlite3`, so the distro's SQLite security updates apply. **Required for distro packages.** Needs `--no-default-features`. |
+| `bundled-sqlite` (default) | SQLite compiled in; for development and binary releases |
+| `system-sqlite` | links the system `libsqlite3` so its security updates apply. **Use for distro packages** (needs `--no-default-features`) |
 
-Exactly one of the two must be enabled; the build fails with an explanatory error otherwise (for example `--features system-sqlite` without `--no-default-features`). Check the result with `ldd target/release/vec | grep sqlite`: a distro build lists `libsqlite3.so.0`.
+Exactly one must be enabled (compile error otherwise). SQLite ≥ 3.35 is required
+(`RETURNING`); CI also tests against Ubuntu 24.04's 3.45.1.
 
-`rusqlite` targets SQLite 3.45.3 or newer; vec's store tests also pass against Ubuntu 24.04's 3.45.1 (checked in CI).
+**Nothing else to install for configuration**: every default
+(`crates/vec-core/defaults.toml`) and the config file locations
+(`crates/vec-core/locations.toml`: `/etc/vec.conf`, the per-user path, the
+userland data paths, the sha256 cache) are compiled into the binary. To change
+a location (e.g. `/usr/local/etc/vec.conf` on BSD), edit `locations.toml` before
+building.
 
-### Installed files
+## Installed files (`vec`)
 
 ```
 /usr/bin/vec
-/etc/vec.conf                                 # from contrib/vec.conf (all defaults commented)
-/etc/systemd/system/vec-updatedb.service      # from contrib/vec-updatedb.service
-/etc/systemd/system/vec-updatedb.timer        # from contrib/vec-updatedb.timer
-/etc/systemd/system/vec-watch.service         # from contrib/vec-watch.service
-/etc/systemd/system/vec-embed.service         # from contrib/vec-embed.service (optional daemon)
-/etc/sysctl.d/99-vec.conf                     # from contrib/99-vec.conf (inotify limit)
-/usr/share/doc/vec/
+/etc/vec.conf                                   contrib/vec.conf (conffile)
+/usr/lib/systemd/system/vec-updatedb.service    enabled via the timer only
+/usr/lib/systemd/system/vec-updatedb.timer      enable + start
+/usr/lib/systemd/system/vec-watch.service       enable + start
+/usr/lib/systemd/system/vec-embed.socket        ship DISABLED (optional daemon)
+/usr/lib/systemd/system/vec-embed.service       ship DISABLED
+/usr/lib/sysctl.d/99-vec.conf                   inotify watch limit
+/usr/share/doc/vec/contrib/user/                userland units for users to copy
 ```
 
-Install the binary from `target/release/vec`.
-Install systemd units from `contrib/`.
-Install `/etc/vec.conf` from `contrib/vec.conf`.
+Runtime dependencies: `libsqlite3-0` (Debian), `sqlite-libs` (Fedora),
+`sqlite` (Arch). `/var/lib/vec` is created by `StateDirectory=vec`.
 
-### Runtime dependencies
+## Service policy
 
-| Distro | Packages |
-|--------|---------|
-| Debian / Ubuntu | `libsqlite3` |
-| Fedora / RHEL | `sqlite-libs` |
-| Arch | `sqlite` |
+- **Enable** `vec-updatedb.timer` (daily, `Persistent=true`) and `vec-watch.service`.
+- **Do not enable or start** `vec-updatedb.service` (the timer runs it) or
+  `vec-embed.socket` / `vec-embed.service`. The daemon holds the model in RAM
+  (150–300 MB) while running; users opt in with
+  `systemctl enable --now vec-embed.socket`. Queries work identically without it.
+- `vec-watch.service` supports `systemctl reload` (SIGHUP re-reads the config).
+- The units are hardened (see [SECURITY.md](SECURITY.md)); keep them as shipped.
+  In particular do not add `PrivateTmp=` to the indexer units.
+- `contrib/debian/rules` does this with `dh_installsystemd` overrides;
+  `contrib/vec.spec` with `%systemd_post` for the timer and watcher only.
 
-`vec` does **not** hard-depend on a model package — users may point `model` at an absolute path to a custom ONNX file in `/etc/vec.conf`.
+## Upgrades
 
----
+- **From 0.1.x:** the index must be rebuilt. Old versions stored wrong vectors
+  and an older schema; until `vec updatedb --full` has run, queries fail with a
+  model-mismatch error and `vec-watch` fails at start-up. Tell users (NEWS /
+  release notes), or run it from the maintainer script on upgrade from < 0.2 in
+  the background, as `vec-model-base` does on model changes. See
+  [README.md](README.md#upgrading) and [CHANGELOG.md](CHANGELOG.md).
+- **Schema upgrades** happen in place the first time a writer opens the index;
+  running `vec updatedb` once before restarting the services avoids services
+  waiting on each other (`[database] migration_wait_ms`).
+- **Daemon protocol v2:** restart `vec-embed.service` on upgrade (the spec's
+  `%systemd_postun_with_restart` does); an old daemon is not used by new clients.
 
 ## Building `vec-model-base`
 
-This package contains pre-built ONNX model files. There is **no compilation step**.
-
-### Source
-
-Download from the vec GitHub Releases page (pinned, versioned, checksummed):
-
-```
-https://github.com/kvzp/vec/releases/download/model-base-v<VERSION>/gte-multilingual-base.tar.gz
-```
-
-Contents:
-- `model_int8.onnx` — int8-quantized ONNX, ~90MB
-- `tokenizer.json` — HuggingFace tokenizer config
-
-Verify the SHA-256 checksum published alongside the release.
-
-### Installed files
+No compilation. Package `model_int8.onnx` and `tokenizer.json` from the
+upstream model repository (the URLs are `[embed] model_download_url` /
+`model_download_files` in `defaults.toml`; `vec model download` prints them),
+pinned by checksum, into:
 
 ```
 /usr/share/vec/models/gte-multilingual-base/model_int8.onnx
 /usr/share/vec/models/gte-multilingual-base/tokenizer.json
 ```
 
-### Notes
+The directory name must match `[embed] model`. Versioned independently of
+`vec`. The model's sha256 is part of the index identity: after a model upgrade
+the index must be rebuilt (`vec updatedb --full`), which the provided
+postinst/posttrans start in the background.
 
-- `noarch` / `all` — ONNX runs on any architecture vec supports.
-- Independent version from the `vec` binary.
-- The directory name must match the `model` setting in `/etc/vec.conf` (default: `gte-multilingual-base`).
-
----
-
-## Post-Install Setup
-
-### `vec` postinst
-
-Enable the systemd services for automatic indexing:
+## Verify
 
 ```bash
-# Enable daily timer (reconciliation + first run at next boot if missed)
-systemctl enable vec-updatedb.timer || true
-systemctl start  vec-updatedb.timer || true
-
-# Enable real-time watcher
-systemctl enable vec-watch.service || true
-systemctl start  vec-watch.service || true
-
-# Raise inotify watch limit
-sysctl --system || true
-
-# DO NOT enable vec-embed.service here. It is optional — see below.
-```
-
-With `Persistent=true` in the timer unit, the first `vec updatedb` run fires at next boot even if the timer was not running when first due.
-
----
-
-## Optional: Embedding Daemon (`vec-embed.service`)
-
-**`vec-embed.service` must NOT be auto-enabled by the package installer.**
-
-Ship it installed but disabled. Users enable it explicitly if they want it.
-
-### What it does
-
-`vec daemon` loads the ONNX model once and keeps the compiled graph in
-resident memory, serving embed requests over `/run/vec/embed.sock`.
-`vec <query>` tries the socket first (near-instant) and silently falls back
-to in-process model loading if the socket is absent — **no change in
-behaviour either way**.
-
-### The cost
-
-| | Without daemon | With daemon |
-|--|--|--|
-| `vec "query"` startup | 2–5 s (model compile) | ~50 ms (socket) |
-| Permanent RAM | 0 MB | **150–300 MB** |
-
-### Who should enable it
-
-Only users who:
-1. Run `vec <query>` interactively many times per day, **and**
-2. Have RAM to spare (150–300 MB permanently resident is acceptable)
-
-**Do not enable on:** servers with tight memory budgets, containers,
-systems where `vec` is used only occasionally.
-
-### User instructions
-
-```bash
-# Enable
-sudo systemctl enable --now vec-embed.service
-
-# Disable
-sudo systemctl disable --now vec-embed.service
-```
-
----
-
-## System Configuration
-
-`/etc/vec.conf` is installed with all settings commented out. Packagers may uncomment and adjust defaults appropriate for their distribution. Do not hardcode values that users may need to override.
-
----
-
-## Verifying the Package
-
-After installing, verify end-to-end:
-
-```bash
-# Binary in place
 vec --version
-
-# Model found (or HTTP backend configured)
-vec status
-
-# Manual index
-vec updatedb
-
-# Search
+vec doctor            # config, model, index, daemon; exit 1 on a problem
+sudo vec updatedb
 vec "hello world"
 ```
 
-`vec status` will report `model not found` if the model directory is missing.
+## BSD
 
----
+Portable code paths are `cfg`-gated; not yet tested on BSD. Build with the same
+command (`lang/rust`, `databases/sqlite3`, `devel/pkgconf`). Set the BSD
+locations in `locations.toml` (`/usr/local/etc/vec.conf`) and the defaults in
+the shipped `vec.conf` (`db_path = "/var/db/vec/vec.db"`,
+`model_search_path = ["/usr/local/share/vec/models"]`). Use cron instead of
+systemd: `@daily nice -n 19 vec updatedb`. `vec watch` uses kqueue through the
+`notify` crate (untested).
 
-## BSD Packaging
-
-vec is BSD-compatible. Portability differences are handled via conditional compilation — no patches needed.
-
-### FreeBSD Ports
-
-Build deps: `lang/rust`, `databases/sqlite3`, `devel/pkgconf`
-
-```bash
-cargo build --release -p vec-cli --no-default-features --features system-sqlite
-```
-
-Install prefix: `/usr/local/`
+## `contrib/` layout
 
 ```
-/usr/local/bin/vec
-/usr/local/etc/vec.conf
-/usr/local/share/vec/models/
-/usr/local/share/doc/vec/
+vec.conf                      /etc/vec.conf template (hand-maintained; a test checks it is a valid layer)
+vec-updatedb.{service,timer}  daily index + gc
+vec-watch.service             real-time watcher
+vec-embed.{socket,service}    optional socket-activated embedding daemon
+user/                         the same units for systemd --user (%h paths, socket mode 0600)
+99-vec.conf                   sysctl: fs.inotify.max_user_watches
+vec.spec, vec-model-base.spec RPM
+debian/                       Debian (both packages)
 ```
-
-Data directory: `/var/db/vec/` (BSD convention; configure via `/usr/local/etc/vec.conf`).
-
-`vec-model-en` and `vec-model-multilingual` are separate ports under `textproc/`.
-
-### OpenBSD Ports
-
-Build deps: `lang/rust`, `databases/sqlite3`
-
-```bash
-cargo build --release -p vec-cli --no-default-features --features system-sqlite
-```
-
-Notes:
-- No `ionice` equivalent — IO scheduling config is silently ignored
-- No per-process CPU affinity — silently ignored
-
-### BSD automatic indexing
-
-Use crontab instead of systemd:
-
-```cron
-@hourly  nice -n 19 vec updatedb 2>/dev/null
-```
-
-Or a per-user `periodic` entry on FreeBSD.
-
-### BSD file path summary
-
-| Path | Linux | BSD |
-|------|-------|-----|
-| Binaries | `/usr/bin/` | `/usr/local/bin/` |
-| Config | `/etc/vec.conf` | `/usr/local/etc/vec.conf` |
-| Models | `/usr/share/vec/models/` | `/usr/local/share/vec/models/` |
-| DB | `/var/lib/vec/vec.db` | `/var/db/vec/vec.db` |
-| Init | systemd units | crontab / periodic |
-
----
-
-## Contributor Packaging Files
-
-Ready-to-use packaging templates in `contrib/`:
-
-```
-contrib/
-├── vec.conf                   # /etc/vec.conf template
-├── vec-updatedb.service       # systemd oneshot service (system)
-├── vec-updatedb.timer         # daily timer (system)
-├── vec-watch.service          # inotify real-time watcher (system)
-├── vec-embed.service          # persistent embedding daemon (system, optional)
-├── user/                      # systemd user units (userland install)
-│   ├── vec-updatedb.service   # oneshot indexer — uses %h for $HOME paths
-│   ├── vec-updatedb.timer     # daily timer
-│   ├── vec-watch.service      # inotify real-time watcher
-│   └── vec-embed.service      # persistent embedding daemon (optional)
-├── 99-vec.conf                # sysctl inotify limit
-├── vec.spec                   # RPM spec (binary)
-├── vec-model-base.spec        # RPM spec (base model package)
-└── debian/                    # Debian packaging for all packages
-```
-
-### Userland systemd units (`contrib/user/`)
-
-These are **not installed by the package** — they are for users who install vec without root (see `vec init --user`). Users copy them manually into `~/.config/systemd/user/`.
-
-Key differences from the system units:
-- `WantedBy=default.target` instead of `multi-user.target`
-- Binary path: `%h/.local/bin/vec` (systemd expands `%h` to `$HOME`)
-- Config: `--config %h/.config/vec/config.toml`
-- No `RuntimeDirectory` (socket lives in `~/.local/share/vec/`)
-- Timer uses `Persistent=true` — fires at next login if the user was logged out when the timer was due
-
-Packagers should ship these files in `/usr/share/doc/vec/contrib/user/` so users can find and copy them.

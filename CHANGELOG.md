@@ -9,9 +9,31 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+Audit of 2026-11-19 ([tasks/audit-2026-11-19.md](tasks/audit-2026-11-19.md)) and its review: correctness, robustness and security fixes across every crate.
+
+### Breaking — read before upgrading
+
+- **Rebuild the index: `sudo vec updatedb --full`.** Earlier versions read the ONNX model's first output (`token_embeddings`) as if it were the pooled `sentence_embedding`, so `gte-multilingual-base` indexes hold wrong 128-dimension vectors. The model output is now chosen by name. Until the rebuild, queries and incremental updates stop with a "model mismatch" error and `vec watch` does not start.
+- **Index schema version 1** (`PRAGMA user_version`): adds `files.size` and `chunks.text_hash`, stores vectors normalised, records the model identity (`model_name`, `embedding_dim`, `model_sha256`). The first writer upgrades an existing index in place in one transaction; queries cannot read an old index until then.
+- **Configuration is strict**: unknown keys and sections are errors in every layer; values are validated (`chunk_overlap < chunk_size`, absolute paths, ranges, timeout ordering, ...) and errors name the file that set the key. `embed_url` must start with `http://`. `[embed] daemon_socket` is deprecated (mapped to `[daemon] socket` with a warning, for one release). New sections and keys: [CONFIG.md](CONFIG.md).
+- **No silent stub embedder**: a model that cannot be loaded is an error (it used to index meaningless vectors).
+- **Daemon protocol v2** (handshake with model identity, batched requests). v1 daemons and clients are not compatible: restart `vec daemon` after upgrading. The socket setting moved from `[embed] daemon_socket` to `[daemon] socket`.
+- **MCP results**: `search` items gain `line` (best-matching line) next to `start_line`/`end_line`; `index_status` returns the full status report (`files`, `chunks`, `schema_version`, `index_model`, `configured_model`, `model_mismatch`, `last_updatedb`, `watcher`, `daemon`, ...) instead of `{file_count, chunk_count, db_path, model, model_found}`. See [AI-INTEGRATION.md](AI-INTEGRATION.md).
+- `vec model download` prints commands built from `[embed] model_download_url` / `model_download_files` (it never downloaded anything).
+
 ### Added
 
-- **Workspace split** — 8 crates: vec-core, vec-embed, vec-store, vec-index, vec-watch, vec-daemon, vec-mcp, vec-cli
+- `vec search` (explicit form), `--files-only`, `vec doctor`, `vec config show` (with provenance) / `vec config check [FILE]`, `vec status --daemon`, `--json` for `similar` and `explain`.
+- `vec status` / MCP `index_status`: model identity, schema, last `updatedb` run, watcher state (pending, overflows, rescans, reloads, last success/error).
+- MCP tools `similar` and `explain`; `search` takes `queries` and `exclude`; `index_status` takes `probe_daemon`.
+- `exclude_dirs` / `exclude_files`: `"!pattern"` removes a default.
+- Defaults in one embedded file (`crates/vec-core/defaults.toml`, also the source of `vec init`); config locations in `locations.toml`.
+- Incremental speed-ups: size+mtime skip before reading; per-chunk vector reuse by text hash; real batching (`[embed] onnx_batch_size`); batched HTTP requests (`http_concurrency`).
+- `vec watch`: `SIGHUP` reloads config and model (`ExecReload=` in the units).
+- Daemon: thread per connection (`max_connections`), systemd socket activation (`vec-embed.socket`, system and user), `idle_exit_secs`, hardened units.
+- New crate `vec-query`: one read path for the CLI and the MCP server.
+- [FAILURE-ZONE.md](FAILURE-ZONE.md): behaviour on every failure, and recovery.
+- **Workspace split** — 9 crates: vec-core, vec-embed, vec-store, vec-index, vec-watch, vec-daemon, vec-query, vec-mcp, vec-cli
 - **New subcommands:** `vec context`, `vec similar`, `vec repl`, `vec gc`, `vec explain`, `vec diff`, `vec completions`
 - **New flags:** `--json` (structured output), `--exclude` (filter directories)
 - **Multi-query search** — `vec "auth" "error handling"` merges and deduplicates results
@@ -30,6 +52,18 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Audit 2026-11-19:**
+  - indexing: writing a file is one transaction (`replace_file`); `--full` no longer empties the index first (only on a real model change, right before the first successful write); the chunker no longer drops a file's tail or leaves gaps; per-file embedding failures keep the old entry, and a probe text tells a down backend (run stops, nothing pruned) from a bad file; `vec diff` uses the indexer's walker and filters; nested include paths are embedded once; non-UTF-8 file names are skipped and counted; relative `--path` is normalised;
+  - symlink and race safety: the indexer opens files component by component with `O_NOFOLLOW` and checks device/inode against the walk, with `O_NONBLOCK` and a size cap; snippets, `context` and MCP reads never follow symlinks and are capped;
+  - queries: no panics on stale offsets, shrunk files, UTF-8 boundaries or `context` past EOF; filters (path, excludes, readability) apply before the limit; the path filter respects directory boundaries (`/a` no longer matches `/abc`) and no longer mis-escapes GLOB characters; the store is opened read-only; the model is loaded once per process (repl, MCP); `vec … | head` exits quietly;
+  - model identity checked by every reader and writer; queries never hash the model file (sha256 cache in `~/.cache/vec/model-sha256.toml`);
+  - HTTP backend: status checked, chunked bodies decoded, non-numeric values rejected, connect timeout, URL path kept, no byte-slicing panics;
+  - daemon: per-request deadlines (`io_timeout_ms`) against slow or trickling clients, separate client `reply_timeout_ms`, request/text limits, immediate "busy" reply, safe stale-socket removal, accept backoff, no internal paths in client errors; queries fall back to in-process embedding with one warning line;
+  - `vec status` and MCP `index_status` no longer start a socket-activated daemon (`--daemon` / `probe_daemon` do);
+  - schema upgrades wait up to `[database] migration_wait_ms` for a lock instead of failing;
+  - `PrivateTmp=` removed from the indexer units (it made `/tmp` records disappear);
+  - MCP server honours `--config`, the backend, the daemon and `path_boost`; `context` is restricted to indexed files; `similar`/`explain` require read access;
+  - `vec init` escapes TOML strings; the private LAN address in a doc comment is gone.
 - **`vec watch` unbounded memory growth and starvation** (#2). Root cause: every flush re-walked all of `include_paths` and checked every database row once per changed directory, and the model was reloaded per directory, while an unbounded channel queued every event. Now:
   - scoped re-indexes (`vec watch`, `vec updatedb --path`) walk only the changed paths and prune only records under them, in one transaction;
   - the watcher drops events for excluded, hidden, gitignored and database paths before queueing them, and de-duplicates them into a bounded set;

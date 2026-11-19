@@ -1,61 +1,52 @@
-/// index.rs — file walker, chunker, and incremental indexing.
-///
-/// # Chunker
-///
-/// [`chunk_file`] splits a UTF-8 source file into overlapping windows sized by
-/// [`IndexConfig::chunk_size`]. Before committing each boundary it scans
-/// ±[`BOUNDARY_SCAN`] lines for a recognised function/class-start pattern and
-/// snaps to that line if found. Chunks with fewer than
-/// [`IndexConfig::min_chunk_lines`] non-blank lines are discarded.
-///
-/// # Incremental update
-///
-/// [`run_updatedb`] walks the configured include paths using the `ignore`
-/// crate (ripgrep's engine — respects .gitignore), skips unchanged files
-/// (sha256 hash comparison), re-embeds changed files in batches, and keeps
-/// the `files` / `chunks` tables consistent.
+//! vec-index — file walker, chunker and incremental indexer.
+//!
+//! # Chunker
+//!
+//! [`chunk_file`] splits a UTF-8 file into overlapping windows of
+//! [`IndexConfig::chunk_size`] lines that share about
+//! [`IndexConfig::chunk_overlap`] lines. Each window end and each window start
+//! may move up to [`IndexConfig::boundary_scan`] lines to land on a line that starts
+//! with one of [`IndexConfig::boundary_patterns`] (a function or class header), so
+//! chunks tend to begin at a definition. Every line of the file belongs to at
+//! least one chunk; a window with fewer than
+//! [`IndexConfig::min_chunk_lines`] non-blank lines is merged into a neighbour
+//! instead of being dropped (a file with fewer such lines in total has no
+//! chunk).
+//!
+//! # Incremental update
+//!
+//! [`run_updatedb`] and [`update_paths`] walk the include paths with the
+//! `ignore` crate (ripgrep's walker, honours `.gitignore`). For each file the walk
+//! accepts:
+//!
+//! 1. unchanged size and mtime → skipped without reading;
+//! 2. the file is opened without following symlinks, checked on the open
+//!    handle and read with a size cap;
+//! 3. unchanged sha256 → only the stored size/mtime are refreshed;
+//! 4. otherwise it is chunked; a chunk whose text is already stored for that
+//!    file reuses its vector, the others are embedded in batches;
+//! 5. the file's record and all its chunks are replaced in one transaction.
+//!
+//! A file whose embedding fails is counted as an error and keeps its previous
+//! entry. After the walk, records the walk did not accept are pruned, so the
+//! index ends up as a fresh full run would leave it. [`diff_files`] uses the same
+//! walker and filters without writing anything.
+use std::cell::RefCell;
 use std::collections::HashSet;
+use std::ffi::OsString;
+use std::fs::File;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use anyhow::{Context, Result};
-use ignore::WalkBuilder;
+use anyhow::{Context, Result, anyhow, bail};
 use ignore::overrides::{Override, OverrideBuilder};
+use ignore::{DirEntry, WalkBuilder};
 use sha2::{Digest, Sha256};
 
-use vec_core::config::{Config, IndexConfig};
-use vec_embed::Embedder;
-use vec_store::{Store, is_gone};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// Scan window (±N lines) around a tentative boundary when looking for a
-/// better split point aligned to a function/class start.
-const BOUNDARY_SCAN: usize = 5;
-
-/// Line-start patterns that indicate good chunk-boundary candidates.
-///
-/// A line is a candidate when, after stripping leading whitespace, it starts
-/// with one of these strings.  The list covers Rust, Python, Go, JavaScript,
-/// TypeScript, C, and C++.
-const BOUNDARY_PATTERNS: &[&str] = &[
-    "fn ",
-    "pub fn ",
-    "async fn ",
-    "pub async fn ",
-    "impl ",
-    "pub impl ",
-    "pub struct ",
-    "pub enum ",
-    "mod ",
-    "pub mod ",
-    "def ",
-    "class ",
-    "func ",
-    "function ",
-];
+use vec_core::config::{Config, EmbedBackend, IndexConfig};
+use vec_embed::{Embedder, ModelIdentity};
+use vec_store::{FileRecord, ModelMismatch, NewChunk, Store, is_gone};
 
 // ---------------------------------------------------------------------------
 // Chunk
@@ -85,143 +76,108 @@ pub struct Chunk {
 
 /// Split `content` into overlapping [`Chunk`]s according to `cfg`.
 ///
-/// The algorithm:
+/// Windows are half-open line ranges `[start, end)`:
 ///
-/// 1. Split `content` into lines, accumulating cumulative byte offsets so we
-///    can map line numbers → byte positions in O(n).
-/// 2. Advance the chunk window in steps of `chunk_size - chunk_overlap`
-///    (i.e., 30 lines), capping at the end of the file.
-/// 3. Before committing each boundary, scan the ±[`BOUNDARY_SCAN`] lines
-///    around it for a line whose stripped content starts with a recognised
-///    keyword from [`BOUNDARY_PATTERNS`].  If found, snap the boundary there.
-/// 4. Skip chunks with fewer than `cfg.min_chunk_lines` non-blank lines.
+/// 1. a window ends `chunk_size` lines after its start, or at the end of the
+///    file, whichever comes first;
+/// 2. an end before the end of the file moves to the nearest line within
+///    ±`boundary_scan` that matches a boundary pattern (that line then starts
+///    the next window); the last window always reaches the end of the file;
+/// 3. the next window starts `chunk_overlap` lines before the end, also snapped
+///    to a boundary line, but always after the previous start and never after
+///    the previous end — so consecutive windows leave no gap;
+/// 4. a window with fewer than `min_chunk_lines` non-blank lines is merged into
+///    the previous chunk (or, if there is none yet, into the next one).
+///
+/// Hence every line is in a chunk unless the whole file has fewer than
+/// `min_chunk_lines` non-blank lines. `chunk_size = 0` (rejected by config
+/// validation) is treated as 1.
 pub fn chunk_file(content: &str, cfg: &IndexConfig) -> Vec<Chunk> {
-    // -----------------------------------------------------------------------
-    // Step 1: build a line table: line_starts[i] = byte offset of line i+1
-    // -----------------------------------------------------------------------
-    //
-    // We collect one entry per line: the byte offset where that line begins,
-    // and the length of the line in bytes (including the trailing '\n' if any).
-    //
-    // "line" here means the substring up to and including the '\n'.  The last
-    // line may not have a trailing newline.
-
-    struct LineInfo {
-        /// Byte offset of the first character on this line.
+    struct Line<'a> {
+        text: &'a str,
         byte_start: usize,
-        /// Number of bytes in this line (including '\n' if present).
-        byte_len: usize,
-        /// True if the line contains at least one non-whitespace character.
         non_blank: bool,
     }
 
-    let mut lines: Vec<LineInfo> = Vec::new();
+    let mut lines: Vec<Line<'_>> = Vec::new();
     let mut cursor = 0usize;
-    for line_str in content.split_inclusive('\n') {
-        let byte_len = line_str.len();
-        let non_blank = line_str.bytes().any(|b| !b.is_ascii_whitespace());
-        lines.push(LineInfo {
+    for text in content.split_inclusive('\n') {
+        lines.push(Line {
+            text,
             byte_start: cursor,
-            byte_len,
-            non_blank,
+            non_blank: text.bytes().any(|b| !b.is_ascii_whitespace()),
         });
-        cursor += byte_len;
+        cursor += text.len();
     }
-    // If content is empty, nothing to chunk.
-    let total_lines = lines.len();
-    if total_lines == 0 {
+    let total = lines.len();
+    if total == 0 {
         return Vec::new();
     }
 
-    // -----------------------------------------------------------------------
-    // Helper: does line at index `idx` start with a boundary pattern?
-    // -----------------------------------------------------------------------
-    let line_strs: Vec<&str> = content.split_inclusive('\n').collect();
-    let is_boundary = |idx: usize| -> bool {
-        if idx >= total_lines {
-            return false;
-        }
-        let s = line_strs[idx].trim_start();
-        BOUNDARY_PATTERNS.iter().any(|p| s.starts_with(p))
+    let is_boundary = |i: usize| {
+        let s = lines[i].text.trim_start();
+        cfg.boundary_patterns
+            .iter()
+            .any(|p| s.starts_with(p.as_str()))
+    };
+    // The boundary line nearest to `target` within ±boundary_scan and within
+    // [lo, hi] (the lower one on a tie), else `target` itself. Requires lo <= target <= hi.
+    let snap = |target: usize, lo: usize, hi: usize| -> usize {
+        let from = target.saturating_sub(cfg.boundary_scan).max(lo);
+        let to = target.saturating_add(cfg.boundary_scan).min(hi);
+        (from..=to)
+            .filter(|&i| is_boundary(i))
+            .min_by_key(|&i| i.abs_diff(target))
+            .unwrap_or(target)
     };
 
-    // -----------------------------------------------------------------------
-    // Step 2 & 3: emit chunks
-    // -----------------------------------------------------------------------
-    let step = cfg.chunk_size.saturating_sub(cfg.chunk_overlap).max(1);
-    let mut chunks: Vec<Chunk> = Vec::new();
-    let mut chunk_start_line = 0usize; // 0-based index into `lines`
-
-    while chunk_start_line < total_lines {
-        // Tentative end: chunk_size after start, clamped to file end.
-        let tentative_end = (chunk_start_line + cfg.chunk_size).min(total_lines);
-
-        // ----- boundary snapping -----
-        // Search ±BOUNDARY_SCAN around `tentative_end` for a better split.
-        // We only scan forward from (tentative_end - scan) to
-        // (tentative_end + scan), clamped to valid range.
-        //
-        // Preference: find the nearest matching line that is still ≥
-        // chunk_start_line + 1 (we need at least one line in the chunk).
-        let scan_lo = tentative_end
-            .saturating_sub(BOUNDARY_SCAN)
-            .max(chunk_start_line + 1);
-        let scan_hi = (tentative_end + BOUNDARY_SCAN).min(total_lines);
-
-        // Find the boundary-pattern line closest to tentative_end in [scan_lo, scan_hi).
-        let snapped_end = {
-            let mut best: Option<usize> = None;
-            let mut best_dist = usize::MAX;
-            for idx in scan_lo..scan_hi {
-                if is_boundary(idx) {
-                    let dist = idx.abs_diff(tentative_end);
-                    if dist < best_dist {
-                        best_dist = dist;
-                        best = Some(idx);
-                    }
-                }
-            }
-            // If snapping would push the end line *before* advancing the cursor
-            // at all, ignore it.
-            match best {
-                Some(b) if b > chunk_start_line => b,
-                _ => tentative_end,
-            }
-        };
-
-        let chunk_end_line = snapped_end; // exclusive
-
-        // ----- build chunk text and count non-blank lines -----
-        let byte_start = lines[chunk_start_line].byte_start;
-        let last = chunk_end_line - 1;
-        let byte_end = lines[last].byte_start + lines[last].byte_len;
-
-        let non_blank_count: usize = lines[chunk_start_line..chunk_end_line]
-            .iter()
-            .filter(|l| l.non_blank)
-            .count();
-
-        if non_blank_count >= cfg.min_chunk_lines {
-            let text = content[byte_start..byte_end].to_owned();
-            chunks.push(Chunk {
-                byte_offset: byte_start,
-                byte_end,
-                // Convert 0-based → 1-based for public API.
-                start_line: chunk_start_line + 1,
-                end_line: chunk_end_line, // chunk_end_line is the 1-based inclusive last line
-                text,
-            });
-        }
-
-        // Advance start by `step` lines; stop if we've covered the whole file.
-        let next_start = chunk_start_line + step;
-        if next_start >= total_lines {
+    // Step 1-3: covering windows.
+    let size = cfg.chunk_size.max(1);
+    let mut windows: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    loop {
+        let tentative = start + size;
+        if tentative >= total {
+            windows.push((start, total));
             break;
         }
-        chunk_start_line = next_start;
+        // At least one line in the window, and a next window remains.
+        let end = snap(tentative, start + 1, total - 1);
+        windows.push((start, end));
+        let target = end.saturating_sub(cfg.chunk_overlap).clamp(start + 1, end);
+        start = snap(target, start + 1, end);
     }
 
-    chunks
+    // Step 4: merge windows that are too sparse.
+    let non_blank = |s: usize, e: usize| lines[s..e].iter().filter(|l| l.non_blank).count();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut carry: Option<usize> = None;
+    for (s, e) in windows {
+        let s = carry.take().unwrap_or(s);
+        if non_blank(s, e) >= cfg.min_chunk_lines {
+            spans.push((s, e));
+        } else if let Some(last) = spans.last_mut() {
+            last.1 = e;
+        } else {
+            carry = Some(s);
+        }
+    }
+
+    spans
+        .into_iter()
+        .map(|(s, e)| {
+            let byte_offset = lines[s].byte_start;
+            let last = &lines[e - 1];
+            let byte_end = last.byte_start + last.text.len();
+            Chunk {
+                byte_offset,
+                byte_end,
+                start_line: s + 1,
+                end_line: e,
+                text: content[byte_offset..byte_end].to_owned(),
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -236,7 +192,6 @@ pub fn chunk_file(content: &str, cfg: &IndexConfig) -> Vec<Chunk> {
 ///
 /// Only the bare filename is matched — the directory portion is ignored.
 pub fn glob_match(pattern: &str, filename: &str) -> bool {
-    // Recursive implementation with memoisation avoided by using slices.
     fn inner(pat: &[u8], name: &[u8]) -> bool {
         match (pat.first(), name.first()) {
             (None, None) => true,
@@ -247,7 +202,6 @@ pub fn glob_match(pattern: &str, filename: &str) -> bool {
                 if inner(&pat[1..], name) {
                     return true;
                 }
-                // Try consuming one non-'/' character from name.
                 if name.first().is_some_and(|&c| c != b'/') {
                     inner(pat, &name[1..])
                 } else {
@@ -267,44 +221,59 @@ pub fn glob_match(pattern: &str, filename: &str) -> bool {
 // IndexStats
 // ---------------------------------------------------------------------------
 
-/// Summary of what [`run_updatedb`] did.
-#[derive(Debug, Default)]
+/// Summary of what [`run_updatedb`] or [`update_paths`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct IndexStats {
-    /// Total number of files visited by the walker.
+    /// Files the walk accepted (regular, UTF-8 name, not excluded, size in range).
     pub files_visited: usize,
-    /// Files that were re-embedded (new or changed).
+    /// Files whose entry was (re)written: new or changed.
     pub files_updated: usize,
-    /// Files skipped because their sha256 matched the stored hash.
+    /// Files whose content was unchanged (by size+mtime or by sha256).
     pub files_unchanged: usize,
-    /// Files removed from the DB because they no longer exist on disk.
+    /// Records pruned because the walk no longer accepts their file.
     pub files_deleted: usize,
-    /// Total number of chunks added to the database.
+    /// Chunks written for new or changed files.
     pub chunks_added: usize,
-    /// Number of files that produced errors (skipped, logged via `progress`).
+    /// Of [`IndexStats::chunks_added`], chunks whose vector was reused because
+    /// the same text was already stored for that file.
+    pub chunks_reused: usize,
+    /// Files skipped because their path is not valid UTF-8 (the index stores
+    /// UTF-8 paths).
+    pub files_skipped_non_utf8: usize,
+    /// Problems that skipped a file or directory (each reported through
+    /// `progress`); the previous entries of the files concerned are kept.
     pub errors: usize,
 }
 
 // ---------------------------------------------------------------------------
-// run_updatedb
+// run_updatedb / update_paths
 // ---------------------------------------------------------------------------
 
 /// Walk the configured paths, embed changed files, and update the store.
 ///
 /// # Arguments
 ///
-/// * `store`       — mutable reference to the open SQLite store.
-/// * `embedder`    — embedding engine (stub or real).
+/// * `store`       — the open store; its model identity must match
+///   `embedder`'s (recorded on a new index).
+/// * `embedder`    — embedding engine.
 /// * `cfg`         — full application config (paths, exclusions, batch size).
-/// * `full`        — if `true`, skip the sha256 check and re-embed every file.
-/// * `path_filter` — if `Some(p)`, only walk `p` and only prune records under
-///   `p` (see [`update_paths`]). Cost is proportional to the size of `p`.
-/// * `progress`    — callback invoked with human-readable status lines.
-///   Called for each file processed; the format is intentionally
-///   unstructured so callers can log, print, or discard it.
+/// * `full`        — re-embed every file, even unchanged ones. The old entries
+///   stay searchable until each file is rewritten; records the walk no longer
+///   accepts are pruned at the end. When the index was built by a different
+///   model, it is emptied right before the first file is written (so a model
+///   that cannot embed leaves it intact); this needs `path_filter = None`.
+/// * `path_filter` — only walk this path and only prune records under it (see
+///   [`update_paths`]). A relative path is resolved against the current
+///   directory, `..` is resolved lexically; a path outside every include path
+///   is reported through `progress` and indexes nothing.
+/// * `progress`    — receives human-readable status lines (one per file
+///   written, warnings prefixed with `warn:`).
 ///
-/// # Returns
+/// # Errors
 ///
-/// An [`IndexStats`] summarising the run.
+/// A store error, a model mismatch (without `full`), or a batch in which no
+/// file could be embedded (the backend is failing). Records written before
+/// the error stay; nothing is pruned.
 pub fn run_updatedb(
     store: &mut Store,
     embedder: &Embedder,
@@ -313,53 +282,28 @@ pub fn run_updatedb(
     path_filter: Option<&Path>,
     progress: impl Fn(&str),
 ) -> Result<IndexStats> {
-    if let Some(p) = path_filter {
-        let p = std::path::absolute(p)
-            .with_context(|| format!("resolving path filter {}", p.display()))?;
-        return update_paths_inner(store, embedder, cfg, full, &[p], &progress);
-    }
-
-    if cfg.index.include_paths.is_empty() {
-        progress("no include_paths configured; nothing to index");
-    }
-
-    // --full: wipe everything first and re-embed every file, so nothing
-    // stale can survive (also out-of-scope entries).
-    let mut cleared = 0;
-    if full {
-        cleared = store
-            .delete_all_files()
-            .context("clearing index for full re-index")?;
-        if cleared > 0 {
-            progress(&format!("cleared {cleared} entries for full re-index"));
+    let scopes = match path_filter {
+        Some(p) => Some(vec![resolve_path_filter(cfg, p, &progress)?]),
+        None => {
+            if cfg.index.include_paths.is_empty() {
+                progress("no include_paths configured; nothing to index");
+            }
+            None
         }
-    }
-
-    let mut seen = WalkSeen::default();
-    let mut stats = IndexStats::default();
-    for builder in scoped_walkers(cfg, None, &progress) {
-        stats.add(&index_walk(
-            &builder, store, embedder, cfg, full, &progress, &mut seen,
-        )?);
-    }
-
-    // Incremental: after the walk, drop every record the walk did not accept
-    // (deleted, now excluded, outside include_paths, binary, too large …).
-    // The walker is the single source of truth, so the index ends up exactly
-    // as a --full run would leave it.
-    stats.files_deleted = if full {
-        cleared
-    } else {
-        let n = store
-            .delete_files_where(None, |p| seen.is_stale(p))
-            .context("pruning stale files from store")?;
-        if n > 0 {
-            progress(&format!("pruned {n} stale files from index"));
-        }
-        n
     };
+    let stats = index_with(store, embedder, cfg, full, scopes.as_deref(), &progress)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    store
+        .set_meta(META_LAST_UPDATEDB, &now.to_string())
+        .context("recording the time of this run")?;
     Ok(stats)
 }
+
+/// Meta key holding the end time of the last successful [`run_updatedb`]
+/// (Unix seconds), shown by `vec status`.
+pub const META_LAST_UPDATEDB: &str = "updatedb.last_run";
 
 /// Re-index exactly the given paths (files or directories) — used by `vec watch`.
 ///
@@ -380,35 +324,801 @@ pub fn update_paths(
     paths: &[PathBuf],
     progress: impl Fn(&str),
 ) -> Result<IndexStats> {
-    update_paths_inner(store, embedder, cfg, false, paths, &progress)
+    index_with(store, embedder, cfg, false, Some(paths), &progress)
 }
 
-fn update_paths_inner(
+/// Embedding function used by a run: texts in, one vector per text out.
+type EmbedFn<'a> = dyn Fn(&[&str]) -> Result<Vec<Vec<f32>>> + 'a;
+
+/// Run an index pass with `embedder`, on a thread pool local to this run.
+fn index_with(
     store: &mut Store,
     embedder: &Embedder,
     cfg: &Config,
     full: bool,
-    paths: &[PathBuf],
+    scopes: Option<&[PathBuf]>,
     progress: &dyn Fn(&str),
 ) -> Result<IndexStats> {
-    let mut seen = WalkSeen::default();
-    let mut stats = IndexStats::default();
-    for builder in scoped_walkers(cfg, Some(paths), progress) {
-        stats.add(&index_walk(
-            &builder, store, embedder, cfg, full, progress, &mut seen,
-        )?);
+    let cache = vec_core::model_sha::ShaCache::for_user()?;
+    let identity = vec_core::model_sha::writer_identity(embedder, cache.as_ref())
+        .context("hashing the model file")?;
+    let threads = EmbedThreads::new(cfg)?;
+    let embed = |texts: &[&str]| match &threads.pool {
+        Some(pool) => pool.install(|| embedder.embed_batch(texts)),
+        None => embedder.embed_batch(texts),
+    };
+    let run = Run::new(
+        store,
+        identity,
+        &embed,
+        cfg,
+        threads.batch_size,
+        full,
+        scopes,
+        progress,
+    )?;
+    run.execute(scopes)
+}
+
+/// Where embedding work runs, and how many chunks one call receives.
+struct EmbedThreads {
+    /// ONNX: a pool sized by `[embed] index_threads` (0 = one thread per
+    /// core), built per run so a changed setting always applies. HTTP: none,
+    /// the server does the work.
+    pool: Option<rayon::ThreadPool>,
+    /// Chunks per embedding call: `[embed] batch_size` per thread.
+    batch_size: usize,
+}
+
+impl EmbedThreads {
+    fn new(cfg: &Config) -> Result<Self> {
+        match cfg.embed.backend {
+            EmbedBackend::Onnx => {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(cfg.embed.index_threads)
+                    .build()
+                    .context("starting the embedding threads")?;
+                let batch_size = cfg
+                    .embed
+                    .batch_size
+                    .saturating_mul(pool.current_num_threads());
+                Ok(Self {
+                    pool: Some(pool),
+                    batch_size,
+                })
+            }
+            EmbedBackend::Ollama => Ok(Self {
+                pool: None,
+                batch_size: cfg.embed.batch_size,
+            }),
+        }
     }
-    stats.files_deleted = store
-        .delete_files_where(Some(paths), |p| seen.is_stale(p))
-        .context("pruning stale files from store")?;
-    if stats.files_deleted > 0 {
-        progress(&format!(
-            "pruned {} stale files from index",
-            stats.files_deleted
+}
+
+/// Make a `--path` argument comparable with the walker's paths: absolute
+/// (against the current directory) with `.` and `..` resolved lexically.
+/// When that lies outside every include path but the canonical path (symlinks
+/// resolved) lies inside one, the canonical path is used. Outside both: a
+/// warning, and the lexical path (which then matches nothing).
+fn resolve_path_filter(cfg: &Config, p: &Path, progress: &dyn Fn(&str)) -> Result<PathBuf> {
+    let lexical = vec_core::util::absolute_lexical(p)
+        .with_context(|| format!("resolving path filter {}", p.display()))?;
+    let in_scope = |q: &Path| {
+        cfg.index
+            .include_paths
+            .iter()
+            .any(|root| q.starts_with(root) || root.starts_with(q))
+    };
+    if in_scope(&lexical) {
+        return Ok(lexical);
+    }
+    if let Ok(canonical) = std::fs::canonicalize(&lexical)
+        && in_scope(&canonical)
+    {
+        return Ok(canonical);
+    }
+    progress(&format!(
+        "warn: {} is outside every include path; nothing to index there",
+        lexical.display()
+    ));
+    Ok(lexical)
+}
+
+// ---------------------------------------------------------------------------
+// Run — one index pass
+// ---------------------------------------------------------------------------
+
+/// A file waiting for its missing vectors.
+struct PendingFile {
+    path: PathBuf,
+    mtime: f64,
+    size: u64,
+    hash: String,
+    /// Content unchanged: only size/mtime are refreshed (no stats counted).
+    refresh: bool,
+    chunks: Vec<Chunk>,
+    text_hashes: Vec<String>,
+    /// `Some` when reused from the index or already embedded.
+    vectors: Vec<Option<Vec<f32>>>,
+    reused: usize,
+}
+
+impl PendingFile {
+    fn missing_texts(&self) -> impl Iterator<Item = &str> {
+        self.chunks
+            .iter()
+            .zip(&self.vectors)
+            .filter(|(_, v)| v.is_none())
+            .map(|(c, _)| c.text.as_str())
+    }
+}
+
+/// Fill in the missing vectors of `files` with one call to `embed`.
+/// Returns how many texts were embedded.
+fn embed_missing(embed: &EmbedFn<'_>, files: &mut [PendingFile]) -> Result<usize> {
+    let vectors = {
+        let texts: Vec<&str> = files.iter().flat_map(PendingFile::missing_texts).collect();
+        if texts.is_empty() {
+            return Ok(0);
+        }
+        let vectors = embed(&texts)?;
+        if vectors.len() != texts.len() {
+            bail!(
+                "the embedder returned {} vectors for {} texts",
+                vectors.len(),
+                texts.len()
+            );
+        }
+        vectors
+    };
+    let n = vectors.len();
+    let mut it = vectors.into_iter();
+    for slot in files
+        .iter_mut()
+        .flat_map(|f| f.vectors.iter_mut())
+        .filter(|v| v.is_none())
+    {
+        *slot = it.next();
+    }
+    Ok(n)
+}
+
+struct Run<'a> {
+    store: &'a mut Store,
+    embed: &'a EmbedFn<'a>,
+    cfg: &'a Config,
+    progress: &'a dyn Fn(&str),
+    full: bool,
+    batch_size: usize,
+    db_files: Option<DbFiles>,
+    /// The model that computes this run's vectors (checked by the store on
+    /// every write).
+    identity: ModelIdentity,
+    /// A full run over an index built by another model: the index is emptied
+    /// and `identity` recorded right before the first write.
+    reset_pending: bool,
+    seen: WalkSeen,
+    stats: IndexStats,
+    pending: Vec<PendingFile>,
+    pending_chunks: usize,
+}
+
+impl<'a> Run<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        store: &'a mut Store,
+        identity: ModelIdentity,
+        embed: &'a EmbedFn<'a>,
+        cfg: &'a Config,
+        batch_size: usize,
+        full: bool,
+        scopes: Option<&[PathBuf]>,
+        progress: &'a dyn Fn(&str),
+    ) -> Result<Self> {
+        // Refuse to mix vectors of different models (a new index records it).
+        // Only a real model mismatch may lead to a reset: any other error (a
+        // busy database, an I/O error) stops the run with the index intact.
+        let mut reset_pending = false;
+        if let Err(e) = store.ensure_model(&identity) {
+            if !full || scopes.is_some() || !e.is::<ModelMismatch>() {
+                return Err(e.context("checking the index model"));
+            }
+            progress(&format!(
+                "{e:#}\nThe index is rebuilt with {identity}: it is emptied before the first \
+                 file is written."
+            ));
+            reset_pending = true;
+        }
+        Ok(Self {
+            store,
+            embed,
+            cfg,
+            progress,
+            full,
+            batch_size,
+            db_files: DbFiles::new(cfg),
+            identity,
+            reset_pending,
+            seen: WalkSeen::default(),
+            stats: IndexStats::default(),
+            pending: Vec::new(),
+            pending_chunks: 0,
+        })
+    }
+
+    /// Walk every scope, write what changed, then prune what the walk did
+    /// not accept.
+    fn execute(mut self, scopes: Option<&[PathBuf]>) -> Result<IndexStats> {
+        for builder in scoped_walkers(self.cfg, scopes, self.progress) {
+            self.walk(&builder)?;
+        }
+        self.flush()?;
+        if self.reset_pending {
+            // Nothing was written: the index still holds the old model's vectors.
+            self.reset()?;
+        }
+        let seen = &self.seen;
+        let pruned = self
+            .store
+            .delete_files_where(scopes, |p| seen.is_stale(p))
+            .context("pruning stale files from store")?;
+        if pruned > 0 {
+            (self.progress)(&format!("pruned {pruned} stale files from index"));
+        }
+        self.stats.files_deleted += pruned;
+        Ok(self.stats)
+    }
+
+    fn warn(&mut self, msg: &str) {
+        (self.progress)(&format!("warn: {msg}"));
+        self.stats.errors += 1;
+    }
+
+    fn walk(&mut self, builder: &WalkBuilder) -> Result<()> {
+        for result in builder.build() {
+            let entry = match result {
+                Ok(e) => e,
+                Err(e) => {
+                    // Vanished while walking (deleted or renamed): plain absence.
+                    if !is_not_found(&e) {
+                        self.warn(&format!("walk error: {e}"));
+                        self.seen.record_error(&e);
+                    }
+                    continue;
+                }
+            };
+            match accept(&entry, &self.cfg.index, self.db_files.as_ref()) {
+                Accept::Skip => {}
+                Accept::NonUtf8 => {
+                    self.stats.files_skipped_non_utf8 += 1;
+                    (self.progress)(&format!(
+                        "warn: skipping {}: the file name is not valid UTF-8",
+                        entry.path().display()
+                    ));
+                }
+                Accept::MetadataError(e) => {
+                    // Exists but cannot be inspected right now: keep its record.
+                    self.warn(&format!("metadata({}): {e}", entry.path().display()));
+                    self.seen.kept.insert(entry.into_path());
+                }
+                Accept::File(c) => self.index_file(c)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn index_file(&mut self, c: Candidate) -> Result<()> {
+        // Nested include paths: a file already handled by an earlier walk.
+        if self.seen.kept.contains(&c.path) {
+            return Ok(());
+        }
+        self.stats.files_visited += 1;
+
+        let record = if self.full {
+            None
+        } else {
+            self.store
+                .get_file(&c.path)
+                .with_context(|| format!("reading the index entry of {}", c.path.display()))?
+        };
+        if record.as_ref().is_some_and(|r| c.same_metadata(r)) {
+            self.stats.files_unchanged += 1;
+            self.seen.kept.insert(c.path);
+            return Ok(());
+        }
+
+        let text = match read_file(&c, &self.cfg.index) {
+            ReadOutcome::Text(t) => t,
+            // Binary, too large or small, gone, or no longer a regular file.
+            ReadOutcome::NotIndexable => return Ok(()),
+            ReadOutcome::Failed(e) => {
+                // Transient failure: keep the existing record.
+                self.warn(&format!("read({}): {e}", c.path.display()));
+                self.seen.kept.insert(c.path);
+                return Ok(());
+            }
+        };
+        let hash = sha256_hex(text.content.as_bytes());
+        let refresh = record.as_ref().is_some_and(|r| r.hash == hash);
+
+        let chunks = chunk_file(&text.content, &self.cfg.index);
+        if chunks.is_empty() {
+            return Ok(()); // not indexable: an existing record is pruned
+        }
+        let mut stored = match record {
+            Some(_) => self
+                .store
+                .embeddings_by_text_hash(&c.path)
+                .with_context(|| format!("reading the stored vectors of {}", c.path.display()))?,
+            None => Default::default(),
+        };
+        let text_hashes: Vec<String> = chunks
+            .iter()
+            .map(|ch| sha256_hex(ch.text.as_bytes()))
+            .collect();
+        let vectors: Vec<Option<Vec<f32>>> =
+            text_hashes.iter().map(|h| stored.get(h).cloned()).collect();
+        stored.clear();
+        let reused = vectors.iter().filter(|v| v.is_some()).count();
+
+        self.seen.kept.insert(c.path.clone());
+        self.pending_chunks += chunks.len();
+        self.pending.push(PendingFile {
+            path: c.path,
+            mtime: text.mtime,
+            size: text.size,
+            hash,
+            refresh,
+            chunks,
+            text_hashes,
+            vectors,
+            reused,
+        });
+        if self.pending_chunks >= self.batch_size {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Embed and write every pending file.
+    ///
+    /// When the batch call fails, each file is retried alone, so the failure
+    /// is attributed to the files that cause it: they count as errors and
+    /// keep their previous entry. When no file of the batch can be embedded,
+    /// a short probe text ([`vec_embed::PROBE_TEXT`]) tells a failing backend
+    /// (the probe fails too: the run stops) from files that cannot be
+    /// embedded (the probe works: they are errors and the run goes on), so a
+    /// single bad file alone in a batch cannot block indexing for good.
+    fn flush(&mut self) -> Result<()> {
+        let mut files = std::mem::take(&mut self.pending);
+        self.pending_chunks = 0;
+        if files.is_empty() {
+            return Ok(());
+        }
+        let batch_err = match embed_missing(self.embed, &mut files) {
+            Ok(_) => {
+                for f in files {
+                    self.write(f)?;
+                }
+                return Ok(());
+            }
+            Err(e) => e,
+        };
+
+        let mut failed = Vec::new();
+        let mut any_embedded = false;
+        for mut f in files {
+            let needed = f.missing_texts().next().is_some();
+            match embed_missing(self.embed, std::slice::from_mut(&mut f)) {
+                Ok(_) => {
+                    any_embedded |= needed;
+                    self.write(f)?;
+                }
+                Err(e) => failed.push((f.path, e)),
+            }
+        }
+        if !any_embedded && let Err(probe_err) = (self.embed)(&[vec_embed::PROBE_TEXT]) {
+            return Err(batch_err.context(format!(
+                "embedding failed for every file of a batch, and for a probe text too \
+                 ({probe_err:#}); is the embedding backend working?"
+            )));
+        }
+        for (path, e) in failed {
+            self.warn(&format!(
+                "embedding {}: {e:#}; its previous index entry is kept",
+                path.display()
+            ));
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.reset_pending = false;
+        let cleared = self.store.stats().context("reading index stats")?.0;
+        self.store
+            .reset_model(&self.identity)
+            .context("emptying the index for the new model")?;
+        (self.progress)(&format!(
+            "cleared {cleared} entries built by the previous model"
+        ));
+        Ok(())
+    }
+
+    fn write(&mut self, f: PendingFile) -> Result<()> {
+        if self.reset_pending {
+            self.reset()?;
+        }
+        let new_chunks: Vec<NewChunk> = f
+            .chunks
+            .iter()
+            .zip(f.text_hashes)
+            .zip(f.vectors)
+            .map(|((c, text_hash), v)| {
+                Ok(NewChunk {
+                    byte_offset: c.byte_offset,
+                    byte_end: c.byte_end,
+                    start_line: c.start_line,
+                    end_line: c.end_line,
+                    text_hash,
+                    embedding: v
+                        .ok_or_else(|| anyhow!("a chunk of {} has no vector", f.path.display()))?,
+                })
+            })
+            .collect::<Result<_>>()?;
+        self.store
+            .replace_file(
+                &self.identity,
+                &f.path,
+                f.mtime,
+                f.size,
+                &f.hash,
+                &new_chunks,
+            )
+            .with_context(|| format!("writing the index entry of {}", f.path.display()))?;
+
+        if f.refresh {
+            self.stats.files_unchanged += 1;
+            return Ok(());
+        }
+        self.stats.files_updated += 1;
+        self.stats.chunks_added += new_chunks.len();
+        self.stats.chunks_reused += f.reused;
+        let reused = match f.reused {
+            0 => String::new(),
+            n => format!(" ({n} reused)"),
+        };
+        (self.progress)(&format!(
+            "indexed {} chunks{reused} from {}",
+            new_chunks.len(),
+            f.path.display()
+        ));
+        Ok(())
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+// ---------------------------------------------------------------------------
+// Accepting and reading files (shared by indexing and diff_files)
+// ---------------------------------------------------------------------------
+
+/// A file the walk accepts, with its size, mtime and identity as seen by the
+/// walker (`lstat`, no symlink followed).
+struct Candidate {
+    path: PathBuf,
+    size: u64,
+    mtime: f64,
+    /// Device and inode (`None` where the platform has none).
+    id: Option<FileId>,
+}
+
+/// A file's identity on its filesystem: `(st_dev, st_ino)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    dev: u64,
+    ino: u64,
+}
+
+impl FileId {
+    #[cfg(unix)]
+    fn of(md: &std::fs::Metadata) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        Some(Self {
+            dev: md.dev(),
+            ino: md.ino(),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn of(_md: &std::fs::Metadata) -> Option<Self> {
+        None
+    }
+}
+
+impl Candidate {
+    /// A candidate from the walker's metadata of `path`.
+    fn new(path: &Path, md: &std::fs::Metadata) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            size: md.len(),
+            mtime: mtime_secs(md),
+            id: FileId::of(md),
+        }
+    }
+
+    /// Same size and mtime as when `record` was written: skipped unread. An
+    /// unknown mtime (0) or size never matches.
+    fn same_metadata(&self, record: &FileRecord) -> bool {
+        self.mtime > 0.0 && record.mtime == self.mtime && record.size == Some(self.size)
+    }
+}
+
+enum Accept {
+    /// Not a regular file, a database file, excluded by name, or size out of range.
+    Skip,
+    /// A regular file whose path is not valid UTF-8.
+    NonUtf8,
+    /// A regular file whose metadata could not be read (not "not found").
+    MetadataError(ignore::Error),
+    File(Candidate),
+}
+
+/// The filters applied to every walker entry, before reading it. The walker
+/// itself has already applied `.gitignore`, hidden files and `exclude_dirs`.
+fn accept(entry: &DirEntry, icfg: &IndexConfig, db_files: Option<&DbFiles>) -> Accept {
+    // Not a directory, symlink, device or FIFO. Symlinks are not followed
+    // (follow_links = false), so a link to a regular file is not a duplicate.
+    if !entry.file_type().is_some_and(|t| t.is_file()) {
+        return Accept::Skip;
+    }
+    let path = entry.path();
+    let Some(name) = path
+        .to_str()
+        .and_then(|_| path.file_name())
+        .and_then(|n| n.to_str())
+    else {
+        return Accept::NonUtf8;
+    };
+    if db_files.is_some_and(|d| d.contains(path)) {
+        return Accept::Skip;
+    }
+    if icfg.exclude_files.iter().any(|pat| glob_match(pat, name)) {
+        return Accept::Skip;
+    }
+    let md = match entry.metadata() {
+        Ok(md) => md,
+        Err(e) if is_not_found(&e) => return Accept::Skip,
+        Err(e) => return Accept::MetadataError(e),
+    };
+    let size = md.len();
+    if !md.is_file() || size > icfg.max_file_size || size < icfg.min_file_size {
+        return Accept::Skip;
+    }
+    Accept::File(Candidate::new(path, &md))
+}
+
+/// Seconds since the epoch, 0 when unknown.
+fn mtime_secs(md: &std::fs::Metadata) -> f64 {
+    md.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// A file's content, with the size and mtime of the open handle.
+struct FileText {
+    content: String,
+    size: u64,
+    mtime: f64,
+}
+
+enum ReadOutcome {
+    Text(FileText),
+    /// Not UTF-8, size out of range, gone, or not a regular file (any more).
+    NotIndexable,
+    /// Could not be read right now.
+    Failed(io::Error),
+}
+
+/// Read a candidate safely. The indexer may run as root over directories
+/// that users control, so a user must not be able to make it read another
+/// file than the one the walk accepted (e.g. by swapping one of their
+/// directories for a symlink to `/root` between the walk and the read):
+///
+/// - every path component below the include path is opened without following
+///   a symlink ([`open_no_follow`]): the walker never follows one, so a
+///   symlink there was swapped in after the walk and the path is not indexable;
+/// - the open handle must be the file the walker saw (same device and inode),
+///   else the file was replaced meanwhile: a transient failure, the record is
+///   kept and the next run reads the new file;
+/// - the last component is opened without blocking (a FIFO swapped in), the
+///   type and size are checked on the open handle, and at most
+///   `max_file_size + 1` bytes are read.
+fn read_file(c: &Candidate, icfg: &IndexConfig) -> ReadOutcome {
+    let file = match open_no_follow(&c.path, &icfg.include_paths) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound || is_symlink_error(&e) => {
+            return ReadOutcome::NotIndexable;
+        }
+        Err(e) => return ReadOutcome::Failed(e),
+    };
+    let md = match file.metadata() {
+        Ok(md) => md,
+        Err(e) => return ReadOutcome::Failed(e),
+    };
+    if let Some(walked) = c.id
+        && FileId::of(&md) != Some(walked)
+    {
+        return ReadOutcome::Failed(io::Error::other(
+            "the file was replaced after the walk saw it; it is read on the next run",
         ));
     }
-    Ok(stats)
+    let in_range = |n: u64| (icfg.min_file_size..=icfg.max_file_size).contains(&n);
+    if !md.is_file() || !in_range(md.len()) {
+        return ReadOutcome::NotIndexable;
+    }
+    let mut buf = Vec::with_capacity(usize::try_from(md.len()).unwrap_or_default());
+    if let Err(e) = file
+        .take(icfg.max_file_size.saturating_add(1))
+        .read_to_end(&mut buf)
+    {
+        return ReadOutcome::Failed(e);
+    }
+    // It may have grown or shrunk since the fstat.
+    if !u64::try_from(buf.len()).is_ok_and(in_range) {
+        return ReadOutcome::NotIndexable;
+    }
+    match String::from_utf8(buf) {
+        Ok(content) => ReadOutcome::Text(FileText {
+            content,
+            size: md.len(),
+            mtime: mtime_secs(&md),
+        }),
+        Err(_) => ReadOutcome::NotIndexable,
+    }
 }
+
+/// Open `path` for reading without following a symlink anywhere below its
+/// include path.
+///
+/// The include path (the longest of `include_paths` containing `path`; `/`
+/// when none does) is opened normally: it is the administrator's choice and
+/// may itself be or contain a symlink. Each component below it is then
+/// opened relative to its parent's descriptor with `O_NOFOLLOW`
+/// (`openat`), so no component can be redirected by a symlink, whichever
+/// one is swapped. The last component is also opened with `O_NONBLOCK` and
+/// `O_NOCTTY`.
+#[cfg(unix)]
+fn open_no_follow(path: &Path, include_paths: &[PathBuf]) -> io::Result<File> {
+    use nix::fcntl::{OFlag, open, openat};
+    use nix::sys::stat::Mode;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::path::Component;
+
+    fn owned(fd: nix::Result<RawFd>) -> io::Result<OwnedFd> {
+        let fd = fd.map_err(io::Error::from)?;
+        // SAFETY: `fd` was just returned by open(2)/openat(2): it is a valid
+        // descriptor that nothing else owns.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    let root = include_paths
+        .iter()
+        .filter(|r| path.starts_with(r))
+        .max_by_key(|r| r.components().count())
+        .map_or(Path::new("/"), PathBuf::as_path);
+    let below = path
+        .strip_prefix(root)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path is not absolute"))?;
+    let mut names = Vec::new();
+    for c in below.components() {
+        match c {
+            Component::Normal(name) => names.push(name),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "path is not in normal form (\".\" or \"..\")",
+                ));
+            }
+        }
+    }
+    let Some((name, dirs)) = names.split_last() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is an include path, not a file below one",
+        ));
+    };
+
+    let dir_flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+    let mut dir = owned(open(root, dir_flags, Mode::empty()))?;
+    for d in dirs {
+        dir = owned(openat(
+            Some(dir.as_raw_fd()),
+            *d,
+            dir_flags | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        ))?;
+    }
+    let file = owned(openat(
+        Some(dir.as_raw_fd()),
+        *name,
+        OFlag::O_RDONLY
+            | OFlag::O_NOFOLLOW
+            | OFlag::O_NONBLOCK
+            | OFlag::O_NOCTTY
+            | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ))?;
+    Ok(File::from(file))
+}
+
+#[cfg(not(unix))]
+fn open_no_follow(path: &Path, _include_paths: &[PathBuf]) -> io::Result<File> {
+    File::open(path)
+}
+
+/// `open` refused because a component is a symlink (`O_NOFOLLOW`: `ELOOP`)
+/// or no longer a directory (`ENOTDIR`): the path no longer leads, without
+/// symlinks, to a file.
+fn is_symlink_error(e: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        use nix::errno::Errno;
+        matches!(
+            e.raw_os_error().map(Errno::from_raw),
+            Some(Errno::ELOOP | Errno::ENOTDIR)
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = e;
+        false
+    }
+}
+
+/// The SQLite database and its side files (`-wal`, `-shm`, `-journal`):
+/// never indexed, and their events are dropped by [`IndexFilter`].
+struct DbFiles {
+    dir: PathBuf,
+    name: OsString,
+}
+
+/// Suffixes SQLite appends to the database file name for its side files.
+const SQLITE_SIDE_FILE_SUFFIXES: &[&str] = &["-wal", "-shm", "-journal"];
+
+impl DbFiles {
+    /// `None` for a database path without a directory and a name.
+    fn new(cfg: &Config) -> Option<Self> {
+        let db = &cfg.database.db_path;
+        let dir = db.parent().filter(|d| !d.as_os_str().is_empty())?;
+        Some(Self {
+            dir: dir.to_path_buf(),
+            name: db.file_name()?.to_os_string(),
+        })
+    }
+
+    fn contains(&self, path: &Path) -> bool {
+        if path.parent() != Some(self.dir.as_path()) {
+            return false;
+        }
+        let Some(name) = path.file_name() else {
+            return false;
+        };
+        let (name, db) = (name.as_encoded_bytes(), self.name.as_encoded_bytes());
+        name.strip_prefix(db).is_some_and(|rest| {
+            rest.is_empty()
+                || SQLITE_SIDE_FILE_SUFFIXES
+                    .iter()
+                    .any(|s| rest == s.as_bytes())
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Walkers
+// ---------------------------------------------------------------------------
 
 /// Visit every directory the indexer would descend into, equal to or under
 /// one of `paths`, using the real walker (see [`update_paths`]). For a
@@ -457,6 +1167,9 @@ pub fn visit_dirs(
 /// scope itself. That costs a directory listing per ancestor, but means the
 /// walker's own rules decide every ancestor — no re-implementation of
 /// `.gitignore` semantics that could disagree with a full run.
+///
+/// Fixed policy: hidden entries are skipped, symlinks are not followed, the
+/// global git excludes file is ignored (same result on every machine).
 fn scoped_walkers(
     cfg: &Config,
     scopes: Option<&[PathBuf]>,
@@ -466,10 +1179,9 @@ fn scoped_walkers(
     for root in &cfg.index.include_paths {
         let mut builder = WalkBuilder::new(root);
         builder.git_ignore(cfg.index.gitignore);
-        builder.git_global(false); // keep behaviour predictable across machines
+        builder.git_global(false);
         builder.git_exclude(cfg.index.gitignore);
         builder.overrides(exclude_override(&cfg.index, root, progress));
-        // Follow symlinks is intentionally false (default) — avoids infinite loops.
         builder.follow_links(false);
 
         if let Some(scopes) = scopes
@@ -530,7 +1242,7 @@ impl WalkSeen {
 /// The entry disappeared during the walk: not an error, just absence.
 fn is_not_found(e: &ignore::Error) -> bool {
     e.io_error()
-        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        .is_some_and(|io| io.kind() == io::ErrorKind::NotFound)
 }
 
 enum ErrScope {
@@ -596,305 +1308,23 @@ fn exclude_override(icfg: &IndexConfig, root: &Path, progress: &dyn Fn(&str)) ->
     })
 }
 
-impl IndexStats {
-    fn add(&mut self, o: &IndexStats) {
-        self.files_visited += o.files_visited;
-        self.files_updated += o.files_updated;
-        self.files_unchanged += o.files_unchanged;
-        self.files_deleted += o.files_deleted;
-        self.chunks_added += o.chunks_added;
-        self.errors += o.errors;
-    }
-}
-
-/// Walk `builder`'s roots, embed new/changed files, and write them to `store`.
-/// Every file the walk accepts (indexed, unchanged, or unreadable for a
-/// transient reason) is recorded in `seen`, which drives pruning.
-fn index_walk(
-    builder: &WalkBuilder,
-    store: &mut Store,
-    embedder: &Embedder,
-    cfg: &Config,
-    full: bool,
-    progress: &dyn Fn(&str),
-    seen: &mut WalkSeen,
-) -> Result<IndexStats> {
-    let mut stats = IndexStats::default();
-    let icfg = &cfg.index;
-
-    // Configure rayon thread pool for parallel embedding (ONNX backend only).
-    // The HTTP/Ollama backend sends work to the server — no local parallelism needed.
-    let is_local = cfg.embed.backend != "ollama";
-    let batch_size = if is_local {
-        let num_threads = if cfg.embed.index_threads == 0 {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-        } else {
-            cfg.embed.index_threads
-        };
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(num_threads)
-            .build_global()
-            .ok();
-        // Scale batch size to fill all cores.
-        cfg.embed.batch_size * num_threads
-    } else {
-        // HTTP backend: no scaling, use config batch_size directly.
-        cfg.embed.batch_size
-    };
-
-    // We accumulate chunks across files until we fill a batch, then embed.
-    struct PendingChunk {
-        /// Which file this chunk belongs to.
-        path: std::path::PathBuf,
-        file_mtime: f64,
-        file_hash: String,
-        chunk: Chunk,
-    }
-    let mut pending: Vec<PendingChunk> = Vec::new();
-
-    // Helper: flush `pending` to the embedder + store.
-    // This is a local closure called when the batch is full or at the end.
-    // We can't capture `store` and `embedder` by mutable reference inside a
-    // closure that we also call from within the loop, so we make it a function
-    // that takes explicit arguments.
-    fn flush_pending(
-        pending: &mut Vec<PendingChunk>,
-        embedder: &Embedder,
-        store: &mut Store,
-        stats: &mut IndexStats,
-        progress: &dyn Fn(&str),
-    ) -> Result<()> {
-        if pending.is_empty() {
-            return Ok(());
-        }
-
-        let texts: Vec<&str> = pending.iter().map(|p| p.chunk.text.as_str()).collect();
-        let embeddings = embedder
-            .embed_batch(&texts)
-            .context("embedding batch failed")?;
-
-        // Group by file so we can do one DB transaction per file.
-        // Files appear contiguously in `pending` because we flush at file
-        // boundaries and always complete a file before moving to the next.
-        let mut i = 0;
-        while i < pending.len() {
-            let file_path = pending[i].path.clone();
-            let file_mtime = pending[i].file_mtime;
-            let file_hash = pending[i].file_hash.clone();
-
-            // Find the end of this file's slice.
-            let j = pending[i..].partition_point(|p| p.path == file_path) + i;
-
-            // 1. Upsert the file record → get file_id.
-            let file_id = store
-                .upsert_file(&file_path, file_mtime, &file_hash)
-                .with_context(|| format!("upserting file record for {}", file_path.display()))?;
-
-            // 2. Delete all existing chunks for this file (avoids duplicates
-            //    on re-index; the ON DELETE CASCADE would also handle it if we
-            //    deleted the file row, but we keep the file row and just
-            //    refresh the chunks).
-            store
-                .delete_chunks_for_file(file_id)
-                .with_context(|| format!("deleting old chunks for {}", file_path.display()))?;
-
-            // 3. Insert each chunk with its freshly computed embedding.
-            for (pc, emb) in pending[i..j].iter().zip(&embeddings[i..j]) {
-                store
-                    .insert_chunk(
-                        file_id,
-                        pc.chunk.byte_offset,
-                        pc.chunk.byte_end,
-                        pc.chunk.start_line,
-                        pc.chunk.end_line,
-                        emb.as_slice(),
-                    )
-                    .with_context(|| {
-                        format!(
-                            "inserting chunk (lines {}-{}) for {}",
-                            pc.chunk.start_line,
-                            pc.chunk.end_line,
-                            file_path.display()
-                        )
-                    })?;
-            }
-
-            let chunk_count = j - i;
-            stats.chunks_added += chunk_count;
-            progress(&format!(
-                "indexed {} chunks from {}",
-                chunk_count,
-                file_path.display()
-            ));
-
-            i = j;
-        }
-
-        pending.clear();
-        Ok(())
-    }
-
-    for result in builder.build() {
-        let entry = match result {
-            Ok(e) => e,
-            Err(e) => {
-                // Vanished while walking (deleted or renamed): plain absence.
-                if !is_not_found(&e) {
-                    progress(&format!("warn: walk error: {e}"));
-                    stats.errors += 1;
-                    seen.record_error(&e);
-                }
-                continue;
-            }
-        };
-
-        // Skip anything that is not a regular file: directories, symlinks,
-        // devices, FIFOs. Symlinks are not followed (follow_links = false)
-        // so without this check a symlink to a regular file would be indexed
-        // and appear as a duplicate alongside the real path.
-        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-            continue;
-        }
-
-        let path = entry.path().to_path_buf();
-
-        // ---- file metadata ----
-        let metadata = match std::fs::metadata(&path) {
-            Ok(m) => m,
-            Err(e) => {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    // Exists but cannot be inspected right now: keep its record.
-                    progress(&format!("warn: metadata({}): {e}", path.display()));
-                    stats.errors += 1;
-                    seen.kept.insert(path);
-                }
-                continue;
-            }
-        };
-
-        if !metadata.is_file() {
-            continue;
-        }
-
-        let file_size = metadata.len();
-
-        // ---- size filters ----
-        // max_file_size / min_file_size are plain u64 thresholds in IndexConfig
-        // (zero means "no limit" for min; for max a reasonable compiled default
-        // is always set, so we always compare).
-        if file_size > icfg.max_file_size {
-            continue;
-        }
-        if file_size < icfg.min_file_size {
-            continue;
-        }
-
-        // ---- exclude_files glob check ----
-        // Match against the bare filename (not the full path).
-        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if icfg
-            .exclude_files
-            .iter()
-            .any(|pat| glob_match(pat, filename))
-        {
-            continue;
-        }
-
-        stats.files_visited += 1;
-
-        // ---- read as UTF-8 ----
-        let content = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(e) => {
-                match e.kind() {
-                    // Binary / not UTF-8, or deleted meanwhile: not indexable.
-                    std::io::ErrorKind::InvalidData | std::io::ErrorKind::NotFound => {}
-                    // Transient failure: keep the existing record.
-                    _ => {
-                        progress(&format!("warn: read({}): {e}", path.display()));
-                        stats.errors += 1;
-                        seen.kept.insert(path);
-                    }
-                }
-                continue;
-            }
-        };
-
-        // ---- sha256 hash ----
-        let hash = {
-            let digest = Sha256::digest(content.as_bytes());
-            hex::encode(digest)
-        };
-
-        // ---- incremental check ----
-        // Use store.get_file() and compare the stored hash directly.
-        if !full
-            && let Ok(Some(record)) = store.get_file(&path)
-            && record.hash == hash
-        {
-            stats.files_unchanged += 1;
-            seen.kept.insert(path);
-            continue;
-        }
-
-        // ---- chunk ----
-        let chunks = chunk_file(&content, icfg);
-        if chunks.is_empty() {
-            continue;
-        }
-
-        // ---- mtime ----
-        let mtime: f64 = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
-
-        seen.kept.insert(path.clone());
-
-        // Queue chunks.
-        for chunk in chunks {
-            pending.push(PendingChunk {
-                path: path.clone(),
-                file_mtime: mtime,
-                file_hash: hash.clone(),
-                chunk,
-            });
-        }
-
-        stats.files_updated += 1;
-
-        // Flush when batch is full.
-        if pending.len() >= batch_size {
-            flush_pending(&mut pending, embedder, store, &mut stats, &progress)?;
-        }
-    }
-
-    // ---- flush remaining ----
-    flush_pending(&mut pending, embedder, store, &mut stats, &progress)?;
-
-    Ok(stats)
-}
-
 // ---------------------------------------------------------------------------
 // IndexFilter — exact, cheap exclusion rules for one path at a time
 // ---------------------------------------------------------------------------
 
 /// Decides, without touching the filesystem, whether the indexer will skip
 /// a path, using only the rules that can be decided exactly from the path:
-/// outside `include_paths`, inside the database directory, a hidden
-/// component, or an `exclude_dirs` match on any component.
+/// outside `include_paths`, the database file or one of its SQLite side files,
+/// a hidden component, or an `exclude_dirs` match on any component.
 ///
-/// It never excludes a path the walker would index — so `vec watch` can
-/// drop such events safely. Everything else (`.gitignore`, `exclude_files`,
-/// size, binary content) is left to the walker, which is authoritative.
+/// The walker applies the same rules, so this never excludes a path the
+/// walker would index — `vec watch` can drop such events safely. Everything
+/// else (`.gitignore`, `exclude_files`, size, binary content) is left to the
+/// walker, which is authoritative.
 pub struct IndexFilter {
     /// `(include path, its exclude_dirs matcher)`.
     roots: Vec<(PathBuf, Override)>,
-    db_dir: Option<PathBuf>,
+    db_files: Option<DbFiles>,
 }
 
 impl IndexFilter {
@@ -906,13 +1336,13 @@ impl IndexFilter {
                 .iter()
                 .map(|r| (r.clone(), exclude_override(&cfg.index, r, progress)))
                 .collect(),
-            db_dir: cfg.database.db_path.parent().map(Path::to_path_buf),
+            db_files: DbFiles::new(cfg),
         }
     }
 
     /// `true` if the indexer will never index `path` nor anything under it.
     pub fn is_excluded(&self, path: &Path) -> bool {
-        if self.db_dir.as_deref().is_some_and(|d| path.starts_with(d)) {
+        if self.db_files.as_ref().is_some_and(|d| d.contains(path)) {
             return true;
         }
         // Excluded only if *every* include path containing it excludes it
@@ -953,77 +1383,109 @@ impl IndexFilter {
 // ---------------------------------------------------------------------------
 
 /// Result of comparing the filesystem against the stored index.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DiffResult {
-    pub new_files: Vec<std::path::PathBuf>,
-    pub changed_files: Vec<std::path::PathBuf>,
-    pub deleted_files: Vec<std::path::PathBuf>,
+    /// Files `vec updatedb` would add.
+    pub new_files: Vec<PathBuf>,
+    /// Indexed files whose content changed.
+    pub changed_files: Vec<PathBuf>,
+    /// Indexed files `vec updatedb` would remove: gone, no longer indexable
+    /// (excluded by name or size, binary, no chunk), or under a directory the
+    /// walk no longer enters (newly excluded or ignored).
+    pub deleted_files: Vec<PathBuf>,
+    /// Problems met during the walk (unreadable entries, non-UTF-8 names).
+    pub warnings: Vec<String>,
 }
 
-/// Walk configured paths and compare against the index without modifying anything.
+/// Walk the configured paths with the same walker and filters as
+/// [`run_updatedb`] and compare against the index without modifying anything.
 ///
-/// Returns lists of new, changed, and deleted files.
+/// Files are read with the same size cap as indexing, and only when their
+/// size or mtime differ from the index. `deleted_files` lists exactly the
+/// records [`run_updatedb`] would prune: every indexed file the walk does not
+/// accept, including files under directories it no longer enters (newly
+/// excluded or ignored), except under a location it could not read.
+///
+/// # Errors
+///
+/// A store error.
 pub fn diff_files(store: &Store, cfg: &Config) -> Result<DiffResult> {
     let icfg = &cfg.index;
-    let mut new_files = Vec::new();
-    let mut changed_files = Vec::new();
+    let warnings = RefCell::new(Vec::new());
+    let warn = |m: &str| warnings.borrow_mut().push(m.to_owned());
+    let db_files = DbFiles::new(cfg);
+    let mut out = DiffResult::default();
+    // What the walk accepted and where it could not see, as for a prune.
+    let mut seen = WalkSeen::default();
 
-    if icfg.include_paths.is_empty() {
-        return Ok(DiffResult {
-            new_files,
-            changed_files,
-            deleted_files: Vec::new(),
-        });
-    }
-
-    let mut builder = WalkBuilder::new(&icfg.include_paths[0]);
-    for extra in icfg.include_paths.iter().skip(1) {
-        builder.add(extra);
-    }
-    builder.git_ignore(icfg.gitignore);
-    builder.git_global(false);
-    builder.git_exclude(icfg.gitignore);
-    builder.follow_links(false);
-
-    for result in builder.build() {
-        let entry = match result {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-            continue;
-        }
-        let path = entry.path().to_path_buf();
-
-        let content = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-
-        let hash = {
-            let digest = Sha256::digest(content.as_bytes());
-            hex::encode(digest)
-        };
-
-        match store.get_file(&path) {
-            Ok(Some(record)) => {
-                if record.hash != hash {
-                    changed_files.push(path);
+    for builder in scoped_walkers(cfg, None, &warn) {
+        for result in builder.build() {
+            let entry = match result {
+                Ok(e) => e,
+                Err(e) => {
+                    if !is_not_found(&e) {
+                        warn(&format!("walk error: {e}"));
+                        seen.record_error(&e);
+                    }
+                    continue;
+                }
+            };
+            let c = match accept(&entry, icfg, db_files.as_ref()) {
+                Accept::File(c) => c,
+                Accept::Skip => continue,
+                Accept::NonUtf8 => {
+                    warn(&format!(
+                        "skipping {}: the file name is not valid UTF-8",
+                        entry.path().display()
+                    ));
+                    continue;
+                }
+                Accept::MetadataError(e) => {
+                    warn(&format!("metadata({}): {e}", entry.path().display()));
+                    seen.kept.insert(entry.into_path()); // its record would be kept
+                    continue;
+                }
+            };
+            if seen.kept.contains(&c.path) {
+                continue; // nested include paths
+            }
+            let record = store
+                .get_file(&c.path)
+                .with_context(|| format!("reading the index entry of {}", c.path.display()))?;
+            if record.as_ref().is_some_and(|r| c.same_metadata(r)) {
+                seen.kept.insert(c.path);
+                continue;
+            }
+            match read_file(&c, icfg) {
+                ReadOutcome::Text(text) => {
+                    let hash = sha256_hex(text.content.as_bytes());
+                    match record {
+                        Some(r) if r.hash == hash => {}
+                        // No chunk: not indexable, an existing record is pruned.
+                        _ if chunk_file(&text.content, icfg).is_empty() => continue,
+                        Some(_) => out.changed_files.push(c.path.clone()),
+                        None => out.new_files.push(c.path.clone()),
+                    }
+                    seen.kept.insert(c.path);
+                }
+                ReadOutcome::NotIndexable => {}
+                ReadOutcome::Failed(e) => {
+                    warn(&format!("read({}): {e}", c.path.display()));
+                    seen.kept.insert(c.path);
                 }
             }
-            Ok(None) => {
-                new_files.push(path);
-            }
-            Err(_) => continue,
         }
     }
 
-    let deleted_files = store.get_missing_file_paths().unwrap_or_default();
-
-    Ok(DiffResult {
-        new_files,
-        changed_files,
-        deleted_files,
-    })
+    store
+        .for_each_indexed_path(|p| {
+            if seen.is_stale(p) {
+                out.deleted_files.push(p.to_path_buf());
+            }
+        })
+        .context("listing indexed files")?;
+    out.warnings = warnings.into_inner();
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,17 +1500,18 @@ mod tests {
     // We build one manually because IndexConfig does not derive Default —
     // the project keeps defaults centralised in config::default_config().
     fn test_icfg() -> IndexConfig {
-        IndexConfig {
-            chunk_size: 40,
-            chunk_overlap: 10,
-            max_file_size: 10 * 1024 * 1024,
-            min_file_size: 0,
-            min_chunk_lines: 5,
-            gitignore: false,
-            include_paths: vec![],
-            exclude_dirs: vec![],
-            exclude_files: vec![],
-        }
+        let mut icfg = vec_core::config::Config::defaults().unwrap().index;
+        icfg.min_file_size = 0;
+        icfg.gitignore = false;
+        icfg.include_paths = vec![];
+        icfg.exclude_dirs = vec![];
+        icfg.exclude_files = vec![];
+        icfg
+    }
+
+    fn test_store_opts() -> vec_store::StoreOptions {
+        let db = vec_core::config::Config::defaults().unwrap().database;
+        vec_store::StoreOptions::from_config(&db, false)
     }
 
     // -----------------------------------------------------------------------
@@ -1099,7 +1562,7 @@ mod tests {
 
     #[test]
     fn chunk_short_file_below_min_lines() {
-        // 3 non-blank lines → below MIN_40 → no chunks
+        // 3 non-blank lines, below min_chunk_lines → no chunks
         let content = "a\nb\nc\n";
         let chunks = chunk_file(content, &test_icfg());
         assert!(
@@ -1164,16 +1627,10 @@ mod tests {
         let chunks = chunk_file(&content, &test_icfg());
         assert!(!chunks.is_empty());
         // The first chunk should end at or near the 'fn ' line.
-        let first = &chunks[0];
-        // The 'fn' line is at 1-based index 40 + 4.
-        // After snapping, end_line should equal 40 + 4.
-        let fn_line: usize = 40 + 4; // 1-based
-        assert!(
-            first.end_line >= fn_line.saturating_sub(BOUNDARY_SCAN)
-                && first.end_line <= fn_line + BOUNDARY_SCAN,
-            "expected end_line near fn boundary ({fn_line}), got {}",
-            first.end_line
-        );
+        // The 'fn' line is 0-based index 43 (1-based line 44), 3 lines after
+        // the tentative end (40) and within boundary_scan: the first chunk
+        // ends right before it.
+        assert_eq!(chunks[0].end_line, 43);
     }
 
     #[test]
@@ -1185,10 +1642,7 @@ mod tests {
         }
         let content = lines.join("\n") + "\n";
         let chunks = chunk_file(&content, &test_icfg());
-        if chunks.len() < 2 {
-            // Small test environments may produce only one chunk — skip overlap test.
-            return;
-        }
+        assert!(chunks.len() >= 2, "80 lines must give at least 2 chunks");
         let c0 = &chunks[0];
         let c1 = &chunks[1];
         // Chunk 1 should start before chunk 0 ends (overlap).
@@ -1204,7 +1658,8 @@ mod tests {
 
     // Helper: build a full Config pointing at a given TempDir with stub-friendly settings.
     fn test_cfg_for_dir(dir: &tempfile::TempDir) -> vec_core::config::Config {
-        let mut cfg = vec_core::config::Config::load(None).unwrap();
+        // Compiled-in defaults only: no system or user config file is read.
+        let mut cfg = vec_core::config::Config::defaults().unwrap();
         cfg.index.include_paths = vec![dir.path().to_path_buf()];
         cfg.index.min_file_size = 0;
         cfg.index.gitignore = false;
@@ -1225,7 +1680,7 @@ mod tests {
 
     fn open_temp_db() -> (tempfile::NamedTempFile, vec_store::Store) {
         let db_file = tempfile::NamedTempFile::new().unwrap();
-        let store = vec_store::Store::open(db_file.path(), false).unwrap();
+        let store = vec_store::Store::open(db_file.path(), &test_store_opts()).unwrap();
         (db_file, store)
     }
 
@@ -1713,7 +2168,7 @@ mod tests {
 
     #[test]
     fn chunk_file_short_file() {
-        // 3 non-blank lines is fewer than MIN_40 (5) → no chunks.
+        // 3 non-blank lines is fewer than min_chunk_lines → no chunks.
         let content = "line one\nline two\nline three\n";
         let chunks = chunk_file(content, &test_icfg());
         assert!(
@@ -1854,17 +2309,10 @@ mod tests {
         let chunks = chunk_file(&content, &test_icfg());
         assert!(!chunks.is_empty(), "file should produce at least one chunk");
 
-        let first = &chunks[0];
-        // fn line is at 1-based line 40 + 3.
-        let fn_line_1based: usize = 40 + 3;
-        // The first chunk should end at or near the fn line (within BOUNDARY_SCAN).
-        assert!(
-            first.end_line >= fn_line_1based.saturating_sub(BOUNDARY_SCAN)
-                && first.end_line <= fn_line_1based + BOUNDARY_SCAN,
-            "chunk end_line {} should be near the fn boundary at {}",
-            first.end_line,
-            fn_line_1based
-        );
+        // The fn line is 0-based index 42: the first chunk ends at line 42
+        // (1-based), and the second one starts on or before the fn line.
+        assert_eq!(chunks[0].end_line, 42);
+        assert!(chunks[1].start_line <= 43);
     }
 
     #[test]
@@ -1872,7 +2320,7 @@ mod tests {
         use std::io::Write;
 
         let db_file = tempfile::NamedTempFile::new().unwrap();
-        let mut store = vec_store::Store::open(db_file.path(), false).unwrap();
+        let mut store = vec_store::Store::open(db_file.path(), &test_store_opts()).unwrap();
 
         let dir = tempfile::TempDir::new().unwrap();
         for name in &["alpha.txt", "beta.txt"] {
@@ -1883,16 +2331,7 @@ mod tests {
             }
         }
 
-        let cfg = {
-            let mut c = vec_core::config::Config::load(None).unwrap();
-            c.index.include_paths = vec![dir.path().to_path_buf()];
-            c.index.min_file_size = 0;
-            c.index.gitignore = false;
-            c.index.exclude_dirs = vec![];
-            c.index.exclude_files = vec![];
-            c.embed.batch_size = 4;
-            c
-        };
+        let cfg = test_cfg_for_dir(&dir);
 
         let embedder = vec_embed::Embedder::stub(768);
         let stats = run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {}).unwrap();
@@ -1904,5 +2343,919 @@ mod tests {
         let query_vec = qemb.embed_one("authentication middleware").unwrap();
         let results = store.search(&query_vec, 5, -1.0, None).unwrap();
         assert!(!results.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Chunker: coverage and snapping (regressions for audit B1, B2)
+    // -----------------------------------------------------------------------
+
+    /// xorshift64: deterministic pseudo-random numbers without a dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// Check the structural invariants of `chunks` for `content`: offsets
+    /// match the text, starts strictly increase, no gap between consecutive
+    /// chunks, the first starts at line 1 and the last ends at the last line.
+    fn assert_covers(content: &str, chunks: &[Chunk], what: &str) {
+        let total = content.split_inclusive('\n').count();
+        assert!(!chunks.is_empty(), "{what}: no chunk");
+        assert_eq!(chunks[0].start_line, 1, "{what}: first line not covered");
+        assert_eq!(
+            chunks.last().unwrap().end_line,
+            total,
+            "{what}: tail dropped"
+        );
+        assert_eq!(chunks.last().unwrap().byte_end, content.len(), "{what}");
+        for c in chunks {
+            assert!(c.start_line <= c.end_line, "{what}: empty chunk");
+            assert_eq!(&content[c.byte_offset..c.byte_end], c.text, "{what}");
+        }
+        for w in chunks.windows(2) {
+            assert!(w[1].start_line > w[0].start_line, "{what}: no progress");
+            assert!(
+                w[1].start_line <= w[0].end_line + 1,
+                "{what}: gap between lines {} and {}",
+                w[0].end_line,
+                w[1].start_line
+            );
+        }
+    }
+
+    #[test]
+    fn chunker_covers_every_line_property() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for case in 0..2000 {
+            let mut icfg = test_icfg();
+            icfg.chunk_size = 1 + rng.below(50);
+            icfg.chunk_overlap = rng.below(icfg.chunk_size);
+            icfg.boundary_scan = rng.below(9);
+            icfg.min_chunk_lines = rng.below(4);
+            let n = 1 + rng.below(200);
+            let mut content = String::new();
+            for i in 0..n {
+                match rng.below(10) {
+                    0 => content.push_str("fn f() {"),
+                    1 => content.push_str("    def g():"),
+                    2 => {}
+                    _ => content.push_str(&format!("    body {i}")),
+                }
+                if i + 1 < n || rng.below(2) == 0 {
+                    content.push('\n');
+                }
+            }
+            let non_blank = content.lines().filter(|l| !l.trim().is_empty()).count();
+            let chunks = chunk_file(&content, &icfg);
+            let what = format!(
+                "case {case}: {n} lines, size {} overlap {} scan {} min {}",
+                icfg.chunk_size, icfg.chunk_overlap, icfg.boundary_scan, icfg.min_chunk_lines
+            );
+            if non_blank < icfg.min_chunk_lines {
+                assert!(chunks.is_empty(), "{what}: too sparse for a chunk");
+            } else {
+                assert_covers(&content, &chunks, &what);
+            }
+        }
+    }
+
+    #[test]
+    fn chunker_keeps_the_tail_after_a_late_function() {
+        // Audit repro: a 20-line file whose `fn tail()` starts on line 17
+        // gave one chunk of lines 1-16.
+        let mut lines: Vec<String> = (0..16).map(|i| format!("let a{i} = {i};")).collect();
+        lines.push("fn tail() {".into());
+        lines.extend((0..3).map(|i| format!("    t{i}();")));
+        let content = lines.join("\n") + "\n";
+        let chunks = chunk_file(&content, &test_icfg());
+        assert_covers(&content, &chunks, "late fn");
+        assert!(chunks.last().unwrap().text.contains("fn tail()"));
+    }
+
+    #[test]
+    fn chunker_zero_overlap_leaves_no_gap() {
+        let mut icfg = test_icfg();
+        icfg.chunk_size = 10;
+        icfg.chunk_overlap = 0;
+        // Boundaries a few lines before each tentative end pull ends back.
+        let content: String = (0..60)
+            .map(|i| {
+                if i % 10 == 7 {
+                    "fn x() {\n".to_owned()
+                } else {
+                    format!("    s{i};\n")
+                }
+            })
+            .collect();
+        let chunks = chunk_file(&content, &icfg);
+        assert_covers(&content, &chunks, "overlap 0");
+    }
+
+    #[test]
+    fn chunker_zero_chunk_size_does_not_panic() {
+        let mut icfg = test_icfg();
+        icfg.chunk_size = 0;
+        icfg.chunk_overlap = 0;
+        icfg.min_chunk_lines = 0;
+        let content = "a\nb\nc\n";
+        assert_covers(content, &chunk_file(content, &icfg), "chunk_size 0");
+    }
+
+    #[test]
+    fn chunker_starts_next_chunk_on_a_boundary() {
+        // With overlap <= boundary_scan the function header the first chunk
+        // ends before is also where the second chunk starts.
+        let mut icfg = test_icfg();
+        icfg.chunk_size = 40;
+        icfg.chunk_overlap = 3;
+        icfg.boundary_scan = 5;
+        let mut lines: Vec<String> = (0..37).map(|i| format!("    a{i};")).collect();
+        lines.push("fn second() {".into()); // 0-based 37
+        lines.extend((0..40).map(|i| format!("    b{i};")));
+        let content = lines.join("\n") + "\n";
+        let chunks = chunk_file(&content, &icfg);
+        assert_eq!(chunks[0].end_line, 37);
+        assert_eq!(chunks[1].start_line, 38, "second chunk starts at the fn");
+        assert!(chunks[1].text.starts_with("fn second()"));
+    }
+
+    #[test]
+    fn chunker_uses_configured_patterns_and_scan() {
+        let mut lines: Vec<String> = (0..42).map(|i| format!("    x{i}")).collect();
+        lines.push("SECTION two".into()); // 0-based 42
+        lines.extend((0..20).map(|i| format!("    y{i}")));
+        let content = lines.join("\n") + "\n";
+
+        let mut icfg = test_icfg();
+        icfg.boundary_patterns = vec!["SECTION ".into()];
+        assert_eq!(chunk_file(&content, &icfg)[0].end_line, 42);
+
+        icfg.boundary_scan = 0;
+        assert_eq!(
+            chunk_file(&content, &icfg)[0].end_line,
+            icfg.chunk_size,
+            "boundary_scan = 0 never moves a boundary"
+        );
+
+        icfg.boundary_scan = 5;
+        icfg.boundary_patterns = vec!["fn ".into()];
+        assert_eq!(chunk_file(&content, &icfg)[0].end_line, icfg.chunk_size);
+    }
+
+    #[test]
+    fn chunker_merges_a_sparse_tail_instead_of_dropping_it() {
+        let mut icfg = test_icfg();
+        icfg.chunk_size = 10;
+        icfg.chunk_overlap = 0;
+        icfg.boundary_scan = 0;
+        icfg.min_chunk_lines = 5;
+        // 10 dense lines, then 2 non-blank lines among blanks.
+        let mut content: String = (0..10).map(|i| format!("dense {i}\n")).collect();
+        content.push_str("\n\ntail one\n\n\ntail two\n");
+        let chunks = chunk_file(&content, &icfg);
+        assert_eq!(chunks.len(), 1);
+        assert_covers(&content, &chunks, "sparse tail");
+        assert!(chunks[0].text.ends_with("tail two\n"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Indexing behaviour
+    // -----------------------------------------------------------------------
+
+    fn stub() -> vec_embed::Embedder {
+        vec_embed::Embedder::stub(TEST_DIM)
+    }
+
+    /// Dimension of the test stub embedder.
+    const TEST_DIM: usize = 32;
+
+    /// Run an index pass with a custom embedding function (failure injection).
+    fn run_with(
+        store: &mut Store,
+        cfg: &Config,
+        full: bool,
+        identity: ModelIdentity,
+        embed: &EmbedFn<'_>,
+        log: &RefCell<Vec<String>>,
+    ) -> Result<IndexStats> {
+        let progress = |m: &str| log.borrow_mut().push(m.to_owned());
+        Run::new(
+            store,
+            identity,
+            embed,
+            cfg,
+            cfg.embed.batch_size,
+            full,
+            None,
+            &progress,
+        )?
+        .execute(None)
+    }
+
+    #[test]
+    fn updatedb_records_the_model_identity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_lines(&dir.path().join("a.txt"), 50);
+        let cfg = test_cfg_for_dir(&dir);
+        let (_db, mut store) = open_temp_db();
+        run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap();
+        assert_eq!(store.model().unwrap().as_ref(), Some(stub().identity()));
+
+        // Another model is refused without --full, and nothing is changed.
+        let other = vec_embed::Embedder::stub(TEST_DIM * 2);
+        assert!(run_updatedb(&mut store, &other, &cfg, false, None, |_| {}).is_err());
+        assert!(store.get_file(&dir.path().join("a.txt")).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_file_that_fails_to_embed_keeps_its_old_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bad = dir.path().join("bad.txt");
+        let good = dir.path().join("good.txt");
+        write_lines(&bad, 50);
+        write_lines(&good, 50);
+        let mut cfg = test_cfg_for_dir(&dir);
+        cfg.embed.batch_size = 1000; // both files in one batch
+        let (_db, mut store) = open_temp_db();
+        let log = RefCell::new(Vec::new());
+        let s = stub();
+        let embed_ok = |t: &[&str]| s.embed_batch(t);
+        run_with(
+            &mut store,
+            &cfg,
+            false,
+            s.identity().clone(),
+            &embed_ok,
+            &log,
+        )
+        .unwrap();
+        let old_hash = store.get_file(&bad).unwrap().unwrap().hash;
+
+        std::fs::write(&bad, "POISON\n".repeat(20)).unwrap();
+        std::fs::write(&good, "fresh content line\n".repeat(20)).unwrap();
+        let embed_poison = |t: &[&str]| {
+            if t.iter().any(|x| x.contains("POISON")) {
+                bail!("cannot embed this text")
+            }
+            s.embed_batch(t)
+        };
+        let stats = run_with(
+            &mut store,
+            &cfg,
+            false,
+            s.identity().clone(),
+            &embed_poison,
+            &log,
+        )
+        .unwrap();
+        assert_eq!(stats.errors, 1);
+        assert_eq!(stats.files_updated, 1);
+        assert_eq!(store.get_file(&bad).unwrap().unwrap().hash, old_hash);
+        assert!(
+            log.borrow()
+                .iter()
+                .any(|m| m.contains("previous index entry is kept"))
+        );
+    }
+
+    /// Regression (review 2026-11-19 #6): a file that always fails to embed,
+    /// alone in its batch, made the run look like a down backend, so
+    /// `updatedb` failed on every run and `vec watch` retried forever.
+    #[test]
+    fn a_file_that_fails_alone_in_its_batch_does_not_stop_the_run() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bad = dir.path().join("a-bad.txt");
+        let good = dir.path().join("b-good.txt");
+        std::fs::write(&bad, "POISON line\n".repeat(50)).unwrap();
+        write_lines(&good, 50);
+        let mut cfg = test_cfg_for_dir(&dir);
+        cfg.embed.batch_size = 1; // every file is flushed alone
+        let (_db, mut store) = open_temp_db();
+        let log = RefCell::new(Vec::new());
+        let s = stub();
+        let embed_poison = |t: &[&str]| {
+            if t.iter().any(|x| x.contains("POISON")) {
+                bail!("cannot embed this text")
+            }
+            s.embed_batch(t)
+        };
+        let stats = run_with(
+            &mut store,
+            &cfg,
+            false,
+            s.identity().clone(),
+            &embed_poison,
+            &log,
+        )
+        .unwrap();
+        assert_eq!(stats.errors, 1);
+        assert_eq!(stats.files_updated, 1);
+        assert!(store.get_file(&good).unwrap().is_some());
+        assert!(store.get_file(&bad).unwrap().is_none());
+    }
+
+    /// Regression (review 2026-11-19 #5): `--full` treated any error of
+    /// `ensure_model` (here: the database is locked) as a model mismatch and
+    /// emptied the index at the first write.
+    #[test]
+    fn full_run_does_not_reset_on_an_error_that_is_not_a_model_mismatch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_lines(&dir.path().join("a.txt"), 50);
+        let cfg = test_cfg_for_dir(&dir);
+        let (db, mut store) = open_temp_db();
+        run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap();
+        drop(store);
+        // Test value: fail fast on the lock.
+        let quick = vec_store::StoreOptions {
+            busy_timeout_ms: 50,
+            ..test_store_opts()
+        };
+        let mut store = vec_store::Store::open(db.path(), &quick).unwrap();
+
+        let mut locker = rusqlite::Connection::open(db.path()).unwrap();
+        let lock = locker
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let s = stub();
+        let embed = |t: &[&str]| s.embed_batch(t);
+        let progress = |_: &str| {};
+        let err = Run::new(
+            &mut store,
+            s.identity().clone(),
+            &embed,
+            &cfg,
+            cfg.embed.batch_size,
+            true,
+            None,
+            &progress,
+        )
+        .err()
+        .expect("a locked database is an error");
+        assert!(!err.is::<ModelMismatch>(), "{err:#}");
+        drop(lock);
+        assert_eq!(store.stats().unwrap().0, 1, "the index is intact");
+    }
+
+    #[test]
+    fn a_failing_backend_stops_the_run_and_changes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = dir.path().join("a.txt");
+        write_lines(&f, 50);
+        let cfg = test_cfg_for_dir(&dir);
+        let (_db, mut store) = open_temp_db();
+        run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap();
+        let before = store.get_file(&f).unwrap().unwrap();
+
+        let log = RefCell::new(Vec::new());
+        let down = |_: &[&str]| -> Result<Vec<Vec<f32>>> { bail!("connection refused") };
+        // --full must not empty the index first.
+        let err = run_with(
+            &mut store,
+            &cfg,
+            true,
+            stub().identity().clone(),
+            &down,
+            &log,
+        );
+        assert!(err.is_err());
+        assert_eq!(store.get_file(&f).unwrap().unwrap().hash, before.hash);
+        assert_eq!(store.stats().unwrap().1, 2, "chunks are still there");
+    }
+
+    #[test]
+    fn full_rebuild_with_another_model_empties_only_once_it_can_embed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = dir.path().join("a.txt");
+        write_lines(&f, 50);
+        let cfg = test_cfg_for_dir(&dir);
+        let (_db, mut store) = open_temp_db();
+        run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap();
+
+        let other = vec_embed::Embedder::stub(TEST_DIM * 2);
+        let log = RefCell::new(Vec::new());
+        let down = |_: &[&str]| -> Result<Vec<Vec<f32>>> { bail!("model broken") };
+        assert!(
+            run_with(
+                &mut store,
+                &cfg,
+                true,
+                other.identity().clone(),
+                &down,
+                &log
+            )
+            .is_err()
+        );
+        assert_eq!(store.model().unwrap().as_ref(), Some(stub().identity()));
+        assert!(store.get_file(&f).unwrap().is_some(), "old index intact");
+
+        // A scoped --full cannot switch models.
+        assert!(run_updatedb(&mut store, &other, &cfg, true, Some(dir.path()), |_| {}).is_err());
+
+        let stats = run_updatedb(&mut store, &other, &cfg, true, None, |_| {}).unwrap();
+        assert_eq!(stats.files_updated, 1);
+        assert_eq!(store.model().unwrap().as_ref(), Some(other.identity()));
+    }
+
+    #[test]
+    fn full_run_prunes_after_reembedding() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let keep = dir.path().join("keep.txt");
+        let gone = dir.path().join("gone.txt");
+        write_lines(&keep, 50);
+        write_lines(&gone, 50);
+        let cfg = test_cfg_for_dir(&dir);
+        let (_db, mut store) = open_temp_db();
+        run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap();
+        std::fs::remove_file(&gone).unwrap();
+        let stats = run_updatedb(&mut store, &stub(), &cfg, true, None, |_| {}).unwrap();
+        assert_eq!((stats.files_updated, stats.files_deleted), (1, 1));
+        assert!(store.get_file(&keep).unwrap().is_some());
+    }
+
+    #[test]
+    fn full_run_embeds_files_under_nested_include_paths_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        write_lines(&sub.join("a.txt"), 50);
+        let mut cfg = test_cfg_for_dir(&dir);
+        cfg.index.include_paths.push(sub.clone());
+        let (_db, mut store) = open_temp_db();
+        let calls = std::cell::Cell::new(0usize);
+        let s = stub();
+        let embed = |t: &[&str]| {
+            calls.set(calls.get() + t.len());
+            s.embed_batch(t)
+        };
+        let log = RefCell::new(Vec::new());
+        let stats = run_with(&mut store, &cfg, true, s.identity().clone(), &embed, &log).unwrap();
+        assert_eq!(stats.files_visited, 1);
+        assert_eq!(stats.files_updated, 1);
+        assert_eq!(calls.get(), stats.chunks_added);
+    }
+
+    #[test]
+    fn unchanged_size_and_mtime_skip_the_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = dir.path().join("a.txt");
+        write_lines(&f, 50);
+        let cfg = test_cfg_for_dir(&dir);
+        let (_db, mut store) = open_temp_db();
+        run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap();
+        let mtime = std::fs::metadata(&f).unwrap().modified().unwrap();
+        let old_hash = store.get_file(&f).unwrap().unwrap().hash;
+
+        // Same size, same mtime, different bytes: by design not re-read.
+        let content = std::fs::read_to_string(&f).unwrap().replace("Line", "LINE");
+        std::fs::write(&f, &content).unwrap();
+        File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let stats = run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap();
+        assert_eq!((stats.files_unchanged, stats.files_updated), (1, 0));
+        assert_eq!(store.get_file(&f).unwrap().unwrap().hash, old_hash);
+
+        // --full reads everything.
+        run_updatedb(&mut store, &stub(), &cfg, true, None, |_| {}).unwrap();
+        assert_ne!(store.get_file(&f).unwrap().unwrap().hash, old_hash);
+    }
+
+    #[test]
+    fn touched_file_refreshes_metadata_without_embedding() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = dir.path().join("a.txt");
+        write_lines(&f, 50);
+        let cfg = test_cfg_for_dir(&dir);
+        let (_db, mut store) = open_temp_db();
+        run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap();
+        let before = store.get_file(&f).unwrap().unwrap();
+
+        let later =
+            std::fs::metadata(&f).unwrap().modified().unwrap() + std::time::Duration::from_secs(10);
+        File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let calls = std::cell::Cell::new(0usize);
+        let s = stub();
+        let embed = |t: &[&str]| {
+            calls.set(calls.get() + t.len());
+            s.embed_batch(t)
+        };
+        let log = RefCell::new(Vec::new());
+        let stats = run_with(&mut store, &cfg, false, s.identity().clone(), &embed, &log).unwrap();
+        assert_eq!((stats.files_unchanged, stats.files_updated), (1, 0));
+        assert_eq!(calls.get(), 0, "no text embedded");
+        let after = store.get_file(&f).unwrap().unwrap();
+        assert_eq!(after.hash, before.hash);
+        assert!(after.mtime > before.mtime, "mtime refreshed");
+
+        // The next run skips it by metadata alone.
+        let stats = run_with(&mut store, &cfg, false, s.identity().clone(), &embed, &log).unwrap();
+        assert_eq!(stats.files_unchanged, 1);
+    }
+
+    #[test]
+    fn an_edit_reembeds_only_the_changed_chunks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = dir.path().join("a.txt");
+        write_lines(&f, 200);
+        let cfg = test_cfg_for_dir(&dir);
+        let (_db, mut store) = open_temp_db();
+        run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap();
+
+        let mut content = std::fs::read_to_string(&f).unwrap();
+        content.push_str("one more line at the end\n");
+        std::fs::write(&f, &content).unwrap();
+        let calls = std::cell::Cell::new(0usize);
+        let s = stub();
+        let embed = |t: &[&str]| {
+            calls.set(calls.get() + t.len());
+            s.embed_batch(t)
+        };
+        let log = RefCell::new(Vec::new());
+        let stats = run_with(&mut store, &cfg, false, s.identity().clone(), &embed, &log).unwrap();
+        assert_eq!(stats.files_updated, 1);
+        assert!(stats.chunks_reused > 0);
+        assert_eq!(calls.get(), stats.chunks_added - stats.chunks_reused);
+        assert!(calls.get() < stats.chunks_added);
+
+        // Reused vectors are the ones a fresh embedding gives.
+        let stored = store.embeddings_by_text_hash(&f).unwrap();
+        for c in chunk_file(&content, &cfg.index) {
+            let v = &stored[&sha256_hex(c.text.as_bytes())];
+            let fresh = s.embed_one(&c.text).unwrap();
+            assert!(v.iter().zip(&fresh).all(|(a, b)| (a - b).abs() < 1e-6));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_file_names_are_skipped_and_counted() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let name = std::ffi::OsStr::from_bytes(b"bad-\xff.txt");
+        write_lines(&dir.path().join(name), 50);
+        write_lines(&dir.path().join("ok.txt"), 50);
+        let cfg = test_cfg_for_dir(&dir);
+        let (_db, mut store) = open_temp_db();
+        let log = RefCell::new(Vec::new());
+        let stats = run_updatedb(&mut store, &stub(), &cfg, false, None, |m| {
+            log.borrow_mut().push(m.to_owned())
+        })
+        .unwrap();
+        assert_eq!(stats.files_skipped_non_utf8, 1);
+        assert_eq!(stats.files_updated, 1);
+        assert!(log.borrow().iter().any(|m| m.contains("not valid UTF-8")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_file_refuses_symlinks_and_caps_the_size() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join("real.txt");
+        let link = dir.path().join("link.txt");
+        write_lines(&real, 50);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let icfg = test_icfg();
+        let real_c = walked(&real);
+        assert!(matches!(read_file(&real_c, &icfg), ReadOutcome::Text(_)));
+        // A file swapped for a symlink after the walk is not read.
+        let link_c = Candidate {
+            path: link,
+            ..walked(&real)
+        };
+        assert!(matches!(
+            read_file(&link_c, &icfg),
+            ReadOutcome::NotIndexable
+        ));
+        let missing = Candidate {
+            path: dir.path().join("missing"),
+            ..walked(&real)
+        };
+        assert!(matches!(
+            read_file(&missing, &icfg),
+            ReadOutcome::NotIndexable
+        ));
+        let mut small = test_icfg();
+        small.max_file_size = 10;
+        assert!(matches!(
+            read_file(&real_c, &small),
+            ReadOutcome::NotIndexable
+        ));
+    }
+
+    /// The candidate the walker would produce for `path` (`lstat`).
+    fn walked(path: &Path) -> Candidate {
+        Candidate::new(path, &std::fs::symlink_metadata(path).unwrap())
+    }
+
+    /// Regression (review 2026-11-19 #4): a user swaps one of their
+    /// directories for a symlink (e.g. to `/root`) between the walk and the
+    /// read. The indexer must not read the file behind the link, whether the
+    /// walker's `lstat` ran before the swap or after it.
+    #[test]
+    fn a_directory_swapped_for_a_symlink_is_not_followed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("home");
+        let user_dir = root.join("user/project");
+        let secret_dir = tmp.path().join("root-only");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        let path = user_dir.join("notes.txt");
+        write_lines(&path, 50);
+        std::fs::write(secret_dir.join("notes.txt"), "SECRET line\n".repeat(50)).unwrap();
+        let mut icfg = test_icfg();
+        icfg.include_paths = vec![root.clone()];
+
+        let before_swap = walked(&path);
+        assert!(matches!(
+            read_file(&before_swap, &icfg),
+            ReadOutcome::Text(_)
+        ));
+
+        // Swap the directory for a symlink to the secret directory.
+        std::fs::rename(&user_dir, root.join("user/project.old")).unwrap();
+        std::os::unix::fs::symlink(&secret_dir, &user_dir).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("SECRET"));
+
+        let after_swap = walked(&path); // lstat follows the swapped directory
+        for c in [&before_swap, &after_swap] {
+            match read_file(c, &icfg) {
+                ReadOutcome::Text(t) => panic!("read through the symlink: {}", &t.content[..20]),
+                ReadOutcome::NotIndexable => {}
+                ReadOutcome::Failed(e) => panic!("expected NotIndexable, got {e}"),
+            }
+        }
+
+        // The include path itself may be a symlink (the admin's choice).
+        let alias = tmp.path().join("home-alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        std::fs::remove_file(&user_dir).unwrap();
+        std::fs::rename(root.join("user/project.old"), &user_dir).unwrap();
+        icfg.include_paths = vec![alias.clone()];
+        let via_alias = alias.join("user/project/notes.txt");
+        assert!(matches!(
+            read_file(&walked(&via_alias), &icfg),
+            ReadOutcome::Text(_)
+        ));
+    }
+
+    /// A file replaced (another inode) between the walk and the read is a
+    /// transient failure: its record is kept and the next run reads it.
+    #[test]
+    fn a_file_replaced_after_the_walk_is_a_transient_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("a.txt");
+        write_lines(&path, 50);
+        let c = walked(&path);
+        let new = dir.path().join("a.txt.new");
+        write_lines(&new, 60);
+        std::fs::rename(&new, &path).unwrap();
+        let mut icfg = test_icfg();
+        icfg.include_paths = vec![dir.path().to_path_buf()];
+        assert!(matches!(read_file(&c, &icfg), ReadOutcome::Failed(_)));
+        assert!(matches!(
+            read_file(&walked(&path), &icfg),
+            ReadOutcome::Text(_)
+        ));
+    }
+
+    #[test]
+    fn database_files_are_not_indexed_and_their_events_are_dropped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let mut cfg = test_cfg_for_dir(&dir);
+        cfg.database.db_path = root.join("vec.db");
+        // Text files under the database names, plus a normal neighbour.
+        for name in ["vec.db", "vec.db-wal", "vec.db-journal", "notes.txt"] {
+            write_lines(&root.join(name), 50);
+        }
+        let filter = IndexFilter::new(&cfg, &|_| {});
+        assert!(filter.is_excluded(&root.join("vec.db")));
+        assert!(filter.is_excluded(&root.join("vec.db-shm")));
+        assert!(!filter.is_excluded(&root.join("notes.txt")));
+        assert!(!filter.is_excluded(&root.join("vec.dbx")));
+
+        let (_db, mut store) = open_temp_db();
+        let stats = run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap();
+        assert_eq!(stats.files_updated, 1, "only notes.txt");
+    }
+
+    #[test]
+    fn relative_db_path_does_not_exclude_everything() {
+        // Audit B6: `Path::new("vec.db").parent()` is `""`, a prefix of every path.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_cfg_for_dir(&dir);
+        cfg.database.db_path = PathBuf::from("vec.db");
+        let filter = IndexFilter::new(&cfg, &|_| {});
+        assert!(!filter.is_excluded(&dir.path().join("src/main.rs")));
+    }
+
+    #[test]
+    fn path_filter_is_normalised_and_warns_outside_include_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let a = dir.path().join("a");
+        std::fs::create_dir_all(&a).unwrap();
+        write_lines(&a.join("x.txt"), 50);
+        let cfg = test_cfg_for_dir(&dir);
+        let (_db, mut store) = open_temp_db();
+
+        let dotted = dir.path().join("b/../a/./");
+        let stats = run_updatedb(&mut store, &stub(), &cfg, false, Some(&dotted), |_| {}).unwrap();
+        assert_eq!(stats.files_updated, 1);
+
+        let log = RefCell::new(Vec::new());
+        let outside = tempfile::TempDir::new().unwrap();
+        let stats = run_updatedb(
+            &mut store,
+            &stub(),
+            &cfg,
+            false,
+            Some(outside.path()),
+            |m| log.borrow_mut().push(m.to_owned()),
+        )
+        .unwrap();
+        assert_eq!(stats, IndexStats::default());
+        assert!(
+            log.borrow()
+                .iter()
+                .any(|m| m.contains("outside every include path"))
+        );
+    }
+
+    #[test]
+    fn embed_threads_scale_onnx_batches_only() {
+        let mut cfg = vec_core::config::Config::defaults().unwrap();
+        cfg.embed.index_threads = 3;
+        let t = EmbedThreads::new(&cfg).unwrap();
+        assert_eq!(
+            t.pool.as_ref().map(rayon::ThreadPool::current_num_threads),
+            Some(3)
+        );
+        assert_eq!(t.batch_size, cfg.embed.batch_size * 3);
+
+        cfg.embed.backend = EmbedBackend::Ollama;
+        let t = EmbedThreads::new(&cfg).unwrap();
+        assert!(t.pool.is_none());
+        assert_eq!(t.batch_size, cfg.embed.batch_size);
+    }
+
+    // -----------------------------------------------------------------------
+    // diff_files (audit B5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn diff_uses_the_indexing_filters_and_agrees_with_updatedb() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("vendor")).unwrap();
+        write_lines(&root.join("a.txt"), 50);
+        write_lines(&root.join("vendor/v.txt"), 50); // exclude_dirs
+        write_lines(&root.join("x.lock"), 50); // exclude_files
+        std::fs::write(root.join("tiny.txt"), "a\nb\n").unwrap(); // too few lines
+        let mut cfg = test_cfg_for_dir(&dir);
+        cfg.index.exclude_dirs = vec!["vendor".into()];
+        cfg.index.exclude_files = vec!["*.lock".into()];
+        let (_db, mut store) = open_temp_db();
+
+        let d = diff_files(&store, &cfg).unwrap();
+        assert_eq!(d.new_files, vec![root.join("a.txt")]);
+        assert!(d.changed_files.is_empty() && d.deleted_files.is_empty());
+
+        run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap();
+        assert_eq!(diff_files(&store, &cfg).unwrap(), DiffResult::default());
+
+        // Changed content, a file turned binary (would be pruned).
+        write_lines(&root.join("b.txt"), 50);
+        run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap();
+        std::fs::write(root.join("a.txt"), "changed line\n".repeat(30)).unwrap();
+        std::fs::write(root.join("b.txt"), [0xffu8; 300]).unwrap();
+        let d = diff_files(&store, &cfg).unwrap();
+        assert_eq!(d.changed_files, vec![root.join("a.txt")]);
+        assert_eq!(d.deleted_files, vec![root.join("b.txt")]);
+        assert!(d.new_files.is_empty());
+    }
+
+    #[test]
+    fn diff_reports_files_under_a_newly_excluded_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("gen")).unwrap();
+        write_lines(&root.join("a.txt"), 50);
+        write_lines(&root.join("gen/g.txt"), 50);
+        let mut cfg = test_cfg_for_dir(&dir);
+        let (_db, mut store) = open_temp_db();
+        run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap();
+
+        cfg.index.exclude_dirs.push("gen".into());
+        let d = diff_files(&store, &cfg).unwrap();
+        assert_eq!(d.deleted_files, vec![root.join("gen/g.txt")]);
+        // updatedb agrees: it prunes exactly that record.
+        let stats = run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap();
+        assert_eq!(stats.files_deleted, 1);
+        assert_eq!(diff_files(&store, &cfg).unwrap(), DiffResult::default());
+    }
+
+    #[test]
+    fn updatedb_records_its_run_time() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_lines(&dir.path().join("a.txt"), 50);
+        let cfg = test_cfg_for_dir(&dir);
+        let (_db, mut store) = open_temp_db();
+        assert_eq!(store.get_meta(META_LAST_UPDATEDB).unwrap(), None);
+        run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap();
+        let t: u64 = store
+            .get_meta(META_LAST_UPDATEDB)
+            .unwrap()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(t > 0);
+    }
+
+    #[test]
+    fn diff_reports_deleted_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = dir.path().join("a.txt");
+        write_lines(&f, 50);
+        let cfg = test_cfg_for_dir(&dir);
+        let (_db, mut store) = open_temp_db();
+        run_updatedb(&mut store, &stub(), &cfg, false, None, |_| {}).unwrap();
+        std::fs::remove_file(&f).unwrap();
+        assert_eq!(diff_files(&store, &cfg).unwrap().deleted_files, vec![f]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Real model (run with VEC_TEST_MODEL=<model.onnx> cargo test -- --ignored)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "needs a real ONNX model in VEC_TEST_MODEL"]
+    fn real_model_index_vectors_equal_single_text_embeddings() {
+        let model = std::env::var_os("VEC_TEST_MODEL")
+            .expect("set VEC_TEST_MODEL to an ONNX model file with tokenizer.json beside it");
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_cfg_for_dir(&dir);
+        cfg.embed.index_threads = 2;
+        let embedder =
+            vec_embed::Embedder::load(Path::new(&model), "test-model", &cfg.onnx_options())
+                .unwrap();
+        for (i, name) in ["a.rs", "b.py", "c.txt"].iter().enumerate() {
+            let text: String = (0..60 + 20 * i)
+                .map(|l| format!("fn handler_{l}() {{ let total = compute({l}); }}\n"))
+                .collect();
+            std::fs::write(dir.path().join(name), text).unwrap();
+        }
+        let (_db, mut store) = open_temp_db();
+        let check = |store: &Store| {
+            for name in ["a.rs", "b.py", "c.txt"] {
+                let path = dir.path().join(name);
+                let content = std::fs::read_to_string(&path).unwrap();
+                let stored = store.embeddings_by_text_hash(&path).unwrap();
+                for c in chunk_file(&content, &cfg.index) {
+                    let v = &stored[&sha256_hex(c.text.as_bytes())];
+                    let single = embedder.embed_one(&c.text).unwrap();
+                    let diff = v
+                        .iter()
+                        .zip(&single)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    assert!(
+                        diff < 1e-4,
+                        "{name} lines {}: max diff {diff}",
+                        c.start_line
+                    );
+                }
+            }
+        };
+        run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {}).unwrap();
+        assert_eq!(
+            store.model().unwrap().unwrap().sha256,
+            embedder.model_sha256().unwrap()
+        );
+        check(&store);
+
+        // An edit reuses the untouched chunks; the result is the same.
+        let a = dir.path().join("a.rs");
+        let mut content = std::fs::read_to_string(&a).unwrap();
+        content.push_str("fn appended() { done(); }\n");
+        std::fs::write(&a, content).unwrap();
+        let stats = run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {}).unwrap();
+        assert!(stats.chunks_reused > 0);
+        check(&store);
     }
 }
