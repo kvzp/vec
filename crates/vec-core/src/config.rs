@@ -461,13 +461,31 @@ impl Config {
     ///   → ~/.config/vec/config.toml          (per-user config, overrides system)
     ///   → extra_path (if Some, via --config) (explicit override, highest priority)
     pub fn load(extra_path: Option<&Path>) -> Result<Config> {
-        let mut cfg = default_config();
-
         // System-wide config (admin-controlled)
         #[cfg(unix)]
         let system_conf = Path::new("/etc/vec.conf");
         #[cfg(not(unix))]
         let system_conf = Path::new("C:\\ProgramData\\vec\\vec.conf");
+
+        // Per-user config, auto-detected only without an explicit --config.
+        let user_conf = match extra_path {
+            None => dirs::config_dir().map(|d| d.join("vec").join("config.toml")),
+            Some(_) => None,
+        };
+
+        Self::load_layers(system_conf, user_conf.as_deref(), extra_path)
+    }
+
+    /// Merge the defaults with the config layers that exist, lowest priority
+    /// first: system, user, explicit `--config`. A missing system or user
+    /// file is skipped; a missing explicit file is an error.
+    fn load_layers(
+        system_conf: &Path,
+        user_conf: Option<&Path>,
+        extra_path: Option<&Path>,
+    ) -> Result<Config> {
+        let mut cfg = default_config();
+
         if system_conf.exists() {
             let raw = load_file(system_conf)?;
             merge(&mut cfg, &raw);
@@ -475,14 +493,11 @@ impl Config {
 
         // Per-user config (overrides system — a user may want their own DB,
         // model, or include_paths even when a system install exists).
-        if extra_path.is_none()
-            && let Some(config_dir) = dirs::config_dir()
+        if let Some(user_conf) = user_conf
+            && user_conf.exists()
         {
-            let user_conf = config_dir.join("vec").join("config.toml");
-            if user_conf.exists() {
-                let raw = load_file(&user_conf)?;
-                merge(&mut cfg, &raw);
-            }
+            let raw = load_file(user_conf)?;
+            merge(&mut cfg, &raw);
         }
 
         // Explicit --config flag (highest priority, skips user config auto-detection)
@@ -598,9 +613,37 @@ mod tests {
 
     #[test]
     fn load_no_files_returns_defaults() {
-        // Pass a non-existent extra path → should error; pass None → should succeed.
-        let cfg = Config::load(None).expect("load with no config files should succeed");
+        // No system or user file → the built-in defaults. Uses load_layers so
+        // the result does not depend on the machine's /etc/vec.conf or
+        // ~/.config/vec/config.toml.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load_layers(
+            &dir.path().join("vec.conf"),
+            Some(&dir.path().join("config.toml")),
+            None,
+        )
+        .expect("load with no config files should succeed");
         assert_eq!(cfg.embed.model, "gte-multilingual-base");
+    }
+
+    #[test]
+    fn load_layers_user_overrides_system_and_extra_overrides_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = dir.path().join("vec.conf");
+        let user = dir.path().join("config.toml");
+        let extra = dir.path().join("extra.toml");
+        std::fs::write(&sys, "[embed]\nbatch_size = 8\nmax_tokens = 100\n").unwrap();
+        std::fs::write(&user, "[embed]\nbatch_size = 24\n").unwrap();
+        std::fs::write(&extra, "[embed]\nmax_tokens = 300\n").unwrap();
+
+        let cfg = Config::load_layers(&sys, Some(&user), None).unwrap();
+        assert_eq!((cfg.embed.batch_size, cfg.embed.max_tokens), (24, 100));
+
+        // --config skips the user layer (load passes no user path) and wins over system.
+        let cfg = Config::load_layers(&sys, None, Some(&extra)).unwrap();
+        assert_eq!((cfg.embed.batch_size, cfg.embed.max_tokens), (8, 300));
+
+        assert!(Config::load_layers(&sys, None, Some(&dir.path().join("missing.toml"))).is_err());
     }
 
     #[test]

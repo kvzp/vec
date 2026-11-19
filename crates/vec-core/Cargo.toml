@@ -1,10 +1,11 @@
 [package]
 name = "vec-core"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.89"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 description = "vec shared foundations: config, util, embedder loading"
-license = "MIT"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 serde   = { version = "1", features = ["derive"] }

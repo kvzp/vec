@@ -9,6 +9,19 @@
 // Security note: there is NO content column in chunks. Text is always read
 // from the live source file at query time using byte_offset / byte_end.
 
+// The SQLite source is chosen at build time and must be explicit: a build
+// that silently fell back to the other one would ship a different SQLite
+// than the packager asked for.
+#[cfg(all(feature = "bundled-sqlite", feature = "system-sqlite"))]
+compile_error!(
+    "vec-store: features `bundled-sqlite` and `system-sqlite` are mutually exclusive; \
+     build with --no-default-features --features system-sqlite to link the system libsqlite3"
+);
+#[cfg(not(any(feature = "bundled-sqlite", feature = "system-sqlite")))]
+compile_error!(
+    "vec-store: select a SQLite source: feature `bundled-sqlite` (default) or `system-sqlite`"
+);
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};

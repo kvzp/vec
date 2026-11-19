@@ -5,7 +5,7 @@ export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 	dh $@ --with=systemd
 
 override_dh_auto_build:
-	cargo build --release --features system-sqlite
+	cargo build --release -p vec-cli --no-default-features --features system-sqlite
 
 override_dh_auto_install:
 	# Binary

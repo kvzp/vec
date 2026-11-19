@@ -221,7 +221,7 @@ Transport: stdio (default for Claude Code MCP registration).
 ### Build Flags for Distros
 
 ```bash
-cargo build --release --features system-sqlite
+cargo build --release -p vec-cli --no-default-features --features system-sqlite
 ```
 
 No extra steps. No model download at build time. No Python. No HuggingFace tooling.

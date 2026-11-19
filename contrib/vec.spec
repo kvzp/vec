@@ -29,7 +29,7 @@ After 'dnf install vec vec-model-base', open a terminal and type
 %autosetup
 
 %build
-cargo build --release --features system-sqlite
+cargo build --release -p vec-cli --no-default-features --features system-sqlite
 
 %install
 # Binary

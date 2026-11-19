@@ -36,14 +36,17 @@ No `protobuf-compiler`. No Python. No HuggingFace tooling. No network access at 
 ### Build command
 
 ```bash
-cargo build --release -p vec-cli --features vec-store/system-sqlite
+cargo build --release -p vec-cli --no-default-features --features system-sqlite
 ```
 
 | Feature | Effect |
 |---------|--------|
-| `system-sqlite` | Links against system `libsqlite3` instead of bundling one. **Required for distro packages.** |
+| `bundled-sqlite` (default) | Compiles SQLite into the binary. For development and binary releases. |
+| `system-sqlite` | Links against the system `libsqlite3`, so the distro's SQLite security updates apply. **Required for distro packages.** Needs `--no-default-features`. |
 
-The default build (no features) bundles SQLite — fine for development and binary releases, not for distro packages.
+Exactly one of the two must be enabled; the build fails with an explanatory error otherwise (for example `--features system-sqlite` without `--no-default-features`). Check the result with `ldd target/release/vec | grep sqlite`: a distro build lists `libsqlite3.so.0`.
+
+`rusqlite` targets SQLite 3.45.3 or newer; vec's store tests also pass against Ubuntu 24.04's 3.45.1 (checked in CI).
 
 ### Installed files
 
@@ -211,7 +214,7 @@ vec is BSD-compatible. Portability differences are handled via conditional compi
 Build deps: `lang/rust`, `databases/sqlite3`, `devel/pkgconf`
 
 ```bash
-cargo build --release -p vec-cli --features vec-store/system-sqlite
+cargo build --release -p vec-cli --no-default-features --features system-sqlite
 ```
 
 Install prefix: `/usr/local/`
@@ -232,7 +235,7 @@ Data directory: `/var/db/vec/` (BSD convention; configure via `/usr/local/etc/ve
 Build deps: `lang/rust`, `databases/sqlite3`
 
 ```bash
-cargo build --release -p vec-cli --features vec-store/system-sqlite
+cargo build --release -p vec-cli --no-default-features --features system-sqlite
 ```
 
 Notes:

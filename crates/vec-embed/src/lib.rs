@@ -799,7 +799,7 @@ mod tests {
 
     #[test]
     fn stub_is_unit_length() {
-        let mut emb = Embedder::stub(768);
+        let emb = Embedder::stub(768);
         let v = emb.embed_one("hello world").unwrap();
         assert_eq!(v.len(), 768);
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -808,7 +808,7 @@ mod tests {
 
     #[test]
     fn stub_is_deterministic() {
-        let mut emb = Embedder::stub(768);
+        let emb = Embedder::stub(768);
         let a = emb.embed_one("determinism test").unwrap();
         let b = emb.embed_one("determinism test").unwrap();
         assert_eq!(a, b);
@@ -816,7 +816,7 @@ mod tests {
 
     #[test]
     fn stub_different_texts_differ() {
-        let mut emb = Embedder::stub(768);
+        let emb = Embedder::stub(768);
         let a = emb.embed_one("foo bar baz").unwrap();
         let b = emb.embed_one("completely different text").unwrap();
         let sim = dot(&a, &b);
@@ -825,7 +825,7 @@ mod tests {
 
     #[test]
     fn stub_batch_matches_individual() {
-        let mut emb = Embedder::stub(128);
+        let emb = Embedder::stub(128);
         let texts = vec!["alpha", "beta", "gamma"];
         let batch = emb.embed_batch(&texts).unwrap();
         for (i, text) in texts.iter().enumerate() {
@@ -872,7 +872,7 @@ mod tests {
 
     #[test]
     fn stub_batch_size_1() {
-        let mut emb = Embedder::stub(768);
+        let emb = Embedder::stub(768);
         let result = emb.embed_batch(&["single text"]).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 768);
@@ -880,7 +880,7 @@ mod tests {
 
     #[test]
     fn stub_empty_batch() {
-        let mut emb = Embedder::stub(768);
+        let emb = Embedder::stub(768);
         let result = emb.embed_batch(&[]).unwrap();
         assert!(result.is_empty(), "empty batch should return empty Vec");
     }
@@ -889,7 +889,7 @@ mod tests {
     fn stub_long_text() {
         // Very long text (10 000 chars) must not panic and must return a valid unit vector.
         let long_text: String = "a".repeat(10_000);
-        let mut emb = Embedder::stub(768);
+        let emb = Embedder::stub(768);
         let result = emb.embed_one(&long_text);
         assert!(result.is_ok(), "long text should not cause an error");
         let vec = result.unwrap();
