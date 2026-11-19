@@ -47,12 +47,19 @@ Versioning follows [Semantic Versioning](https://semver.org/).
   - incremental `vec updatedb` prunes newly excluded files (no `--full` needed); a permission error is no longer mistaken for a deleted file;
   - `exclude_dirs` patterns are rooted at each include path: `"/builds"` and absolute paths inside an include path now match.
 - **CI** (from #4): clippy fixes, and the aarch64 cross-compile job installs `g++-aarch64-linux-gnu` and sets `CXX_aarch64_unknown_linux_gnu` (`esaxx-rs` compiles C++); it had failed since March.
+- **MCP server exposed no tools** — `vec serve` answered `tools/list` with an empty list and every `tools/call` with "method not found": the `ServerHandler` was never wired to the tool router (`#[tool_handler]` was missing). `search`, `context` and `index_status` now work; `serverInfo` reports `vec-mcp` instead of `rmcp`.
+- **Dependency audit** — all RustSec vulnerabilities fixed:
+  - `rusqlite` 0.31 → 0.43 (bundled SQLite, `libsqlite3-sys` 0.28 → 0.40, RUSTSEC-2026-0459);
+  - `rmcp` 0.3 → 3.11 (RUSTSEC-2026-0462, RUSTSEC-2026-0189; both in HTTP transports vec does not use);
+  - `tract-onnx` 0.21 → 0.22.5 (RUSTSEC-2026-0217; embeddings are bit-identical to 0.21); `time` 0.3.55 (RUSTSEC-2026-0009, held back by tract 0.21.19's `time < 0.3.42` pin);
+  - `crossbeam-epoch`, `tar` patch updates; `anyhow`, `memmap2`, `rand`, `rustix`, `tokio` patch updates for unsoundness advisories.
 
 - ONNX model loading with `gte-multilingual-base` — cleared `value_info` symbolic dims that tract couldn't parse
 - Watcher feedback loop — events from the DB directory are now filtered out
 
 ### Changed
 
+- **Minimum supported Rust version is now 1.89** (was 1.85), required by `rusqlite` ≥ 0.41 and `rmcp` 3. Debian 13 ships `rustc` 1.85: build with [rustup](https://rustup.rs) there.
 - File read cache in search — no redundant I/O for best-line targeting and snippet display
 
 ---

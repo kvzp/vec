@@ -2,7 +2,7 @@
 name = "vec-mcp"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "vec MCP server for AI assistant integration"
 license = "MIT"
 
@@ -10,7 +10,7 @@ license = "MIT"
 vec-core  = { path = "../vec-core" }
 vec-embed = { path = "../vec-embed" }
 vec-store = { path = "../vec-store" }
-rmcp      = { version = "0.3", features = ["server", "transport-io"] }
+rmcp      = { version = "3", features = ["server", "transport-io"] }
 tokio     = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde     = { version = "1", features = ["derive"] }
 serde_json = "1"

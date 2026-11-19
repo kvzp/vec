@@ -406,14 +406,14 @@ fn merge(cfg: &mut Config, raw: &RawConfig) {
 /// Returns the path unchanged if no home directory can be determined.
 fn expand_tilde(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
-    if s.starts_with("~/") || s == "~" {
-        if let Some(home) = dirs::home_dir() {
-            if s == "~" {
-                return home;
-            }
-            // Replace the leading "~/" with "<home>/"
-            return home.join(&s[2..]);
+    if (s.starts_with("~/") || s == "~")
+        && let Some(home) = dirs::home_dir()
+    {
+        if s == "~" {
+            return home;
         }
+        // Replace the leading "~/" with "<home>/"
+        return home.join(&s[2..]);
     }
     path.to_path_buf()
 }
@@ -475,13 +475,13 @@ impl Config {
 
         // Per-user config (overrides system — a user may want their own DB,
         // model, or include_paths even when a system install exists).
-        if extra_path.is_none() {
-            if let Some(config_dir) = dirs::config_dir() {
-                let user_conf = config_dir.join("vec").join("config.toml");
-                if user_conf.exists() {
-                    let raw = load_file(&user_conf)?;
-                    merge(&mut cfg, &raw);
-                }
+        if extra_path.is_none()
+            && let Some(config_dir) = dirs::config_dir()
+        {
+            let user_conf = config_dir.join("vec").join("config.toml");
+            if user_conf.exists() {
+                let raw = load_file(&user_conf)?;
+                merge(&mut cfg, &raw);
             }
         }
 

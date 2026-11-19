@@ -7,7 +7,7 @@
 // Transport: stdio (read from stdin, write to stdout) — the standard MCP
 // transport for CLI-launched servers like vec.
 //
-// rmcp 0.3 API used here:
+// rmcp 3 API used here:
 //   - `#[tool_router]` on an impl block registers tools via the ToolRouter.
 //   - `#[tool(description = "...")]` marks each method.
 //   - Parameters are extracted using the `Parameters<T>` newtype wrapper.
@@ -20,9 +20,11 @@ use std::sync::Arc;
 use anyhow::Result;
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
-    handler::server::tool::{Parameters, ToolRouter},
-    model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
-    schemars, tool, tool_router,
+    handler::server::{tool::ToolRouter, wrapper::Parameters},
+    model::{
+        CallToolResult, ContentBlock as Content, Implementation, ServerCapabilities, ServerConfig,
+    },
+    schemars, tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
 
@@ -282,18 +284,19 @@ impl VecServer {
     }
 }
 
+#[tool_handler]
 impl ServerHandler for VecServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
                 "vec — semantic file search. Use `search` to find files by meaning, \
-                 `context` to read lines around a result, `index_status` to check \
-                 the index."
-                    .into(),
-            ),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+             `context` to read lines around a result, `index_status` to check \
+             the index.",
+            )
     }
 }
 
@@ -330,10 +333,10 @@ pub async fn run_server() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn load_embedder_for_mcp(cfg: &Config) -> Embedder {
-    if let Ok(model_path) = cfg.resolve_model_path() {
-        if let Ok(e) = Embedder::load(&model_path, cfg.embed.max_tokens) {
-            return e;
-        }
+    if let Ok(model_path) = cfg.resolve_model_path()
+        && let Ok(e) = Embedder::load(&model_path, cfg.embed.max_tokens)
+    {
+        return e;
     }
     Embedder::stub(768)
 }

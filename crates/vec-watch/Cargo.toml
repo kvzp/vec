@@ -2,7 +2,7 @@
 name = "vec-watch"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "vec real-time inotify filesystem watcher"
 license = "MIT"
 
