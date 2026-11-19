@@ -1,3 +1,9 @@
+# vec-updatedb.service — daily full index update (started by vec-updatedb.timer)
+#
+# Same sandbox as vec-watch.service: root with only the capability to read,
+# a read-only system except the index directory. If [database] db_path is
+# not under /var/lib/vec, add ReadWritePaths= with `systemctl edit`.
+
 [Unit]
 Description=vec semantic index update
 After=network.target
@@ -10,6 +16,32 @@ Nice=19
 IOSchedulingClass=idle
 # Allow enough time for full filesystem indexing
 TimeoutStartSec=3h
+
+StateDirectory=vec
+StateDirectoryMode=0755
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# No PrivateTmp=: with a private /tmp the indexer would see an empty /tmp and
+# /var/tmp, prune every record there and never index new files there. To keep
+# /tmp out of the index, exclude it in the configuration instead.
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

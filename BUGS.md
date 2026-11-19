@@ -1,29 +1,61 @@
 # Known Bugs & Limitations
 
-## Known Limitations
+How each failure behaves and how to recover: [FAILURE-ZONE.md](FAILURE-ZONE.md).
 
-### `vec watch`
+## Indexing
 
-- **Lost-event recovery is a full rescan.** An inotify queue overflow (the kernel drops events) or more than `[watch] max_pending` distinct changes makes the next flush re-walk all include paths: correct, but every file is read again.
-- **Watch limit.** A directory that cannot be watched (`fs.inotify.max_user_watches` exhausted) is reported in the log and by `vec status` (`watch_failures`); changes there are only seen by the next `vec updatedb`.
-- **`exclude_dirs` / `include_paths` edits need a restart** of `vec watch` (the config is read once). The next incremental `vec updatedb` prunes newly excluded files; `--full` is no longer needed for that.
-- **The kernel queue overflow path is covered by unit tests only.** A 40 000-event burst did not overflow the default queue in the end-to-end test; forcing it needs root (`fs.inotify.max_queued_events`).
+- **`--full` with a new model has no staging area.** The old index is emptied at
+  the first successful write; a crash or kill before the run ends leaves a partial
+  (but consistent, single-model) index. Recover with `vec updatedb`.
+- **Size+mtime skip.** A file whose content changes while its size and mtime stay
+  the same (`touch -r`, some restore tools) is not re-read. Use `vec updatedb --full`.
+- **`vec updatedb` exits 0 when some files failed** to read or embed; only the
+  summary (`errors=N`) and `warn:` lines say so.
+- **Not indexed by design:** symlinks (never followed), files with non-UTF-8
+  names (skipped and counted), non-UTF-8 content, files outside
+  `[min_file_size, max_file_size]`, hidden entries.
+- **`onnx_batch_size > 1`** changes the vectors of dynamically quantized (int8)
+  models slightly (cosine about 0.98 to the unbatched vector), so index and query
+  vectors are no longer bit-identical. The default (1) is deterministic.
 
-## Untested Platforms
+## Model identity
 
-### macOS
+- **Queries do not hash the model file.** A model file replaced in place with the
+  same name and dimension is detected by writers (`vec updatedb`, `vec watch`,
+  `vec daemon`) and by queries only once the per-user sha256 cache knows the new
+  file; until a writer runs, queries can compare new-model vectors with old ones.
 
-vec has **never been tested on macOS**. No Apple hardware is available for testing.
+## Search and diagnostics
 
-The code is pure Rust with no platform-specific dependencies beyond the `nix` crate (gated behind `cfg(unix)`), so it *should* compile and run. Known risks:
+- `vec doctor` does not count stale chunk offsets (files edited since indexing);
+  `vec explain` shows it per file (`changed_since_indexed`).
+- Snippets of files edited since indexing may point at the wrong lines until the
+  file is re-indexed (they never panic).
 
-- **inotify → kqueue**: `vec watch` uses the `notify` crate which abstracts over platform-specific APIs. On macOS this means FSEvents/kqueue instead of inotify. Untested — debounce timing and event semantics may differ.
-- **`access(path, R_OK)`**: Used for per-user permission checks via the `nix` crate. Should work on macOS (POSIX) but has not been verified.
-- **systemd user units**: Not applicable on macOS. Users would need launchd plists instead (not provided).
-- **Model loading (tract-onnx)**: tract supports macOS including Apple Silicon, but the ONNX patching in `embed.rs` (clearing `value_info` for symbolic dims) has only been tested on x86_64 Linux.
+## Backends
 
-**Contributors with macOS hardware welcome** — even a `cargo build && cargo test` report would be valuable.
+- The HTTP (Ollama) backend speaks **plain HTTP only** (`embed_url` must start
+  with `http://`): use it on localhost or a trusted network, or behind a local
+  TLS-terminating proxy.
+- `vec model download` prints `curl` commands instead of downloading (no TLS
+  client in the binary).
 
-### Windows
+## `vec watch`
 
-Not a target platform. The code has `cfg(not(unix))` fallbacks for config paths (`C:\ProgramData\vec\`) but these are placeholders — no testing has been done.
+- **Lost-event recovery is a full rescan.** An inotify queue overflow, or more
+  than `[watch] max_pending` distinct changes, makes the next flush re-walk the
+  include paths: correct, but every file whose size or mtime changed is read again.
+- **Watch limit.** A directory that cannot be watched
+  (`fs.inotify.max_user_watches` exhausted) is reported (`watch_failures` in
+  `vec status`); changes there are only seen by the next `vec updatedb`.
+- **The kernel queue overflow path is covered by unit tests only**; forcing a real
+  overflow needs root (`fs.inotify.max_queued_events`).
+
+## Untested platforms
+
+- **macOS:** never tested (no hardware). `vec watch` would use FSEvents/kqueue via
+  `notify`; no launchd units are provided. A `cargo build && cargo test` report is
+  welcome.
+- **BSD:** not tested; see [PACKAGING.md](PACKAGING.md#bsd).
+- **Windows:** not a target. A few `cfg(not(unix))` fallbacks exist (no daemon,
+  open-for-read instead of `access()`), untested.

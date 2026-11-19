@@ -8,17 +8,15 @@ cd vec
 cargo build
 ```
 
-No Python, no protoc, no npm. Pure Rust.
+No Python, no protoc, no npm. Rust plus a C/C++ compiler (bundled SQLite, `tokenizers`).
 
 ### Getting a model for development
 
-Download `gte-multilingual-base` int8 ONNX and place it under `/usr/share/vec/models/`:
-
 ```bash
-vec model download   # prints exact curl commands to run
+vec model download        # prints the mkdir/curl commands; pipe to sh (sudo for /usr/share)
 ```
 
-Or place the ONNX file + `tokenizer.json` manually in `/usr/share/vec/models/gte-multilingual-base/`.
+Or point `[embed] model` at an absolute `.onnx` path with `tokenizer.json` beside it.
 
 ### system-sqlite feature (links against system libsqlite3)
 
@@ -42,7 +40,7 @@ machine:
 
 ```bash
 # Install the cross-compiler (Debian/Ubuntu)
-sudo apt-get install gcc-aarch64-linux-gnu
+sudo apt-get install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
 # Add the Rust target
 rustup target add aarch64-unknown-linux-gnu
@@ -50,12 +48,12 @@ rustup target add aarch64-unknown-linux-gnu
 # Build
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
 CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
 cargo build --release --target aarch64-unknown-linux-gnu
 ```
 
-The `rusqlite` bundled feature compiles SQLite from C, which requires the
-aarch64 C compiler (`CC_aarch64_unknown_linux_gnu`). The rest of the crate is
-pure Rust and cross-compiles without extra tooling.
+The bundled SQLite (C) and `esaxx-rs` (C++, via `tokenizers`) need the aarch64
+C and C++ compilers.
 
 Output: `target/aarch64-unknown-linux-gnu/release/vec`
 
@@ -65,90 +63,71 @@ assets.
 
 ---
 
-## Running Tests
+## Running tests
 
-```bash
-cargo test                          # all unit tests
-cargo test store                    # tests in store.rs
-cargo test -- --nocapture           # show println output
-cargo test --features integration   # integration tests (requires model files present)
-```
-
-Tests that require the embedding model on disk are gated behind `#[cfg(feature = "integration")]` and skipped by default.
+See [TESTING.md](TESTING.md). In short: `cargo test`, `cargo clippy -- -D warnings`,
+`cargo fmt --check`; real-model tests with
+`VEC_TEST_MODEL=/path/model_int8.onnx cargo test -- --ignored`.
 
 ---
 
-## Project Structure
+## Project structure
 
 ```
-vec/
-├── crates/
-│   ├── vec-core/       # Config (TOML), util (access() check), load_embedder()
-│   ├── vec-embed/      # ONNX inference via tract, tokenizer, rayon parallel embedding
-│   ├── vec-store/      # SQLite storage, cosine similarity search, pack/unpack
-│   ├── vec-index/      # File walker, chunker, incremental hash check, diff
-│   ├── vec-watch/      # inotify watcher (vec watch)
-│   ├── vec-daemon/     # Unix socket embedding daemon (vec daemon)
-│   ├── vec-mcp/        # MCP server (vec serve)
-│   └── vec-cli/        # Clap CLI — all subcommands
-├── contrib/            # systemd units (system + user), sysctl, distro packaging
-├── Cargo.toml          # Workspace root
-├── flake.nix           # Nix flake for NixOS users
-├── README.md           # Quick start, usage, output format
-├── ARCHITECTURE.md     # Core design decisions and data flow
-├── SECURITY.md         # Security model: no-content DB, access() ACL, threat analysis
-├── CONTRIBUTING.md     # This file — dev setup, tests, project structure, invariants
-├── TESTING.md          # Test strategy, coverage table, known gaps, test conventions
-├── CONFIG.md           # Full config reference with all settings and recipes
-├── AI-INTEGRATION.md   # AI assistant integration (MCP server, Claude Code skill, hooks)
-├── PACKAGING.md        # Guide for distro packagers (Debian/RPM/BSD, system-sqlite)
-├── CHANGELOG.md        # Version history following Keep a Changelog
-├── TODO.md             # Feature backlog and deferred items
-├── BUGS.md             # Known bugs and untested platforms
-└── PROJECT.md          # Project positioning, mental model, and MVP scope
+crates/
+  vec-embed/    embedders (ONNX via tract, Ollama HTTP, stub), ModelIdentity
+  vec-core/     config (defaults.toml, locations.toml), init templates, snippet, sha cache, util
+  vec-store/    SQLite schema + migrations, model identity, atomic writes, search
+  vec-index/    walker, chunker, incremental indexer, diff
+  vec-watch/    inotify watcher (vec watch)
+  vec-daemon/   embedding daemon + client, protocol v2, socket activation
+  vec-query/    read side shared by CLI and MCP
+  vec-mcp/      MCP server (vec serve)
+  vec-cli/      clap CLI (src/commands/: search, index, status, setup, services)
+contrib/        systemd units (system + user), sysctl, vec.conf, RPM/Debian packaging
 ```
+
+Docs: README, CONFIG, ARCHITECTURE, SECURITY, FAILURE-ZONE, AI-INTEGRATION,
+PACKAGING, TESTING, CHANGELOG, BUGS, TODO, PROJECT.
 
 ---
 
-## Key Invariants (don't break these)
+## Key invariants (don't break these)
 
-1. **No source text in the DB.** `chunks` table has no `content` column. Snippets are always read from the live file using `byte_offset..byte_end`.
-
-2. **Filesystem is the ACL.** `access(path, R_OK)` is called on every query result before display — drop silently if denied. Don't add a separate permission system.
-
-3. **Gitignore-aware.** The indexer must use the `ignore` crate (ripgrep's engine) to respect `.gitignore` at every directory level.
-
-4. **Incremental by default.** `vec updatedb` must skip files whose sha256 hash hasn't changed. Full re-index only on `--full`.
-
-5. **No runtime dependencies in release binary.** The default build bundles SQLite (`rusqlite` bundled feature). The `system-sqlite` feature is for distro packagers who control the environment.
-
-6. **Model mismatch detection.** If `meta.model_name` in the DB differs from the configured model, vec must exit with a clear error rather than silently return wrong results.
-
----
-
-## Adding File Type Support
-
-Boundary detection lives in `src/index.rs: BOUNDARY_PATTERNS`. It's a flat
-`&[&str]` of line-start strings applied to every file type. vec is
-general-purpose — it indexes any text files, not just source code.
-
-```rust
-const BOUNDARY_PATTERNS: &[&str] = &[
-    "fn ", "pub fn ", "async fn ", "pub async fn ",
-    "impl ", "pub struct ", "pub enum ",
-    "def ", "class ", "func ", "function ",
-    // add yours here
-];
-```
-
-Verify manually that chunks look reasonable on a real file in that language.
+1. **No source text in the DB.** `chunks` has no content column; snippets are read
+   from the live file through `byte_offset..byte_end`.
+2. **Filesystem is the ACL.** `access(path, R_OK)` on every result before display,
+   before the limit. No separate permission system.
+3. **No literal defaults in code.** Tunables go in `crates/vec-core/defaults.toml`
+   (and CONFIG.md), file locations in `locations.toml`. A missing value is an error,
+   never a guessed fallback. New config keys need validation where a value can be wrong.
+4. **One model per index.** Writers call `Store::ensure_model`; readers check the
+   identity; vectors of two models are never mixed.
+5. **Atomic per file, exact pruning.** A file's record and chunks change in one
+   transaction (`replace_file`); prune only after a completed walk, and only what
+   the walker did not accept. `vec watch` must never re-implement walker rules.
+6. **Incremental by default**: size+mtime, then sha256, then per-chunk text hash.
+   Full re-embedding only with `--full`.
+7. **Never read through a symlink** on the index or display path (`O_NOFOLLOW`,
+   regular files, capped reads).
+8. **Bounded everything** in the daemon: request size, text count, connections,
+   deadlines.
 
 ---
 
-## Submitting Changes
+## Adding file-type support
 
-- One logical change per PR
-- Update `ARCHITECTURE.md` if you change data flow or add a component
-- Update `SECURITY.md` if you change anything touching the DB or permissions
-- `cargo test` must pass
-- If adding distro packaging support, test the build with `-p vec-cli --no-default-features --features system-sqlite`
+Chunk boundaries come from `[index] boundary_patterns` (line prefixes, after
+indentation) and `[index] boundary_scan` in `defaults.toml`. Add patterns there,
+document them in CONFIG.md if the meaning changes, and check the chunks of a real
+file with `vec explain file:line`.
+
+---
+
+## Submitting changes
+
+- One logical change per PR; `cargo test`, clippy and fmt must pass.
+- Update the docs your change touches: ARCHITECTURE (data flow, components),
+  SECURITY (DB, permissions, daemon), CONFIG (keys), FAILURE-ZONE (error
+  behaviour), CHANGELOG (`Unreleased`).
+- Packaging changes: build with `-p vec-cli --no-default-features --features system-sqlite`.

@@ -1,0 +1,42 @@
+# vec-embed.socket — socket activation for the OPTIONAL embedding daemon
+#
+# systemd listens on the socket and starts vec-embed.service on the first
+# connection, so the model is only loaded when a query arrives. With
+# [daemon] idle_exit_secs set in /etc/vec.conf (e.g. 600), the daemon exits
+# after that long without a request and its memory is freed; the next query
+# starts it again.
+#
+# Start-up is eager: the daemon loads the model and hashes its file (sha256,
+# the identity clients check) before it accepts the first connection. The
+# query that started it waits for all of that, bounded by the client's
+# [daemon] reply_timeout_ms (not io_timeout_ms, which only catches stalled
+# peers). Eager rather than lazy because no client could be answered sooner
+# (the handshake carries the hash) and a broken model then fails the service
+# visibly instead of failing every query.
+#
+# The path must equal [daemon] socket in /etc/vec.conf (default
+# /run/vec/embed.sock). SocketMode= here replaces [daemon] socket_mode, which
+# only applies when the daemon binds the socket itself (no systemd).
+#
+# HOW TO ENABLE (user's explicit choice only)
+#   systemctl enable --now vec-embed.socket
+# HOW TO DISABLE
+#   systemctl disable --now vec-embed.socket vec-embed.service
+#
+# Packagers: DO NOT enable this in postinst. Ship it disabled.
+
+[Unit]
+Description=vec embedding daemon socket (OPTIONAL)
+Documentation=https://github.com/kvzp/vec/blob/main/CONFIG.md#daemon
+
+[Socket]
+ListenStream=/run/vec/embed.sock
+# The daemon returns only vectors for the texts a client sends, so any local
+# user may connect. Use 0660 and SocketGroup= to restrict it.
+SocketMode=0666
+DirectoryMode=0755
+# One daemon serves every connection (it runs one thread per connection).
+Accept=no
+
+[Install]
+WantedBy=sockets.target

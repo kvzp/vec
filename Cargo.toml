@@ -6,6 +6,7 @@ members = [
     "crates/vec-index",
     "crates/vec-watch",
     "crates/vec-daemon",
+    "crates/vec-query",
     "crates/vec-mcp",
     "crates/vec-cli",
 ]

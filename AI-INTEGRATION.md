@@ -18,9 +18,8 @@ vec --version
 vec status
 
 # If not indexed yet:
-vec updatedb            # system-wide install
-# or for userland:
-vec --config ~/.config/vec/config.toml updatedb
+sudo vec updatedb       # system-wide install
+vec updatedb            # userland (~/.config/vec/config.toml is read automatically)
 ```
 
 If vec is not installed at all, see [README.md](README.md) for build and install instructions (system-wide or userland).
@@ -33,24 +32,38 @@ If vec is not installed at all, see [README.md](README.md) for build and install
 
 ### MCP Tools
 
-#### `search(query, limit?, path_filter?, min_score?)`
+Search and ranking are the CLI's (same path boost, same filters). The server
+loads the model at most once, on the first query that needs it, and uses the
+embedding daemon when it serves the index's model. A failure comes back as an
+error result (`isError: true`) whose text says what to fix (e.g. a model
+mismatch asks for `vec updatedb --full`; every case: [FAILURE-ZONE.md](FAILURE-ZONE.md#mcp-server)). Relative paths are resolved against
+the server's working directory.
+
+#### `search(query?, queries?, limit?, path_filter?, exclude?, min_score?)`
 Semantic search over the indexed corpus.
-- `query` — natural language or code fragment
-- `limit` — max results (default: from config)
-- `path_filter` — restrict to paths matching this prefix
-- `min_score` — minimum cosine similarity (0.0-1.0)
-- Returns: `[{path, start_line, end_line, score, snippet}]`
+- `query` / `queries` — one or more natural-language or code queries (at least one; at most `[search] max_queries`); results are merged, best score per chunk
+- `limit` — max results (default: `[search] default_limit`)
+- `path_filter` — only files equal to or under this path
+- `exclude` — drop files equal to or under these paths
+- `min_score` — minimum cosine similarity, -1.0 to 1.0 (default: `[search] min_score`)
+- Returns: `[{path, line, start_line, end_line, score, snippet}]` — `line` is the chunk's line that best matches the query words, `start_line`/`end_line` the chunk, `snippet` up to `[search] snippet_lines` lines before and after `line` read from the live file (`>` marks `line`)
+
+#### `similar(file_path, line, limit?)`
+Chunks similar to the indexed chunk covering `file_path:line` (uses its stored vector; no model load). `file_path` must be readable by the user running the server.
+- Returns: the same items as `search`
+
+#### `explain(file_path, line)`
+How a location is indexed. `file_path` must exist and be readable by the user running the server.
+- Returns: `{path, line, chunks: [{start_line, end_line, byte_offset, byte_end}], indexed_hash, changed_since_indexed}`
 
 #### `context(file_path, line, window?)`
-Raw file content around a line.
-- `file_path` — absolute path
-- `line` — 1-based line number
-- `window` — lines above/below to include (default: 10)
+File content around a line, for **indexed files only** (also: readable by the user running the server, a regular file, at most `[index] max_file_size` bytes) — a prompt-injected client cannot read arbitrary files.
+- `window` — lines above/below (default: `[search] context_window`)
 - Returns: annotated source lines with `>` marking the target
 
-#### `index_status()`
-Index health snapshot.
-- Returns: `{file_count, chunk_count, db_path, model, model_found}`
+#### `index_status(probe_daemon?)`
+Index health snapshot. The embedding daemon is not contacted unless `probe_daemon` is `true` (connecting starts a socket-activated daemon, which loads the model); by default `daemon` only says whether its socket exists.
+- Returns: `{db_path, db_size_bytes, schema_version, supported_schema_version, files, chunks, index_model: {name, dim, sha256} | null, backend, configured_model, model_path, model_error, model_mismatch, last_updatedb, watcher: {last_flush, last_success, last_error, last_paths, watched_dirs, watch_failures, pending, overflows, rescans, reloads} | null, daemon}`. Times are Unix seconds. `daemon` is one of `{state: "not_probed", socket_exists}`, `{state: "not_running"}`, `{state: "running", identity, usable}`, `{state: "error", message}`, `{state: "unsupported"}`.
 
 ### MCP Setup
 
@@ -126,7 +139,7 @@ The skill instructs Claude to run `vec` via Bash, interpret the results, and opt
 
 ### Userland Note
 
-If vec is installed as userland (not in `$PATH`), the skill calls `~/.local/bin/vec --config ~/.config/vec/config.toml`. If your binary or config is elsewhere, edit the skill's `SKILL.md` to match your paths.
+The skill runs `vec` from `$PATH`; a userland install reads `~/.config/vec/config.toml` automatically. If your binary is elsewhere (e.g. `~/.local/bin` not in `$PATH`), edit the skill's `SKILL.md`.
 
 ---
 

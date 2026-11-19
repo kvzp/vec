@@ -10,5 +10,19 @@ IOSchedulingClass=idle
 # Allow enough time for full home directory indexing
 TimeoutStartSec=1h
 
+# Sandbox options that work in a user manager (seccomp, no namespaces:
+# ProtectSystem=, PrivateNetwork= etc. need unprivileged user namespaces,
+# which some distributions disable).
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
 [Install]
 WantedBy=default.target

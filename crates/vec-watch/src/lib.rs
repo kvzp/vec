@@ -4,25 +4,39 @@
 // the index. Nothing here re-implements its rules in a way that could
 // disagree; shortcuts are only taken where they are exact.
 //
-// Architecture (three threads):
+// Startup: the configuration and the embedder are loaded once (a model that
+// cannot be loaded, or that differs from the index's, is an error before
+// anything is watched). The pair, with the event filter built from the same
+// configuration, is the `Runtime`; SIGHUP replaces it (see below).
+//
+// Architecture (four threads):
 //   - notify's event thread runs `Handler::handle`. It drops events the
 //     walker can never index, decided exactly from the path alone
 //     (`IndexFilter`: outside include_paths, DB directory, hidden component,
 //     exclude_dirs), and records the rest in a de-duplicated, bounded
 //     `Pending` set. Directory-shaped events, and changes to .gitignore /
 //     .ignore / .git / .git/info/exclude, go to the reconcile queue.
-//   - The watch manager thread reconciles watches: for a directory it walks
-//     it with the real walker (`vec_index::visit_dirs`) and makes the set of
-//     non-recursive inotify watches under it equal the set of directories the
-//     walker would enter — adding new ones, removing deleted, moved-out and
-//     newly ignored ones. Excluded and ignored trees never get a watch. After
-//     watching a new directory, or after an ignore-rule change, it queues the
-//     directory for re-indexing, so files written before the watch existed
-//     (or newly (un)ignored files) are picked up.
+//   - The watch manager thread owns the inotify watches. For a directory it
+//     walks it with the real walker (`vec_index::visit_dirs`) and makes the
+//     set of non-recursive inotify watches under it equal the set of
+//     directories the walker would enter — adding new ones, removing deleted,
+//     moved-out and newly ignored ones. Excluded and ignored trees never get a
+//     watch. After watching a new directory, or after an ignore-rule change,
+//     it queues the directory for re-indexing, so files written before the
+//     watch existed (or newly (un)ignored files) are picked up. No lock is
+//     held during a walk; the counters `vec status` shows are atomics.
+//   - The SIGHUP thread turns the signal into a reload request for the
+//     manager, which loads the configuration and the embedder again. On
+//     success the new runtime replaces the old one, watches outside the new
+//     include paths are dropped, the include paths are re-walked and
+//     re-indexed, and include paths that were dropped are re-indexed too
+//     (which prunes their records). On failure the old runtime stays.
 //   - The main thread flushes `Pending` after [watch] debounce_ms of quiet or
 //     at most [watch] max_wait_ms after the first change, and runs
 //     `vec_index::update_paths`, which walks and prunes exactly the changed
-//     paths. A failed flush is re-queued, never dropped.
+//     paths. A failed flush is re-queued with exponential backoff, never
+//     dropped. Each flush records the watcher's state in the index `meta`
+//     table (keys `watch.*`, read by `vec status`).
 //
 // Lost information is never ignored: an inotify queue overflow, or more
 // distinct changes than [watch] max_pending, degrades to a rescan of the
@@ -32,9 +46,10 @@
 // 8192 on many kernels. The package postinst sets 65536 via
 // /etc/sysctl.d/99-vec.conf. Watch failures are reported by `vec status`.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -42,49 +57,63 @@ use notify::event::{CreateKind, ModifyKind, RemoveKind};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 
 use vec_core::config::{Config, WatchConfig};
+use vec_embed::Embedder;
 use vec_index::{IndexFilter, update_paths, visit_dirs};
-use vec_store::{Store, is_gone};
+use vec_store::{Store, StoreOptions, is_gone};
 
-/// Run the real-time watcher. Blocks until killed (SIGTERM/SIGINT).
-/// `cfg_path` is the `--config` override, as for every other subcommand.
+/// Run the real-time watcher. Blocks until killed (SIGTERM/SIGINT); SIGHUP
+/// reloads the configuration. `cfg_path` is the `--config` override, as for
+/// every other subcommand.
+///
+/// # Errors
+///
+/// When the configuration or the embedder cannot be loaded, the index holds
+/// vectors of another model, or the watcher cannot be set up.
 pub fn run_watch(cfg_path: Option<&Path>) -> Result<()> {
-    let cfg = Config::load(cfg_path).context("loading config")?;
-    let wcfg = cfg.watch.clone();
-    let log = |msg: &str| anstream::eprintln!("{msg}");
+    let cfg_path: Option<PathBuf> = cfg_path.map(Path::to_path_buf);
+    let load = move || Runtime::load(cfg_path.as_deref());
+    let rt = load()?;
+    #[cfg(unix)]
+    let hup = reload_signal::install()?;
 
+    let wcfg = &rt.cfg.watch;
     anstream::eprintln!(
-        "vec watch: monitoring {} path(s), debounce {} ms, max wait {} ms, max pending {}",
-        cfg.index.include_paths.len(),
+        "vec watch: model {}, monitoring {} path(s), debounce {} ms, max wait {} ms, max pending {}",
+        rt.embedder.identity(),
+        rt.cfg.index.include_paths.len(),
         wcfg.debounce_ms,
         wcfg.max_wait_ms,
         wcfg.max_pending,
     );
+    for path in &rt.cfg.index.include_paths {
+        if !path.exists() {
+            anstream::eprintln!("  warn: path does not exist, skipping: {}", path.display());
+        }
+    }
 
-    let pending: Shared<Pending> = shared(Pending::new(cfg.index.include_paths.clone()));
+    let pending: Shared<Pending> = shared(Pending::new(rt.cfg.index.include_paths.clone()));
     let queue: Shared<ReconcileQueue> = shared(ReconcileQueue::default());
+    let stats = Arc::new(WatchStats::default());
+    let current: Current = Arc::new(RwLock::new(Arc::new(rt)));
 
     let handler = Handler {
-        filter: IndexFilter::new(&cfg, &log),
+        current: Arc::clone(&current),
         pending: Arc::clone(&pending),
         queue: Arc::clone(&queue),
-        max_pending: wcfg.max_pending,
     };
     let watcher = notify::RecommendedWatcher::new(
         move |res: notify::Result<Event>| handler.handle(res),
         notify::Config::default(),
     )
     .context("creating filesystem watcher")?;
-    let watches = Arc::new(Mutex::new(Watches::new(watcher)));
+    let mut watches = Watches::new(watcher);
 
     // Initial watches, before anything else, so no change can slip between
     // the startup rescan and the first watch.
     let started = Instant::now();
-    for path in &cfg.index.include_paths {
-        if !path.exists() {
-            anstream::eprintln!("  warn: path does not exist, skipping: {}", path.display());
-        }
-    }
-    let r = lock(&watches).reconcile(&cfg, &cfg.index.include_paths);
+    let rt = snapshot(&current);
+    let r = watches.reconcile(&rt.cfg, &rt.cfg.index.include_paths);
+    stats.record_watches(&watches);
     anstream::eprintln!(
         "  watching {} directories ({} failed) in {:.1}s",
         r.added,
@@ -93,60 +122,108 @@ pub fn run_watch(cfg_path: Option<&Path>) -> Result<()> {
     );
 
     // Changes made while the watcher was not running are unknown: rescan.
-    if wcfg.startup_rescan {
+    if rt.cfg.watch.startup_rescan {
         let (lock_p, cvar) = &*pending;
         lock(lock_p).force_rescan(Instant::now());
         cvar.notify_one();
     }
+    drop(rt);
 
     {
-        let cfg = cfg.clone();
-        let watches = Arc::clone(&watches);
+        let current = Arc::clone(&current);
         let pending = Arc::clone(&pending);
         let queue = Arc::clone(&queue);
+        let stats = Arc::clone(&stats);
         std::thread::Builder::new()
             .name("vec-watch-manager".into())
-            .spawn(move || watch_manager(&cfg, &watches, &queue, &pending))
+            .spawn(move || watch_manager(watches, &current, &queue, &pending, &stats, &load))
             .context("spawning watch manager thread")?;
+    }
+    #[cfg(unix)]
+    {
+        let queue = Arc::clone(&queue);
+        std::thread::Builder::new()
+            .name("vec-watch-sighup".into())
+            .spawn(move || reload_signal::forward(hup, &queue))
+            .context("spawning SIGHUP thread")?;
     }
 
     let mut failures: u32 = 0;
     loop {
-        let batch = wait_for_batch(&pending, &wcfg);
-        let paths = if batch.rescan {
-            anstream::eprintln!("rescanning include paths");
-            cfg.index.include_paths.clone()
-        } else {
-            batch.paths.clone()
-        };
-        anstream::eprintln!(
-            "reindexing {} path(s) from {} event(s), oldest change {:.1}s ago",
-            paths.len(),
-            batch.events,
-            batch.age.as_secs_f64(),
+        let batch = wait_for_batch(&pending, &current);
+        let rt = snapshot(&current);
+        flush(
+            &rt,
+            batch,
+            &pending,
+            &stats,
+            &mut failures,
+            |store, paths| index_batch(store, &rt, paths),
         );
-        let outcome = index_batch(&cfg, &paths);
-        let (watched, failed) = {
-            let w = lock(&watches);
-            (w.dirs.len(), w.failed.len())
-        };
-        if let Err(e) = &outcome {
-            // Never drop changes: put them back and retry with exponential
-            // backoff (a broken database must not become a busy loop).
-            failures = failures.saturating_add(1);
-            let delay = retry_delay(&wcfg, failures);
-            anstream::eprintln!(
-                "warn: reindex failed (attempt {failures}), retrying in {:.1}s: {e:#}",
-                delay.as_secs_f64()
-            );
-            let (lock_p, cvar) = &*pending;
-            let now = Instant::now();
-            lock(lock_p).requeue(batch, now, wcfg.max_pending, now + delay);
-            cvar.notify_one();
-        } else {
-            failures = 0;
-        }
-        write_status(&cfg, &paths, outcome.as_ref().err(), watched, failed);
+    }
+}
+
+/// Everything a reload replaces: the configuration, the embedder loaded from
+/// it, and the event filter built from it.
+struct Runtime {
+    cfg: Config,
+    embedder: Embedder,
+    filter: IndexFilter,
+}
+
+impl Runtime {
+    /// Load the configuration (`--config` override) and build a runtime.
+    fn load(cfg_path: Option<&Path>) -> Result<Self> {
+        let cfg = Config::load(cfg_path).context("loading config")?;
+        Self::new(cfg)
+    }
+
+    /// Load the embedder and check it against the index. Any failure is an
+    /// error: never index with a model that is missing or differs.
+    fn new(cfg: Config) -> Result<Self> {
+        let embedder = vec_core::load_embedder(&cfg)?;
+        let cache = vec_core::model_sha::ShaCache::for_user()?;
+        let identity = vec_core::model_sha::writer_identity(&embedder, cache.as_ref())
+            .context("computing the model identity")?;
+        open_store(&cfg)?.check_model(&identity)?;
+        let filter = IndexFilter::new(&cfg, &|msg| anstream::eprintln!("{msg}"));
+        Ok(Self {
+            cfg,
+            embedder,
+            filter,
+        })
+    }
+}
+
+/// The runtime in use, replaced as a whole on reload. Readers take a
+/// snapshot (`Arc` clone) and never hold the lock while working.
+type Current = Arc<RwLock<Arc<Runtime>>>;
+
+fn snapshot(current: &Current) -> Arc<Runtime> {
+    Arc::clone(&current.read().unwrap_or_else(|e| e.into_inner()))
+}
+
+fn open_store(cfg: &Config) -> Result<Store> {
+    Store::open(
+        &cfg.database.db_path,
+        &StoreOptions::from_config(&cfg.database, false),
+    )
+    .with_context(|| format!("opening the index {}", cfg.database.db_path.display()))
+}
+
+/// Counters shown by `vec status`, updated without locks.
+#[derive(Default)]
+struct WatchStats {
+    watched_dirs: AtomicUsize,
+    watch_failures: AtomicUsize,
+    rescans: AtomicU64,
+    reloads: AtomicU64,
+}
+
+impl WatchStats {
+    fn record_watches(&self, w: &Watches) {
+        self.watched_dirs.store(w.dirs.len(), Ordering::Relaxed);
+        self.watch_failures.store(w.failed.len(), Ordering::Relaxed);
     }
 }
 
@@ -174,10 +251,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 // ---------------------------------------------------------------------------
 
 struct Handler {
-    filter: IndexFilter,
+    current: Current,
     pending: Shared<Pending>,
     queue: Shared<ReconcileQueue>,
-    max_pending: usize,
 }
 
 /// What one event asks for.
@@ -193,8 +269,9 @@ struct Triage {
 
 impl Handler {
     fn handle(&self, res: notify::Result<Event>) {
+        let rt = snapshot(&self.current);
         let t = match res {
-            Ok(event) => triage(&event, &self.filter),
+            Ok(event) => triage(&event, &rt.filter),
             Err(e) => {
                 // An error from the backend may mean lost events.
                 anstream::eprintln!("watch error: {e} — scheduling a rescan");
@@ -204,6 +281,8 @@ impl Handler {
                 }
             }
         };
+        let max_pending = rt.cfg.watch.max_pending;
+        drop(rt);
         let now = Instant::now();
         if t.rescan || !t.reconcile.is_empty() {
             let (l, cvar) = &*self.queue;
@@ -212,7 +291,7 @@ impl Handler {
                 q.overflow = true;
             }
             for (dir, reindex) in t.reconcile {
-                q.insert(dir, reindex, self.max_pending);
+                q.insert(dir, reindex, max_pending);
             }
             cvar.notify_one();
         }
@@ -220,10 +299,10 @@ impl Handler {
             let (l, cvar) = &*self.pending;
             let mut p = lock(l);
             if t.rescan {
-                p.force_rescan(now);
+                p.lost_events(now);
             }
             for path in t.reindex {
-                p.insert(path, now, self.max_pending);
+                p.insert(path, now, max_pending);
             }
             cvar.notify_one();
         }
@@ -306,6 +385,8 @@ fn may_be_dir_change(kind: &EventKind, path: &Path) -> bool {
 struct ReconcileQueue {
     dirs: HashMap<PathBuf, bool>,
     overflow: bool,
+    /// SIGHUP: reload the configuration first.
+    reload: bool,
 }
 
 impl ReconcileQueue {
@@ -321,15 +402,17 @@ impl ReconcileQueue {
     }
 
     fn is_empty(&self) -> bool {
-        self.dirs.is_empty() && !self.overflow
+        self.dirs.is_empty() && !self.overflow && !self.reload
     }
 }
 
 fn watch_manager(
-    cfg: &Config,
-    watches: &Mutex<Watches>,
+    mut watches: Watches,
+    current: &Current,
     queue: &(Mutex<ReconcileQueue>, Condvar),
     pending: &(Mutex<Pending>, Condvar),
+    stats: &WatchStats,
+    load: &dyn Fn() -> Result<Runtime>,
 ) {
     let (lq, cq) = queue;
     loop {
@@ -340,9 +423,15 @@ fn watch_manager(
             }
             std::mem::take(&mut *q)
         };
-        let (dirs, reindex): (Vec<PathBuf>, Vec<PathBuf>) = if job.overflow {
+        let mut rewalk_all = job.overflow;
+        if job.reload && apply_reload(load(), current, &mut watches, pending) {
+            stats.reloads.fetch_add(1, Ordering::Relaxed);
+            rewalk_all = true;
+        }
+        let rt = snapshot(current);
+        let (dirs, reindex): (Vec<PathBuf>, Vec<PathBuf>) = if rewalk_all {
             anstream::eprintln!("re-walking include paths to reconcile watches");
-            let roots = cfg.index.include_paths.clone();
+            let roots = rt.cfg.index.include_paths.clone();
             (roots.clone(), roots)
         } else {
             let reindex = job
@@ -354,7 +443,8 @@ fn watch_manager(
             (job.dirs.into_keys().collect(), reindex)
         };
 
-        let r = lock(watches).reconcile(cfg, &dirs);
+        let r = watches.reconcile(&rt.cfg, &dirs);
+        stats.record_watches(&watches);
         if r.added + r.removed + r.failed > 0 {
             anstream::eprintln!(
                 "  watches: +{} -{} ({} failed)",
@@ -374,11 +464,58 @@ fn watch_manager(
             let mut p = lock(lp);
             let now = Instant::now();
             for d in again {
-                p.insert(d, now, cfg.watch.max_pending);
+                p.insert(d, now, rt.cfg.watch.max_pending);
             }
             cp.notify_one();
         }
     }
+}
+
+/// Install a freshly loaded runtime. `false` (old runtime kept) when loading
+/// failed. On success the caller re-walks and re-indexes the include paths;
+/// here the watches outside them are dropped, and include paths that were
+/// dropped are queued for re-indexing, which prunes their records.
+fn apply_reload(
+    loaded: Result<Runtime>,
+    current: &Current,
+    watches: &mut Watches,
+    pending: &(Mutex<Pending>, Condvar),
+) -> bool {
+    let rt = match loaded {
+        Ok(rt) => rt,
+        Err(e) => {
+            anstream::eprintln!("error: reload failed, keeping the current configuration: {e:#}");
+            return false;
+        }
+    };
+    let roots = rt.cfg.index.include_paths.clone();
+    let max_pending = rt.cfg.watch.max_pending;
+    let old = std::mem::replace(
+        &mut *current.write().unwrap_or_else(|e| e.into_inner()),
+        Arc::new(rt),
+    );
+    let removed = watches.retain_under(&roots);
+
+    let (lp, cp) = pending;
+    let mut p = lock(lp);
+    let now = Instant::now();
+    p.set_roots(roots.clone());
+    for dropped in old
+        .cfg
+        .index
+        .include_paths
+        .iter()
+        .filter(|o| !roots.iter().any(|r| o.starts_with(r)))
+    {
+        p.insert(dropped.clone(), now, max_pending);
+    }
+    // Wake the flusher: [watch] timings may have changed.
+    cp.notify_one();
+    anstream::eprintln!(
+        "configuration reloaded: {} include path(s), {removed} watch(es) outside them dropped",
+        roots.len()
+    );
+    true
 }
 
 struct Watches {
@@ -406,6 +543,19 @@ impl Watches {
             dirs: BTreeSet::new(),
             failed: BTreeSet::new(),
         }
+    }
+
+    /// Drop the watches (and failures) not under any of `roots`. Returns
+    /// how many watches were removed.
+    fn retain_under(&mut self, roots: &[PathBuf]) -> usize {
+        let inside = |d: &PathBuf| roots.iter().any(|r| d.starts_with(r));
+        let outside: Vec<PathBuf> = self.dirs.iter().filter(|d| !inside(d)).cloned().collect();
+        for d in &outside {
+            let _ = self.watcher.unwatch(d); // the kernel may have dropped it already
+            self.dirs.remove(d);
+        }
+        self.failed.retain(inside);
+        outside.len()
     }
 
     /// Make the watches under each of `scopes` equal to the set of
@@ -502,13 +652,15 @@ struct Batch {
     age: Duration,
 }
 
-/// Block until the pending set is due, then take it.
-fn wait_for_batch(shared: &(Mutex<Pending>, Condvar), wcfg: &WatchConfig) -> Batch {
+/// Block until the pending set is due, then take it. The [watch] timings are
+/// read from the current runtime at each wake-up, so a reload applies at once.
+fn wait_for_batch(shared: &(Mutex<Pending>, Condvar), current: &Current) -> Batch {
     let (l, cvar) = shared;
     let mut pending = lock(l);
     loop {
+        let wcfg = snapshot(current).cfg.watch.clone();
         let now = Instant::now();
-        pending = match pending.time_until_due(now, wcfg) {
+        pending = match pending.time_until_due(now, &wcfg) {
             None => cvar.wait(pending).unwrap_or_else(|e| e.into_inner()),
             Some(d) if d.is_zero() => return pending.take(now),
             Some(d) => {
@@ -520,12 +672,81 @@ fn wait_for_batch(shared: &(Mutex<Pending>, Condvar), wcfg: &WatchConfig) -> Bat
     }
 }
 
-/// Re-index one batch: one store, one embedder, one scoped update.
-fn index_batch(cfg: &Config, paths: &[PathBuf]) -> Result<()> {
-    let mut store =
-        Store::open(&cfg.database.db_path, cfg.database.wal).context("opening store")?;
-    let embedder = vec_core::load_embedder(cfg);
-    let stats = update_paths(&mut store, &embedder, cfg, paths, |msg| {
+/// Index one batch with `index` (one store for indexing and status), put it
+/// back with a backoff delay if that fails, and record the watcher's state.
+fn flush(
+    rt: &Runtime,
+    batch: Batch,
+    pending: &(Mutex<Pending>, Condvar),
+    stats: &WatchStats,
+    failures: &mut u32,
+    index: impl FnOnce(&mut Store, &[PathBuf]) -> Result<()>,
+) {
+    let paths = if batch.rescan {
+        anstream::eprintln!("rescanning include paths");
+        stats.rescans.fetch_add(1, Ordering::Relaxed);
+        rt.cfg.index.include_paths.clone()
+    } else {
+        batch.paths.clone()
+    };
+    anstream::eprintln!(
+        "reindexing {} path(s) from {} event(s), oldest change {:.1}s ago",
+        paths.len(),
+        batch.events,
+        batch.age.as_secs_f64(),
+    );
+    let (store, outcome) = match open_store(&rt.cfg) {
+        Ok(mut s) => {
+            let outcome = index(&mut s, &paths);
+            (Some(s), outcome)
+        }
+        Err(e) => (None, Err(e)),
+    };
+
+    let (lp, cvar) = pending;
+    let (pending_paths, overflows) = {
+        let mut p = lock(lp);
+        if let Err(e) = &outcome {
+            // Never drop changes: put them back and retry with exponential
+            // backoff (a broken database must not become a busy loop).
+            *failures = failures.saturating_add(1);
+            let delay = retry_delay(&rt.cfg.watch, *failures);
+            anstream::eprintln!(
+                "warn: reindex failed (attempt {failures}), retrying in {:.1}s: {e:#}",
+                delay.as_secs_f64()
+            );
+            let now = Instant::now();
+            p.requeue(batch, now, rt.cfg.watch.max_pending, now + delay);
+            cvar.notify_one();
+        } else {
+            *failures = 0;
+        }
+        (p.paths.len(), p.overflows)
+    };
+
+    let Some(mut store) = store else {
+        anstream::eprintln!("warn: could not record watcher status (index not open)");
+        return;
+    };
+    let status = Status {
+        time: unix_now(),
+        paths: paths.len(),
+        error: outcome.as_ref().err().map(|e| format!("{e:#}")),
+        watched_dirs: stats.watched_dirs.load(Ordering::Relaxed),
+        watch_failures: stats.watch_failures.load(Ordering::Relaxed),
+        pending: pending_paths,
+        overflows,
+        rescans: stats.rescans.load(Ordering::Relaxed),
+        reloads: stats.reloads.load(Ordering::Relaxed),
+    };
+    if let Err(e) = status.write(&mut store) {
+        anstream::eprintln!("warn: could not record watcher status: {e:#}");
+    }
+}
+
+/// Re-index one batch with the runtime's embedder.
+fn index_batch(store: &mut Store, rt: &Runtime, paths: &[PathBuf]) -> Result<()> {
+    let stats = update_paths(store, &rt.embedder, &rt.cfg, paths, |msg| {
         anstream::eprintln!("{msg}")
     })?;
     anstream::eprintln!(
@@ -539,31 +760,85 @@ fn index_batch(cfg: &Config, paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-/// Record the watcher's state in the DB `meta` table for `vec status`.
-fn write_status(
-    cfg: &Config,
-    paths: &[PathBuf],
-    err: Option<&anyhow::Error>,
-    watched: usize,
-    failed: usize,
-) {
-    let now = SystemTime::now()
+/// Keys of the watcher's state in the index `meta` table (see [`Status`]'s
+/// table), read by `vec status`.
+pub mod meta_keys {
+    /// Unix time of the last flush attempt.
+    pub const LAST_FLUSH: &str = "watch.last_flush";
+    /// Unix time of the last successful flush.
+    pub const LAST_SUCCESS: &str = "watch.last_success";
+    /// Error of the last flush, empty on success.
+    pub const LAST_ERROR: &str = "watch.last_error";
+    /// Paths in the last flush.
+    pub const LAST_PATHS: &str = "watch.last_paths";
+    /// inotify watches held.
+    pub const WATCHED_DIRS: &str = "watch.watched_dirs";
+    /// Directories that could not be watched.
+    pub const WATCH_FAILURES: &str = "watch.watch_failures";
+    /// Changed paths still waiting.
+    pub const PENDING: &str = "watch.pending";
+    /// Times changes were lost or too many (degraded to a rescan).
+    pub const OVERFLOWS: &str = "watch.overflows";
+    /// Flushes that re-indexed every include path.
+    pub const RESCANS: &str = "watch.rescans";
+    /// Successful SIGHUP reloads.
+    pub const RELOADS: &str = "watch.reloads";
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let result = (|| -> Result<()> {
-        let mut store = Store::open(&cfg.database.db_path, cfg.database.wal)?;
-        store.set_meta("watch.last_flush", &now.to_string())?;
-        store.set_meta("watch.last_paths", &paths.len().to_string())?;
-        store.set_meta(
-            "watch.last_error",
-            &err.map(|e| format!("{e:#}")).unwrap_or_default(),
-        )?;
-        store.set_meta("watch.watched_dirs", &watched.to_string())?;
-        store.set_meta("watch.watch_failures", &failed.to_string())?;
+        .map_or(0, |d| d.as_secs())
+}
+
+/// The watcher's state after a flush, as recorded in the index `meta` table.
+///
+/// | key | value |
+/// |---|---|
+/// | `watch.last_flush` | unix time of the last flush attempt |
+/// | `watch.last_success` | unix time of the last successful flush (kept on failure) |
+/// | `watch.last_paths` | paths in the last flush |
+/// | `watch.last_error` | error of the last flush, empty on success |
+/// | `watch.watched_dirs` / `watch.watch_failures` | inotify watches held / failed |
+/// | `watch.pending` | changed paths still waiting (e.g. after a failure) |
+/// | `watch.overflows` | times changes were lost or too many, degrading to a rescan |
+/// | `watch.rescans` | flushes that re-indexed every include path |
+/// | `watch.reloads` | successful SIGHUP reloads |
+///
+/// The counters count since the watcher started.
+struct Status {
+    time: u64,
+    paths: usize,
+    error: Option<String>,
+    watched_dirs: usize,
+    watch_failures: usize,
+    pending: usize,
+    overflows: u64,
+    rescans: u64,
+    reloads: u64,
+}
+
+impl Status {
+    fn write(&self, store: &mut Store) -> Result<()> {
+        use meta_keys as k;
+        let time = self.time.to_string();
+        store.set_meta(k::LAST_FLUSH, &time)?;
+        if self.error.is_none() {
+            store.set_meta(k::LAST_SUCCESS, &time)?;
+        }
+        store.set_meta(k::LAST_ERROR, self.error.as_deref().unwrap_or_default())?;
+        for (key, value) in [
+            (k::LAST_PATHS, self.paths as u64),
+            (k::WATCHED_DIRS, self.watched_dirs as u64),
+            (k::WATCH_FAILURES, self.watch_failures as u64),
+            (k::PENDING, self.pending as u64),
+            (k::OVERFLOWS, self.overflows),
+            (k::RESCANS, self.rescans),
+            (k::RELOADS, self.reloads),
+        ] {
+            store.set_meta(key, &value.to_string())?;
+        }
         Ok(())
-    })();
-    if let Err(e) = result {
-        anstream::eprintln!("warn: could not record watcher status: {e:#}");
     }
 }
 
@@ -576,7 +851,9 @@ struct Pending {
     /// Collapsing never goes above these (`[index] include_paths`): a path
     /// above them would be ignored by the indexer, losing the change.
     roots: Vec<PathBuf>,
-    paths: HashSet<PathBuf>,
+    /// No member is under another one. Ordered, so a directory's
+    /// descendants form one contiguous range.
+    paths: BTreeSet<PathBuf>,
     /// Too many distinct directories to track, or events were lost: the next
     /// flush re-indexes the include paths, and inserts are O(1) until then.
     overflow: bool,
@@ -585,6 +862,9 @@ struct Pending {
     /// After a failed flush: do not flush again before this instant.
     not_before: Option<Instant>,
     events: u64,
+    /// Times the set switched to a rescan because changes were lost or too
+    /// many (kept across `take`).
+    overflows: u64,
 }
 
 impl Pending {
@@ -606,6 +886,11 @@ impl Pending {
         if self.overflow || self.covered(&path) {
             return;
         }
+        // Walking `path` covers everything under it.
+        let descendants: Vec<PathBuf> = under(&self.paths, &path).cloned().collect();
+        for d in descendants {
+            self.paths.remove(&d);
+        }
         self.paths.insert(path);
         if self.paths.len() > max_pending {
             self.collapse(max_pending);
@@ -617,6 +902,17 @@ impl Pending {
         self.touch(now);
         self.overflow = true;
         self.paths.clear();
+    }
+
+    /// Events were lost: rescan, and count it.
+    fn lost_events(&mut self, now: Instant) {
+        self.overflows += 1;
+        self.force_rescan(now);
+    }
+
+    /// New include paths (after a reload).
+    fn set_roots(&mut self, roots: Vec<PathBuf>) {
+        self.roots = roots;
     }
 
     /// Put a failed batch back; the next flush waits until `retry_at`.
@@ -646,7 +942,7 @@ impl Pending {
     fn collapse(&mut self, max: usize) {
         let target = max / 2;
         while self.paths.len() > target {
-            let parents: HashSet<PathBuf> = self
+            let parents: Vec<PathBuf> = self
                 .paths
                 .iter()
                 .map(|p| match p.parent() {
@@ -656,12 +952,14 @@ impl Pending {
                     _ => p.clone(), // already an include path: cannot go higher
                 })
                 .collect();
+            let parents = outermost(&parents);
             if parents.len() == self.paths.len() {
                 self.paths.clear();
                 self.overflow = true;
+                self.overflows += 1;
                 return;
             }
-            self.paths = parents;
+            self.paths = parents.into_iter().collect();
         }
     }
 
@@ -680,13 +978,75 @@ impl Pending {
         let age = self
             .first_seen
             .map_or(Duration::ZERO, |f| now.saturating_duration_since(f));
-        let fresh = Pending::new(std::mem::take(&mut self.roots));
+        let fresh = Pending {
+            roots: std::mem::take(&mut self.roots),
+            overflows: self.overflows,
+            ..Default::default()
+        };
         let taken = std::mem::replace(self, fresh);
         Batch {
             paths: taken.paths.into_iter().collect(),
             rescan: taken.overflow,
             events: taken.events,
             age,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SIGHUP
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod reload_signal {
+    use std::io::{ErrorKind, PipeReader, Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::sync::Condvar;
+    use std::sync::Mutex;
+
+    use anyhow::{Context, Result};
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+
+    use super::{ReconcileQueue, lock};
+
+    /// Make SIGHUP write a byte to a pipe and return its read end. The
+    /// handler runs in whatever thread receives the signal (the CLI's tokio
+    /// threads included), so it only does an async-signal-safe write.
+    pub(super) fn install() -> Result<PipeReader> {
+        let (reader, writer) = std::io::pipe().context("creating the SIGHUP pipe")?;
+        // Never block in the handler: a full pipe already holds a request.
+        fcntl(writer.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
+            .context("making the SIGHUP pipe non-blocking")?;
+        // SAFETY: the action only calls write(2) on a non-blocking pipe: no
+        // allocation, no lock, never blocks, so it is async-signal-safe.
+        unsafe {
+            signal_hook_registry::register(libc::SIGHUP, move || {
+                let _ = (&writer).write(&[1]);
+            })
+        }
+        .context("installing the SIGHUP handler")?;
+        Ok(reader)
+    }
+
+    /// Turn each SIGHUP into a reload request for the watch manager.
+    pub(super) fn forward(mut hup: PipeReader, queue: &(Mutex<ReconcileQueue>, Condvar)) {
+        // Several signals in a row are one reload.
+        let mut buf = [0u8; 64];
+        loop {
+            match hup.read(&mut buf) {
+                Ok(0) => return,
+                Ok(_) => {
+                    anstream::eprintln!("SIGHUP: reloading the configuration");
+                    let (l, cvar) = queue;
+                    lock(l).reload = true;
+                    cvar.notify_one();
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => {
+                    anstream::eprintln!("error: SIGHUP listener stopped: {e}");
+                    return;
+                }
+            }
         }
     }
 }
@@ -905,7 +1265,8 @@ mod tests {
     }
 
     fn test_cfg(dir: &tempfile::TempDir) -> Config {
-        let mut cfg = Config::load(None).unwrap();
+        // Hermetic: the compiled-in defaults only, never /etc/vec.conf.
+        let mut cfg = Config::defaults().unwrap();
         cfg.index.include_paths = vec![dir.path().to_path_buf()];
         cfg.index.exclude_dirs = vec!["target".into()];
         cfg.index.exclude_files = vec![];
@@ -1051,5 +1412,205 @@ mod tests {
         let r = w.reconcile(&cfg, &[root.join("src")]);
         assert_eq!(r.removed, 2);
         assert_eq!(rel(&w), ["", ".git/info", "builds", "builds/out"]);
+    }
+
+    #[test]
+    fn pending_directory_prunes_its_descendants() {
+        let t0 = Instant::now();
+        let mut p = root_pending();
+        p.insert("/r/a/b.rs".into(), t0, 100);
+        p.insert("/r/a/c/d.rs".into(), t0, 100);
+        p.insert("/r/ab.rs".into(), t0, 100);
+        p.insert("/r/a".into(), t0, 100);
+        let got: Vec<&Path> = p.paths.iter().map(PathBuf::as_path).collect();
+        assert_eq!(got, [Path::new("/r/a"), Path::new("/r/ab.rs")]);
+    }
+
+    #[test]
+    fn overflows_are_counted_and_survive_take() {
+        let t0 = Instant::now();
+        let mut p = Pending::new(vec!["/r/d0".into(), "/r/d1".into()]);
+        p.lost_events(t0);
+        assert_eq!(p.overflows, 1);
+        p.take(t0);
+        for r in ["/r/d0", "/r/d1"] {
+            p.insert(r.into(), t0, 1); // cannot collapse above include paths
+        }
+        assert!(p.overflow);
+        assert_eq!(p.overflows, 2);
+        p.take(t0);
+        assert_eq!(p.overflows, 2, "a counter, not a state");
+    }
+
+    /// A runtime with a stub embedder (tests only: never used by vec watch).
+    fn stub_runtime(cfg: Config) -> Runtime {
+        Runtime {
+            filter: IndexFilter::new(&cfg, &|_| {}),
+            embedder: Embedder::stub(8),
+            cfg,
+        }
+    }
+
+    fn meta(cfg: &Config, key: &str) -> Option<String> {
+        open_store(cfg).unwrap().get_meta(key).unwrap()
+    }
+
+    fn one_change(dir: &tempfile::TempDir) -> Shared<Pending> {
+        let pending = shared(Pending::new(vec![dir.path().to_path_buf()]));
+        lock(&pending.0).insert(dir.path().join("a.rs"), Instant::now(), 100);
+        pending
+    }
+
+    #[test]
+    fn failing_flush_is_requeued_with_backoff_and_reported() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rt = stub_runtime(test_cfg(&dir));
+        let pending = one_change(&dir);
+        let stats = WatchStats::default();
+        let mut failures = 0;
+
+        let batch = lock(&pending.0).take(Instant::now());
+        let before = Instant::now();
+        flush(&rt, batch, &pending, &stats, &mut failures, |_, _| {
+            anyhow::bail!("embedding backend unavailable")
+        });
+
+        assert_eq!(failures, 1);
+        let p = lock(&pending.0);
+        assert!(p.paths.contains(&dir.path().join("a.rs")), "change kept");
+        let retry = p.not_before.expect("backoff set");
+        assert!(retry >= before + Duration::from_millis(rt.cfg.watch.debounce_ms));
+        drop(p);
+        let err = meta(&rt.cfg, "watch.last_error").unwrap();
+        assert!(err.contains("embedding backend unavailable"), "{err}");
+        assert_eq!(meta(&rt.cfg, "watch.pending").as_deref(), Some("1"));
+        assert_eq!(meta(&rt.cfg, "watch.last_success"), None);
+
+        // The retry succeeds: counters reset, success recorded.
+        let batch = lock(&pending.0).take(Instant::now());
+        assert_eq!(batch.paths, vec![dir.path().join("a.rs")]);
+        flush(&rt, batch, &pending, &stats, &mut failures, |_, _| Ok(()));
+        assert_eq!(failures, 0);
+        assert_eq!(meta(&rt.cfg, "watch.last_error").as_deref(), Some(""));
+        assert!(meta(&rt.cfg, "watch.last_success").is_some());
+        assert_eq!(meta(&rt.cfg, "watch.pending").as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn flush_with_an_unopenable_index_is_requeued() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_cfg(&dir);
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"").unwrap();
+        cfg.database.db_path = blocker.join("vec.db");
+        let rt = stub_runtime(cfg);
+        let pending = one_change(&dir);
+        let mut failures = 0;
+        let batch = lock(&pending.0).take(Instant::now());
+        flush(
+            &rt,
+            batch,
+            &pending,
+            &WatchStats::default(),
+            &mut failures,
+            |_, _| unreachable!("no store, no indexing"),
+        );
+        assert_eq!(failures, 1);
+        assert_eq!(lock(&pending.0).paths.len(), 1);
+    }
+
+    #[test]
+    fn rescan_flush_indexes_the_include_paths_and_is_counted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rt = stub_runtime(test_cfg(&dir));
+        let pending = shared(Pending::new(rt.cfg.index.include_paths.clone()));
+        lock(&pending.0).lost_events(Instant::now());
+        let stats = WatchStats::default();
+        let batch = lock(&pending.0).take(Instant::now());
+        let mut seen = Vec::new();
+        flush(&rt, batch, &pending, &stats, &mut 0, |_, paths| {
+            seen = paths.to_vec();
+            Ok(())
+        });
+        assert_eq!(seen, rt.cfg.index.include_paths);
+        assert_eq!(meta(&rt.cfg, "watch.rescans").as_deref(), Some("1"));
+        assert_eq!(meta(&rt.cfg, "watch.overflows").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn missing_model_is_an_error_at_startup() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_cfg(&dir);
+        cfg.embed.model_search_path = vec![dir.path().join("no-models")];
+        let err = Runtime::new(cfg).err().expect("must not start");
+        assert!(format!("{err:#}").contains("not found"), "{err:#}");
+    }
+
+    #[test]
+    fn reload_switches_include_paths_and_keeps_the_old_runtime_on_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        for d in ["a/x", "b/y"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let mut cfg_a = test_cfg(&dir);
+        cfg_a.index.include_paths = vec![root.join("a")];
+        let mut cfg_b = cfg_a.clone();
+        cfg_b.index.include_paths = vec![root.join("b")];
+
+        let current: Current = Arc::new(RwLock::new(Arc::new(stub_runtime(cfg_a.clone()))));
+        let watcher = notify::RecommendedWatcher::new(|_| {}, notify::Config::default()).unwrap();
+        let mut w = Watches::new(watcher);
+        w.reconcile(&cfg_a, &cfg_a.index.include_paths);
+        assert_eq!(w.dirs.len(), 2);
+        let pending = shared(Pending::new(cfg_a.index.include_paths.clone()));
+
+        // A failed load changes nothing.
+        assert!(!apply_reload(
+            Err(anyhow::anyhow!("bad config")),
+            &current,
+            &mut w,
+            &pending
+        ));
+        assert_eq!(snapshot(&current).cfg.index.include_paths, [root.join("a")]);
+        assert_eq!(w.dirs.len(), 2);
+
+        assert!(apply_reload(
+            Ok(stub_runtime(cfg_b.clone())),
+            &current,
+            &mut w,
+            &pending
+        ));
+        assert_eq!(snapshot(&current).cfg.index.include_paths, [root.join("b")]);
+        assert!(w.dirs.is_empty(), "watches outside the new paths dropped");
+        let p = lock(&pending.0);
+        assert_eq!(p.roots, [root.join("b")]);
+        assert!(
+            p.paths.contains(&root.join("a")),
+            "the dropped include path is re-indexed, which prunes it"
+        );
+        drop(p);
+        // The manager then re-walks the new include paths.
+        w.reconcile(&cfg_b, &cfg_b.index.include_paths);
+        assert!(w.dirs.iter().all(|d| d.starts_with(root.join("b"))));
+        assert_eq!(w.dirs.len(), 2);
+    }
+
+    #[test]
+    fn sighup_becomes_a_reload_request() {
+        let hup = reload_signal::install().unwrap();
+        let queue: Shared<ReconcileQueue> = shared(ReconcileQueue::default());
+        {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || reload_signal::forward(hup, &queue));
+        }
+        // SAFETY: raise() is always safe to call; the handler is installed.
+        assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+        let (l, cvar) = &*queue;
+        let q = cvar
+            .wait_timeout_while(lock(l), Duration::from_secs(10), |q| !q.reload)
+            .unwrap()
+            .0;
+        assert!(q.reload, "SIGHUP must request a reload");
     }
 }

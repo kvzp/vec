@@ -21,7 +21,10 @@
 
 ## Performance
 
-- [x] **Cache file reads** — `cmd_search` caches file content in a HashMap, shared between best-line targeting and snippet display. No redundant I/O.
+- [x] **Cache file reads** — each result file is read once for best-line targeting and snippet display.
+- [x] **Skip unchanged files without reading** (size+mtime), per-chunk vector reuse, real ONNX batching.
+- [ ] **int8 / f16 vector storage** — 4x / 2x smaller index and faster scans; needs a schema version and a quality check against f32.
+- [ ] **Measure and document** indexing and query speed (release build, reference machine) before quoting numbers.
 
 ## MCP / AI Integration
 
@@ -30,12 +33,19 @@
 ## Operational
 
 - [x] **`vec gc`** — garbage collect orphaned entries and vacuum the database.
-- [ ] **Watcher cleanup on delete** — verify that the watcher notices file deletions and removes stale entries from the index. Currently `run_updatedb` prunes missing files, but this should be confirmed end-to-end for inotify `Remove` events.
+- [x] **Watcher cleanup on delete** — deletions, moves out and newly excluded/ignored paths are pruned by the scoped re-index (the walker decides); covered by `scoped_update_prunes_deleted_file_and_dedups_nested_roots`, `incremental_updatedb_prunes_newly_excluded_files` and the watcher tests.
 - [x] **`vec explain <file:line>`** — show which chunk(s) cover a given line and their stats.
+- [x] **`vec doctor`**, **`vec config show|check`**, `vec status` with model identity, last run and watcher state.
+- [x] **Socket-activated daemon** with idle exit and hardened units.
+- [ ] **Stale-offset count in `vec doctor`** — files whose size/mtime changed since indexing (stale snippets).
+- [ ] **`--full` staging swap** — build a model change into a staging table and swap at the end, so an interrupted rebuild keeps the old index searchable.
+- [ ] **Non-zero exit (or a flag) for `vec updatedb` when files failed**, for scripts and timers.
+- [ ] **Model download over HTTPS** in-process (`vec model download` only prints `curl` commands; needs a TLS client dependency), with checksum verification.
+- [ ] **HTTPS for the HTTP embedding backend.**
 
 ## Architecture
 
-- [x] **Split into crates** — 8 workspace crates: vec-core, vec-embed, vec-store, vec-index, vec-watch, vec-daemon, vec-mcp, vec-cli.
+- [x] **Split into crates** — 9 workspace crates (vec-query shares the read side between CLI and MCP).
 
 ## Distribution
 
