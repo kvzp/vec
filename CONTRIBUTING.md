@@ -29,7 +29,7 @@ apt install libsqlite3-dev
 # Fedora
 dnf install sqlite-devel
 
-cargo build --features system-sqlite
+cargo build -p vec-cli --no-default-features --features system-sqlite
 ```
 
 No other build-time dependencies — no protobuf-compiler, no Python, no HuggingFace tooling.
@@ -151,4 +151,4 @@ Verify manually that chunks look reasonable on a real file in that language.
 - Update `ARCHITECTURE.md` if you change data flow or add a component
 - Update `SECURITY.md` if you change anything touching the DB or permissions
 - `cargo test` must pass
-- If adding distro packaging support, test the build with `--features system-sqlite`
+- If adding distro packaging support, test the build with `-p vec-cli --no-default-features --features system-sqlite`

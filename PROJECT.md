@@ -243,8 +243,10 @@ ndarray      = "0.17"
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["user", "fs"] }  # access() syscall
 
-[features]
-system-sqlite = []   # link against system libsqlite3 (distro builds only)
+[features]                           # vec-store; exactly one must be enabled
+default        = ["bundled-sqlite"]
+bundled-sqlite = ["rusqlite/bundled"]
+system-sqlite  = []                 # link against system libsqlite3 (distro builds, --no-default-features)
 ```
 
 ---

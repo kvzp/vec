@@ -1,15 +1,16 @@
 [package]
 name = "vec-index"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.89"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 description = "vec file walker, chunker, and incremental indexer"
-license = "MIT"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 vec-core  = { path = "../vec-core" }
 vec-embed = { path = "../vec-embed" }
-vec-store = { path = "../vec-store" }
+vec-store = { path = "../vec-store", default-features = false }
 ignore    = "0.4"
 sha2      = "0.10"
 hex       = "0.4"
@@ -17,4 +18,5 @@ rayon     = "1.10"
 anyhow    = "1"
 
 [dev-dependencies]
+vec-store = { path = "../vec-store", features = ["bundled-sqlite"] }
 tempfile = "3"

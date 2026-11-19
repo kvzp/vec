@@ -1678,7 +1678,13 @@ mod tests {
 
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
         let r1 = run_updatedb(&mut store, &embedder, &cfg, false, None, |_| {});
-        let r2 = update_paths(&mut store, &embedder, &cfg, &[sub.clone()], |_| {});
+        let r2 = update_paths(
+            &mut store,
+            &embedder,
+            &cfg,
+            std::slice::from_ref(&sub),
+            |_| {},
+        );
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
         r1.unwrap();
         r2.unwrap();

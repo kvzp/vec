@@ -75,6 +75,30 @@ jobs:
       - name: Audit dependencies
         run: cargo audit
 
+  system-sqlite:
+    name: Build with system SQLite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install libsqlite3-dev
+        run: sudo apt-get install -y libsqlite3-dev
+
+      - name: Build (distro recipe)
+        run: cargo build -p vec-cli --no-default-features --features system-sqlite
+
+      - name: Binary links the system libsqlite3
+        run: ldd target/debug/vec | grep -q 'libsqlite3\.so'
+
+      - name: Store tests against the system SQLite
+        run: cargo test -p vec-store --no-default-features --features system-sqlite
+
+      - name: Bundled and system SQLite are mutually exclusive
+        run: "! cargo check -p vec-cli --features system-sqlite"
+
   cross:
     name: Cross-compile aarch64
     runs-on: ubuntu-latest
