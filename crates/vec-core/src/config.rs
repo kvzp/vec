@@ -110,6 +110,18 @@ pub struct EmbedConfig {
     pub http_max_input_bytes: usize,
     /// Ollama: characters of an error response body quoted in error messages.
     pub http_error_preview_chars: usize,
+    /// Ollama: path of the model list (model digest).
+    pub http_tags_path: String,
+    /// Ollama: path of the server version (runtime).
+    pub http_version_path: String,
+    /// Ollama: tag assumed for a model name without one.
+    pub http_default_tag: String,
+    /// Text whose vector is the index's embedding canary.
+    pub canary_text: String,
+    /// Canary cosine below this: warning.
+    pub canary_warn_cosine: f32,
+    /// Canary cosine below this: drift, writers refuse.
+    pub canary_min_cosine: f32,
     /// Directories searched for a short ONNX model name.
     pub model_search_path: Vec<PathBuf>,
     /// File names tried inside `{dir}/{model}/`, in order.
@@ -543,11 +555,35 @@ impl Config {
                 format!("[embed] {key} must be greater than 0"),
             );
         }
+        for (key, value) in [
+            ("http_endpoint_path", &e.http_endpoint_path),
+            ("http_tags_path", &e.http_tags_path),
+            ("http_version_path", &e.http_version_path),
+        ] {
+            check(
+                value.starts_with('/'),
+                format!("[embed] {key} must start with '/' (got {value:?})"),
+            );
+        }
         check(
-            e.http_endpoint_path.starts_with('/'),
+            !e.http_default_tag.is_empty() && !e.http_default_tag.contains(':'),
             format!(
-                "[embed] http_endpoint_path must start with '/' (got {:?})",
-                e.http_endpoint_path
+                "[embed] http_default_tag must be a non-empty tag without ':' (got {:?})",
+                e.http_default_tag
+            ),
+        );
+        check(
+            !e.canary_text.trim().is_empty(),
+            "[embed] canary_text must not be empty".into(),
+        );
+        check(
+            e.canary_min_cosine > 0.0
+                && e.canary_min_cosine <= e.canary_warn_cosine
+                && e.canary_warn_cosine <= 1.0,
+            format!(
+                "[embed] canary_min_cosine ({}) and canary_warn_cosine ({}) must satisfy \
+                 0 < canary_min_cosine <= canary_warn_cosine <= 1",
+                e.canary_min_cosine, e.canary_warn_cosine
             ),
         );
         check(
@@ -783,6 +819,9 @@ impl Config {
             max_input_bytes: self.embed.http_max_input_bytes,
             error_preview_chars: self.embed.http_error_preview_chars,
             batch_size: self.embed.batch_size,
+            tags_path: self.embed.http_tags_path.clone(),
+            version_path: self.embed.http_version_path.clone(),
+            default_tag: self.embed.http_default_tag.clone(),
         })
     }
 
@@ -1307,6 +1346,31 @@ mod tests {
             (
                 "[database]\nbusy_timeout_ms = 0\n",
                 "[database] busy_timeout_ms",
+            ),
+            (
+                "[embed]\nhttp_tags_path = \"api/tags\"\n",
+                "[embed] http_tags_path",
+            ),
+            (
+                "[embed]\nhttp_version_path = \"\"\n",
+                "[embed] http_version_path",
+            ),
+            (
+                "[embed]\nhttp_default_tag = \"\"\n",
+                "[embed] http_default_tag",
+            ),
+            ("[embed]\ncanary_text = \" \"\n", "[embed] canary_text"),
+            (
+                "[embed]\ncanary_min_cosine = 0.0\n",
+                "canary_min_cosine (0)",
+            ),
+            (
+                "[embed]\ncanary_min_cosine = 0.99\ncanary_warn_cosine = 0.9\n",
+                "0 < canary_min_cosine <= canary_warn_cosine <= 1",
+            ),
+            (
+                "[embed]\ncanary_warn_cosine = 1.5\n",
+                "canary_warn_cosine (1.5)",
             ),
             (
                 "[database]\nbusy_timeout_ms = 2000\nmigration_wait_ms = 1000\n",
