@@ -9,7 +9,13 @@ repository.workspace = true
 
 [dependencies]
 rusqlite = { version = "0.43", features = ["fallible_uint"] }
+anstream = "0.6"
 anyhow   = "1"
+vec-core  = { path = "../vec-core" }
+vec-embed = { path = "../vec-embed" }
+
+[dev-dependencies]
+tempfile = "3"
 
 [features]
 # Exactly one SQLite source must be selected:

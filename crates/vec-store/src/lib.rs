@@ -1,13 +1,25 @@
-// src/store.rs — SQLite database layer.
-//
-// Schema (created on first open):
-//
-//   meta   — key/value pairs: model_name, model_sha256, embedding_dim
-//   files  — one row per indexed file; tracks mtime + sha256
-//   chunks — one row per chunk; embedding stored as raw f32 little-endian BLOB
-//
-// Security note: there is NO content column in chunks. Text is always read
-// from the live source file at query time using byte_offset / byte_end.
+//! vec-store — the SQLite index: files, chunks and their embeddings.
+//!
+//! Schema version 1 (kept in `PRAGMA user_version`; older databases are
+//! upgraded in place when opened for writing):
+//!
+//! - `meta(key, value)`: the model identity (`model_name`, `embedding_dim`,
+//!   `model_sha256`) and free-form keys (watcher status, ...).
+//! - `files(id, path UNIQUE, mtime, size, hash)`: one row per indexed file.
+//!   `size` is NULL for rows written before version 1.
+//! - `chunks(id, file_id, byte_offset, byte_end, start_line, end_line, text_hash,
+//!   embedding)`: one row per chunk. `embedding` is the L2-normalised vector as
+//!   little-endian f32 (`dim × 4` bytes); `text_hash` identifies the chunk text so
+//!   an unchanged chunk can reuse its vector (NULL for pre-version-1 rows).
+//!
+//! Invariants: every vector has the dimension of the recorded model identity
+//! ([`Store::ensure_model`] must run before the first write), and one file's
+//! record and chunks change together ([`Store::replace_file`] is one transaction).
+//!
+//! Security note: there is NO content column. Text is always read from the live
+//! file at query time, through `byte_offset` / `byte_end`, after an access check.
+//!
+//! Requires SQLite 3.35 or later (`RETURNING`).
 
 // The SQLite source is chosen at build time and must be explicit: a build
 // that silently fell back to the other one would ship a different SQLite
@@ -22,10 +34,16 @@ compile_error!(
     "vec-store: select a SQLite source: feature `bundled-sqlite` (default) or `system-sqlite`"
 );
 
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, params};
+use anyhow::{Context, Result, anyhow, bail};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
+use vec_embed::ModelIdentity;
 
 /// `true` only when `path` definitely does not exist. A permission or I/O
 /// error is not proof of absence (`Path::exists` would return `false` and
@@ -35,22 +53,110 @@ pub fn is_gone(path: &Path) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Public record types
+// Public types
 // ---------------------------------------------------------------------------
 
+/// How to open the database (values come from the `[database]` config section).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreOptions {
+    /// Use write-ahead logging (with `synchronous = NORMAL`). Ignored read-only.
+    pub wal: bool,
+    /// How long to wait for a lock held by another connection (ms).
+    pub busy_timeout_ms: u64,
+    /// Open read-only: no directory or schema is created, nothing is migrated,
+    /// and the database must already exist at the current schema version.
+    pub read_only: bool,
+    /// Read-write: how long to keep retrying for the lock of a schema upgrade
+    /// that another process holds (ms), e.g. while it upgrades the same index.
+    pub migration_wait_ms: u64,
+}
+
+impl StoreOptions {
+    /// The options of the `[database]` config section.
+    #[must_use]
+    pub fn from_config(db: &vec_core::config::DatabaseConfig, read_only: bool) -> Self {
+        Self {
+            wal: db.wal,
+            busy_timeout_ms: db.busy_timeout_ms,
+            read_only,
+            migration_wait_ms: db.migration_wait_ms,
+        }
+    }
+}
+
+/// The index was built with another model than the one given. Returned
+/// inside the `anyhow::Error` of [`Store::check_model`],
+/// [`Store::ensure_model`] and [`Store::replace_file`]; find it with
+/// `err.downcast_ref::<ModelMismatch>()`. Any other error of these methods
+/// (a busy database, an I/O error) is not a mismatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelMismatch {
+    /// The index records another model identity.
+    Recorded {
+        /// The database file.
+        db_path: PathBuf,
+        /// The identity recorded in the index.
+        stored: ModelIdentity,
+        /// The identity given by the caller.
+        expected: ModelIdentity,
+    },
+    /// The index records no identity (written before identities were
+    /// recorded) and its vectors have another dimension.
+    Unrecorded {
+        /// The database file.
+        db_path: PathBuf,
+        /// Dimension of the stored vectors.
+        stored_dim: usize,
+        /// The identity given by the caller.
+        expected: ModelIdentity,
+    },
+}
+
+impl std::fmt::Display for ModelMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Recorded {
+                db_path,
+                stored,
+                expected,
+            } => write!(
+                f,
+                "model mismatch: the index at {} was built with {stored}, but the configured \
+                 model is {expected}. Restore the configured model, or rebuild the index for \
+                 the new one with `vec updatedb --full`.",
+                db_path.display()
+            ),
+            Self::Unrecorded {
+                db_path,
+                stored_dim,
+                expected,
+            } => write!(
+                f,
+                "the index at {} holds vectors of dimension {stored_dim} written before model \
+                 identities were recorded, but the configured model {expected} has dimension \
+                 {}. Rebuild it with `vec updatedb --full`.",
+                db_path.display(),
+                expected.dim
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ModelMismatch {}
+
 /// A row from the `files` table.
-#[derive(Debug)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FileRecord {
     pub id: i64,
     pub path: PathBuf,
     pub mtime: f64,
+    /// File size in bytes; `None` for records written before schema version 1.
+    pub size: Option<u64>,
     pub hash: String,
 }
 
-/// Metadata from a `chunks` row (without the embedding blob).
-#[derive(Debug)]
-#[allow(dead_code)]
+/// Metadata of a `chunks` row (without the embedding).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkRecord {
     pub id: i64,
     pub file_id: i64,
@@ -60,80 +166,41 @@ pub struct ChunkRecord {
     pub end_line: usize,
 }
 
-/// One ranked result returned by `Store::search`.
-#[derive(Debug)]
+/// A chunk to write with [`Store::replace_file`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewChunk {
+    pub byte_offset: usize,
+    pub byte_end: usize,
+    pub start_line: usize,
+    pub end_line: usize,
+    /// Hash of the chunk text, for reusing its vector when the text is unchanged.
+    pub text_hash: String,
+    /// The vector; stored L2-normalised. Its length must be the model dimension.
+    pub embedding: Vec<f32>,
+}
+
+/// One ranked result returned by [`Store::search`].
+#[derive(Debug, Clone, PartialEq)]
 pub struct SearchResult {
     pub path: PathBuf,
     pub byte_offset: usize,
     pub byte_end: usize,
     pub start_line: usize,
     pub end_line: usize,
+    /// Cosine similarity to the query.
     pub score: f32,
 }
 
 // ---------------------------------------------------------------------------
-// Store
+// Schema
 // ---------------------------------------------------------------------------
 
-pub struct Store {
-    conn: Connection,
-}
+/// The schema version this code reads and writes.
+pub const SCHEMA_VERSION: i64 = 1;
 
-// ---------------------------------------------------------------------------
-// Top-k heap for paged search
-// ---------------------------------------------------------------------------
-
-/// Number of rows fetched from SQLite per search page.
-/// Memory per page: PAGE_SIZE × dim × 4 bytes (e.g. 1 000 × 768 × 4 = ~3 MB).
-const SEARCH_PAGE_SIZE: usize = 1_000;
-
-/// A scored search candidate retained in the top-k min-heap.
-///
-/// `BinaryHeap` is a max-heap; to keep the k *highest* scores we invert the
-/// `Ord` so the *lowest* score floats to the top and gets evicted first.
-struct Candidate {
-    /// Raw bits of the f32 score — stored as u32 so the struct can implement
-    /// `Eq` and `Ord` without pulling in an `ordered-float` dependency.
-    score_bits: u32,
-    path: String,
-    byte_offset: usize,
-    byte_end: usize,
-    start_line: usize,
-    end_line: usize,
-}
-
-impl Candidate {
-    fn score(&self) -> f32 {
-        f32::from_bits(self.score_bits)
-    }
-}
-
-impl PartialEq for Candidate {
-    fn eq(&self, other: &Self) -> bool {
-        self.score_bits == other.score_bits
-    }
-}
-impl Eq for Candidate {}
-
-impl PartialOrd for Candidate {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Candidate {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Reversed: lowest score sorts as "greatest" → BinaryHeap acts as min-heap.
-        // heap.peek() returns the lowest-scoring candidate — the first to evict.
-        other
-            .score()
-            .partial_cmp(&self.score())
-            .unwrap_or(std::cmp::Ordering::Equal)
-    }
-}
-
-// DDL executed once on first open.
-const SCHEMA: &str = "
+/// Version-1 tables. `IF NOT EXISTS` leaves a version-0 database's tables in
+/// place; [`migrate_to_v1`] then adds the missing columns.
+const SCHEMA_V1: &str = "
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -143,6 +210,7 @@ CREATE TABLE IF NOT EXISTS files (
     id    INTEGER PRIMARY KEY,
     path  TEXT UNIQUE NOT NULL,
     mtime REAL NOT NULL,
+    size  INTEGER,
     hash  TEXT NOT NULL
 );
 
@@ -153,173 +221,150 @@ CREATE TABLE IF NOT EXISTS chunks (
     byte_end    INTEGER NOT NULL,
     start_line  INTEGER NOT NULL,
     end_line    INTEGER NOT NULL,
+    text_hash   TEXT,
     embedding   BLOB NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
 ";
 
+const META_MODEL_NAME: &str = "model_name";
+const META_EMBEDDING_DIM: &str = "embedding_dim";
+const META_MODEL_SHA256: &str = "model_sha256";
+
+// ---------------------------------------------------------------------------
+// Store
+// ---------------------------------------------------------------------------
+
+/// The open index database.
+pub struct Store {
+    conn: Connection,
+    path: PathBuf,
+}
+
 impl Store {
     // -----------------------------------------------------------------------
     // Lifecycle
     // -----------------------------------------------------------------------
 
-    /// Open (or create) the database at `path`.
+    /// Open the database at `path`.
     ///
-    /// Creates all tables and indexes if this is a new database.
-    /// Enables WAL mode when `wal` is true (recommended — better concurrency
-    /// and crash safety).
-    pub fn open(path: &Path, wal: bool) -> Result<Self> {
-        // Ensure the parent directory exists.
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating database directory {}", parent.display()))?;
-        }
-
-        let conn = Connection::open(path)
-            .with_context(|| format!("opening database {}", path.display()))?;
-
-        // Enable WAL before anything else so all subsequent writes benefit.
-        if wal {
-            conn.execute_batch("PRAGMA journal_mode = WAL;")
-                .context("enabling WAL mode")?;
-        }
-
-        // Foreign-key enforcement is off by default in SQLite.
-        conn.execute_batch("PRAGMA foreign_keys = ON;")
-            .context("enabling foreign keys")?;
-
-        // Create schema (IF NOT EXISTS guards make this idempotent).
-        conn.execute_batch(SCHEMA).context("creating schema")?;
-
-        Ok(Store { conn })
-    }
-
-    // -----------------------------------------------------------------------
-    // Model metadata
-    // -----------------------------------------------------------------------
-
-    /// Read the stored model metadata and verify it matches the given values.
-    ///
-    /// Returns `Ok(())` if the meta table is empty (new DB) or if all three
-    /// values match. Returns an error with a helpful message if there is a
-    /// mismatch.
-    #[allow(dead_code)]
-    pub fn check_model(
-        &self,
-        model_name: &str,
-        model_sha256: &str,
-        embedding_dim: usize,
-    ) -> Result<()> {
-        let stored_name: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'model_name'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .context("reading meta.model_name")?;
-
-        // No stored model yet → fresh DB, nothing to check.
-        let stored_name = match stored_name {
-            None => return Ok(()),
-            Some(n) => n,
+    /// Read-write: creates the parent directory and the database if needed and
+    /// upgrades an older schema in place (the write lock is taken only when an
+    /// upgrade is due, so an up-to-date index stays usable by users who cannot
+    /// write it). Read-only: the database must exist at the current version.
+    pub fn open(path: &Path, opts: &StoreOptions) -> Result<Self> {
+        let conn = if opts.read_only {
+            open_read_only(path, opts)?
+        } else {
+            open_read_write(path, opts)?
         };
+        Ok(Store {
+            conn,
+            path: path.to_path_buf(),
+        })
+    }
 
-        let stored_sha: String = self
-            .conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'model_sha256'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .context("reading meta.model_sha256")?
-            .unwrap_or_default();
+    // -----------------------------------------------------------------------
+    // Model identity
+    // -----------------------------------------------------------------------
 
-        let stored_dim: usize = self
-            .conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'embedding_dim'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .context("reading meta.embedding_dim")?
-            .unwrap_or_default()
-            .parse()
-            .unwrap_or(0);
+    /// The model identity recorded in the index, if any.
+    pub fn model(&self) -> Result<Option<ModelIdentity>> {
+        read_model(&self.conn)
+    }
 
-        if stored_name != model_name || stored_sha != model_sha256 || stored_dim != embedding_dim {
-            bail!(
-                "model changed — run 'vec updatedb --full' to re-index\n\
-                 stored:     {} (sha256={}, dim={})\n\
-                 configured: {} (sha256={}, dim={})",
-                stored_name,
-                stored_sha,
-                stored_dim,
-                model_name,
-                model_sha256,
-                embedding_dim
-            );
+    /// Check that vectors of `id` may be compared with the index (readers).
+    /// An index without a recorded identity accepts any model.
+    pub fn check_model(&self, id: &ModelIdentity) -> Result<()> {
+        match read_model(&self.conn)? {
+            Some(stored) if !stored.is_compatible_with(id) => {
+                Err(mismatch(&self.path, &stored, id))
+            }
+            _ => Ok(()),
         }
-
-        Ok(())
     }
 
-    /// Persist model metadata to the `meta` table (upsert).
-    #[allow(dead_code)]
-    pub fn set_model(
-        &mut self,
-        model_name: &str,
-        model_sha256: &str,
-        embedding_dim: usize,
-    ) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT INTO meta (key, value) VALUES ('model_name', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![model_name],
-            )
-            .context("writing meta.model_name")?;
+    /// Record `id` in an index that has none, or check it against the recorded
+    /// one (writers call this before writing). Name and dimension must match;
+    /// the sha256 must match when both are known, and an unknown stored sha256
+    /// is filled in.
+    ///
+    /// An index written before identities were recorded is adopted when its
+    /// vectors have `id`'s dimension, and refused otherwise.
+    pub fn ensure_model(&mut self, id: &ModelIdentity) -> Result<()> {
+        if id.dim == 0 {
+            bail!("model {id} has dimension 0");
+        }
+        let tx = write_tx(&mut self.conn)?;
+        match read_model(&tx)? {
+            None => {
+                let stored_len: Option<usize> = tx
+                    .query_row("SELECT length(embedding) FROM chunks LIMIT 1", [], |r| {
+                        r.get(0)
+                    })
+                    .optional()
+                    .context("reading a stored vector size")?;
+                if let Some(len) = stored_len
+                    && len != id.dim * 4
+                {
+                    return Err(ModelMismatch::Unrecorded {
+                        db_path: self.path.clone(),
+                        stored_dim: len / 4,
+                        expected: id.clone(),
+                    }
+                    .into());
+                }
+                write_model(&tx, id)?;
+            }
+            Some(stored) => {
+                if !stored.is_compatible_with(id) {
+                    return Err(mismatch(&self.path, &stored, id));
+                }
+                if stored.sha256.is_none()
+                    && let Some(sha) = &id.sha256
+                {
+                    set_meta(&tx, META_MODEL_SHA256, sha)?;
+                }
+            }
+        }
+        tx.commit().context("committing the model identity")
+    }
 
-        self.conn
-            .execute(
-                "INSERT INTO meta (key, value) VALUES ('model_sha256', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![model_sha256],
-            )
-            .context("writing meta.model_sha256")?;
-
-        self.conn
-            .execute(
-                "INSERT INTO meta (key, value) VALUES ('embedding_dim', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![embedding_dim.to_string()],
-            )
-            .context("writing meta.embedding_dim")?;
-
-        Ok(())
+    /// Empty the index and record `id` as its model, in one transaction (for a
+    /// full rebuild with a different model).
+    pub fn reset_model(&mut self, id: &ModelIdentity) -> Result<()> {
+        if id.dim == 0 {
+            bail!("model {id} has dimension 0");
+        }
+        let tx = write_tx(&mut self.conn)?;
+        tx.execute_batch("DELETE FROM chunks; DELETE FROM files;")
+            .context("emptying the index")?;
+        write_model(&tx, id)?;
+        tx.commit().context("committing the model reset")
     }
 
     // -----------------------------------------------------------------------
-    // Files table
+    // Files and chunks
     // -----------------------------------------------------------------------
 
-    /// Look up a file by its path. Returns `None` if not indexed yet.
+    /// Look up a file by path. `None` if it is not indexed (a non-UTF-8 path
+    /// never is).
     pub fn get_file(&self, path: &Path) -> Result<Option<FileRecord>> {
-        let path_str = path.to_string_lossy();
+        let Some(path_str) = path.to_str() else {
+            return Ok(None);
+        };
         self.conn
             .query_row(
-                "SELECT id, path, mtime, hash FROM files WHERE path = ?1",
-                params![path_str.as_ref()],
+                "SELECT id, path, mtime, size, hash FROM files WHERE path = ?1",
+                params![path_str],
                 |row| {
                     Ok(FileRecord {
                         id: row.get(0)?,
                         path: PathBuf::from(row.get::<_, String>(1)?),
                         mtime: row.get(2)?,
-                        hash: row.get(3)?,
+                        size: row.get(3)?,
+                        hash: row.get(4)?,
                     })
                 },
             )
@@ -327,95 +372,123 @@ impl Store {
             .context("querying files table")
     }
 
-    /// Insert or update the file record. Returns the file's row id.
-    pub fn upsert_file(&mut self, path: &Path, mtime: f64, hash: &str) -> Result<i64> {
-        let path_str = path.to_string_lossy();
-        self.conn
-            .execute(
-                "INSERT INTO files (path, mtime, hash) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(path) DO UPDATE SET mtime = excluded.mtime,
-                                                  hash  = excluded.hash",
-                params![path_str.as_ref(), mtime, hash],
-            )
-            .context("upserting file record")?;
-
-        // last_insert_rowid() returns the id even after an upsert in SQLite.
-        // But to be safe (ON CONFLICT UPDATE does not always update rowid),
-        // we do a follow-up lookup.
-        let id: i64 = self
-            .conn
-            .query_row(
-                "SELECT id FROM files WHERE path = ?1",
-                params![path_str.as_ref()],
-                |row| row.get(0),
-            )
-            .context("fetching file id after upsert")?;
-
-        Ok(id)
-    }
-
-    // -----------------------------------------------------------------------
-    // Chunks table
-    // -----------------------------------------------------------------------
-
-    /// Delete all chunk rows that belong to `file_id`.
+    /// Replace everything stored for `path` (its record and all its chunks) in
+    /// one transaction: readers see the old or the new state, never a mix, and
+    /// a failure leaves the old state. Vectors are validated against the model
+    /// dimension and stored normalised.
     ///
-    /// Call this before re-indexing a changed file so you don't accumulate
-    /// stale embeddings.
-    pub fn delete_chunks_for_file(&mut self, file_id: i64) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM chunks WHERE file_id = ?1", params![file_id])
-            .context("deleting chunks for file")?;
-        Ok(())
-    }
-
-    /// Store one chunk with its embedding.
+    /// `model` is the identity of the model that computed the vectors. It is
+    /// checked against the recorded identity inside the transaction, so a
+    /// writer that checked the model earlier cannot slip vectors of the old
+    /// model into an index another process has meanwhile reset for a new one
+    /// ([`Store::reset_model`]). Requires a recorded model identity
+    /// ([`Store::ensure_model`]).
     ///
-    /// The `embedding` slice is packed as little-endian f32 bytes and stored
-    /// as a BLOB — no content / text is stored.
-    pub fn insert_chunk(
+    /// # Errors
+    ///
+    /// [`ModelMismatch`] when the index records another model; an error for a
+    /// non-UTF-8 path, a vector of the wrong dimension or with non-finite
+    /// values, or a database error.
+    pub fn replace_file(
         &mut self,
-        file_id: i64,
-        byte_offset: usize,
-        byte_end: usize,
-        start_line: usize,
-        end_line: usize,
-        embedding: &[f32],
+        model: &ModelIdentity,
+        path: &Path,
+        mtime: f64,
+        size: u64,
+        hash: &str,
+        chunks: &[NewChunk],
     ) -> Result<()> {
-        let blob = pack_f32(embedding);
-        self.conn
-            .execute(
-                "INSERT INTO chunks (file_id, byte_offset, byte_end, start_line, end_line, embedding)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    file_id,
-                    byte_offset as i64,
-                    byte_end as i64,
-                    start_line as i64,
-                    end_line as i64,
-                    blob,
-                ],
+        let path_str = utf8_path(path)?;
+        let tx = write_tx(&mut self.conn)?;
+        let stored = read_model(&tx)?.ok_or_else(|| {
+            anyhow!("the index records no model identity; call Store::ensure_model before writing")
+        })?;
+        if !stored.is_compatible_with(model) {
+            return Err(mismatch(&self.path, &stored, model));
+        }
+        let model = stored;
+        let file_id: i64 = tx
+            .query_row(
+                "INSERT INTO files (path, mtime, size, hash) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(path) DO UPDATE SET mtime = excluded.mtime,
+                                                  size  = excluded.size,
+                                                  hash  = excluded.hash
+                 RETURNING id",
+                params![path_str, mtime, size, hash],
+                |r| r.get(0),
             )
-            .context("inserting chunk")?;
-        Ok(())
+            .with_context(|| format!("writing the file record of {path_str}"))?;
+        tx.execute("DELETE FROM chunks WHERE file_id = ?1", params![file_id])
+            .with_context(|| format!("deleting the old chunks of {path_str}"))?;
+        {
+            let mut insert = tx
+                .prepare_cached(
+                    "INSERT INTO chunks
+                       (file_id, byte_offset, byte_end, start_line, end_line, text_hash, embedding)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .context("preparing chunk insert")?;
+            for c in chunks {
+                let lines = || format!("lines {}-{} of {path_str}", c.start_line, c.end_line);
+                let blob = normalized_blob(&c.embedding, model.dim).with_context(lines)?;
+                insert
+                    .execute(params![
+                        file_id,
+                        c.byte_offset,
+                        c.byte_end,
+                        c.start_line,
+                        c.end_line,
+                        c.text_hash,
+                        blob
+                    ])
+                    .with_context(|| format!("inserting chunk at {}", lines()))?;
+            }
+        }
+        tx.commit()
+            .with_context(|| format!("committing {path_str}"))
+    }
+
+    /// The stored vectors of `path`'s chunks, keyed by chunk text hash (chunks
+    /// written before schema version 1 have no hash and are left out).
+    pub fn embeddings_by_text_hash(&self, path: &Path) -> Result<HashMap<String, Vec<f32>>> {
+        let Some(path_str) = path.to_str() else {
+            return Ok(HashMap::new());
+        };
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT c.text_hash, c.embedding FROM chunks c JOIN files f ON f.id = c.file_id
+                 WHERE f.path = ?1 AND c.text_hash IS NOT NULL",
+            )
+            .context("preparing embedding lookup")?;
+        let mut rows = stmt
+            .query(params![path_str])
+            .context("looking up embeddings")?;
+        let mut out = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let hash: String = row.get(0)?;
+            let vector = vector_from_blob(row.get_ref(1)?.as_blob()?)?;
+            out.insert(hash, vector);
+        }
+        Ok(out)
     }
 
     // -----------------------------------------------------------------------
     // Search
     // -----------------------------------------------------------------------
 
-    /// Cosine similarity search — paged, bounded-memory, top-k.
+    /// Top-`limit` chunks by cosine similarity to `query_embedding`, best first.
     ///
-    /// Reads chunks from SQLite in pages of `SEARCH_PAGE_SIZE` rows, scoring
-    /// each against `query_embedding`. A min-heap of size `limit` tracks the
-    /// k highest-scoring candidates seen so far; only those k embeddings are
-    /// ever live in RAM simultaneously.
+    /// The scan streams over one read snapshot (consistent while `vec watch`
+    /// writes) and keeps only the `limit` best candidates in memory. Results
+    /// below `min_score`, and non-finite scores, are dropped.
     ///
-    /// Memory: O(SEARCH_PAGE_SIZE × dim × 4 + limit) bytes regardless of how
-    /// many chunks are indexed — safe for millions of chunks.
+    /// `path_filter` keeps files equal to that path or inside that directory
+    /// (`/a` matches `/a/x` but not `/abc`); it is an index range scan, and
+    /// `[`, `*`, `?` have no special meaning.
     ///
-    /// If `path_filter` is `Some(prefix)`, only chunks whose file path starts
-    /// with that prefix are scored.
+    /// Errors when the query's dimension differs from the index's, or when a
+    /// stored vector has the wrong size.
     pub fn search(
         &self,
         query_embedding: &[f32],
@@ -423,162 +496,137 @@ impl Store {
         min_score: f32,
         path_filter: Option<&Path>,
     ) -> Result<Vec<SearchResult>> {
-        let q_norm = normalize(query_embedding);
+        self.search_filtered(query_embedding, limit, min_score, path_filter, |_| true)
+    }
 
-        let filter_str = path_filter
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let use_filter = path_filter.is_some();
-
-        // Prefix filter: append '*' for GLOB. Escape any literal '*', '?', or '['
-        // in the path so they are treated as literals, not wildcards.
-        let glob_pattern = format!(
-            "{}*",
-            filter_str
-                .replace('*', "[*]")
-                .replace('?', "[?]")
-                .replace('[', "[[")
-        );
-
-        // Min-heap keeping the top-k highest-scoring candidates.
-        // The lowest score is at the top (Ord is reversed) and evicted first.
-        let mut heap = std::collections::BinaryHeap::<Candidate>::new();
-
-        // Prepare once; re-execute with increasing OFFSET each page.
-        // ORDER BY c.id ensures a stable scan so LIMIT/OFFSET pages are disjoint.
-        let mut stmt = self
+    /// Like [`Store::search`], keeping only results for which `keep` returns
+    /// `true`; the filter runs before the limit, so up to `limit` kept results
+    /// are returned. `keep` is called only for a result that would enter the
+    /// current top `limit` (so a costly check such as an access() call runs for
+    /// few rows).
+    pub fn search_filtered(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        min_score: f32,
+        path_filter: Option<&Path>,
+        mut keep: impl FnMut(&SearchResult) -> bool,
+    ) -> Result<Vec<SearchResult>> {
+        let tx = self
             .conn
-            .prepare(
-                "SELECT f.path, c.byte_offset, c.byte_end, c.start_line, c.end_line, c.embedding
-             FROM chunks c
-             JOIN files f ON f.id = c.file_id
-             WHERE (?1 = 0 OR f.path GLOB ?2)
-             ORDER BY c.id
-             LIMIT ?3 OFFSET ?4",
-            )
-            .context("preparing search query")?;
-
-        let mut offset: i64 = 0;
-        loop {
-            let page = stmt
-                .query_map(
-                    params![
-                        if use_filter { 1i64 } else { 0i64 },
-                        &glob_pattern,
-                        SEARCH_PAGE_SIZE as i64,
-                        offset,
-                    ],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,       // path
-                            row.get::<_, i64>(1)? as usize, // byte_offset
-                            row.get::<_, i64>(2)? as usize, // byte_end
-                            row.get::<_, i64>(3)? as usize, // start_line
-                            row.get::<_, i64>(4)? as usize, // end_line
-                            row.get::<_, Vec<u8>>(5)?,      // embedding BLOB
-                        ))
-                    },
-                )
-                .context("executing search query")?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .context("reading search page")?;
-
-            if page.is_empty() {
-                break; // All chunks processed.
-            }
-
-            for (path, byte_offset, byte_end, start_line, end_line, blob) in page {
-                let embedding = unpack_f32(&blob);
-                if embedding.is_empty() {
-                    continue;
-                }
-
-                let score = dot(&q_norm, &normalize(&embedding));
-                if score < min_score {
-                    continue;
-                }
-
-                let candidate = Candidate {
-                    score_bits: score.to_bits(),
-                    path,
-                    byte_offset,
-                    byte_end,
-                    start_line,
-                    end_line,
-                };
-
-                if heap.len() < limit {
-                    heap.push(candidate);
-                } else if let Some(worst) = heap.peek() {
-                    // Evict the lowest score if this candidate beats it.
-                    if score > worst.score() {
-                        heap.pop();
-                        heap.push(candidate);
-                    }
-                }
-            }
-
-            offset += SEARCH_PAGE_SIZE as i64;
+            .unchecked_transaction()
+            .context("starting the search snapshot")?;
+        let model = read_model(&tx)?;
+        let dim = model.as_ref().map_or(query_embedding.len(), |m| m.dim);
+        if query_embedding.len() != dim {
+            bail!(
+                "the query vector has dimension {} but the index at {} holds {} vectors; \
+                 query with the model the index was built with, or rebuild the index \
+                 (`vec updatedb --full`)",
+                query_embedding.len(),
+                self.path.display(),
+                model.map_or_else(|| format!("dimension-{dim}"), |m| m.to_string()),
+            );
+        }
+        let query = normalize(query_embedding);
+        if query.iter().any(|x| !x.is_finite()) {
+            bail!("the query vector contains non-finite values");
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
         }
 
-        // Extract and sort descending by score.
-        let mut results: Vec<SearchResult> = heap
+        const COLUMNS: &str = "SELECT f.path, c.byte_offset, c.byte_end, c.start_line, \
+                               c.end_line, c.embedding FROM files f JOIN chunks c ON c.file_id = f.id";
+        let bounds = path_filter.map(scope_bounds).transpose()?;
+        let mut stmt;
+        let mut rows = match &bounds {
+            Some((base, lo, hi)) => {
+                stmt = tx
+                    .prepare(&format!(
+                        "{COLUMNS} WHERE f.path = ?1 OR (f.path >= ?2 AND f.path < ?3)"
+                    ))
+                    .context("preparing search query")?;
+                stmt.query(params![base, lo, hi])
+            }
+            None => {
+                stmt = tx.prepare(COLUMNS).context("preparing search query")?;
+                stmt.query([])
+            }
+        }
+        .context("executing search query")?;
+
+        // Grows with the results kept (a huge `limit` must not pre-allocate).
+        let mut heap: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new();
+        while let Some(row) = rows.next().context("reading search rows")? {
+            let blob = row.get_ref(5)?.as_blob()?;
+            if blob.len() != dim * 4 {
+                bail!(
+                    "the index at {} holds a vector of {} bytes where {} were expected \
+                     (dimension {dim}); rebuild it with `vec updatedb --full`",
+                    self.path.display(),
+                    blob.len(),
+                    dim * 4
+                );
+            }
+            let score = dot_blob(&query, blob);
+            if !score.is_finite() || score < min_score {
+                continue;
+            }
+            if heap.len() == limit && heap.peek().is_some_and(|Reverse(w)| score <= w.score) {
+                continue;
+            }
+            let result = SearchResult {
+                path: PathBuf::from(row.get_ref(0)?.as_str()?),
+                byte_offset: row.get(1)?,
+                byte_end: row.get(2)?,
+                start_line: row.get(3)?,
+                end_line: row.get(4)?,
+                score,
+            };
+            if !keep(&result) {
+                continue;
+            }
+            heap.push(Reverse(Candidate { score, result }));
+            if heap.len() > limit {
+                heap.pop();
+            }
+        }
+        // Ascending order of Reverse = descending score.
+        Ok(heap
+            .into_sorted_vec()
             .into_iter()
-            .map(|c| {
-                let score = c.score(); // extract before c.path is moved
-                SearchResult {
-                    path: PathBuf::from(c.path),
-                    byte_offset: c.byte_offset,
-                    byte_end: c.byte_end,
-                    start_line: c.start_line,
-                    end_line: c.end_line,
-                    score,
-                }
-            })
-            .collect();
-
-        results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        Ok(results)
+            .map(|Reverse(c)| c.result)
+            .collect())
     }
 
     // -----------------------------------------------------------------------
     // Maintenance
     // -----------------------------------------------------------------------
 
-    /// Remove rows from `files` (and their chunks, via CASCADE) for files
-    /// that no longer exist on disk. Returns the number of files removed.
-    /// Return paths of indexed files that no longer exist on disk.
-    pub fn get_missing_file_paths(&self) -> Result<Vec<std::path::PathBuf>> {
+    /// Call `f` with the path of every indexed file, in path order, from one
+    /// read snapshot (constant memory). Read-only.
+    pub fn for_each_indexed_path(&self, mut f: impl FnMut(&Path)) -> Result<()> {
         let mut stmt = self
             .conn
-            .prepare("SELECT path FROM files")
+            .prepare("SELECT path FROM files ORDER BY path")
             .context("preparing file list query")?;
-        let paths: Vec<String> = stmt
-            .query_map([], |row| row.get(0))
-            .context("listing files")?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context("reading file list")?;
-
-        Ok(paths
-            .into_iter()
-            .filter(|p| !Path::new(p).exists())
-            .map(std::path::PathBuf::from)
-            .collect())
+        let mut rows = stmt.query([]).context("listing files")?;
+        while let Some(row) = rows.next().context("reading file list")? {
+            f(Path::new(row.get_ref(0)?.as_str()?));
+        }
+        Ok(())
     }
 
+    /// The schema version of the open database (`PRAGMA user_version`).
+    pub fn schema_version(&self) -> Result<i64> {
+        user_version(&self.conn)
+    }
+
+    /// Remove the records (and, by cascade, the chunks) of files that no
+    /// longer exist. Returns the number removed.
     pub fn delete_missing_files(&mut self) -> Result<usize> {
         self.delete_files_where(None, is_gone)
-    }
-
-    /// Like [`Store::delete_missing_files`], but only considers records equal
-    /// to, or located under, one of `scopes`.
-    pub fn delete_missing_files_under(&mut self, scopes: &[PathBuf]) -> Result<usize> {
-        self.delete_files_where(Some(scopes), is_gone)
     }
 
     /// Delete every file record (and, by cascade, its chunks) for which
@@ -586,8 +634,7 @@ impl Store {
     ///
     /// `scopes = None` considers every record. `Some(scopes)` considers only
     /// records equal to or under one of them, with an index range scan, so
-    /// the cost is proportional to the records in scope — this is what keeps
-    /// `vec watch` re-indexes cheap.
+    /// the cost is proportional to the records in scope.
     pub fn delete_files_where(
         &mut self,
         scopes: Option<&[PathBuf]>,
@@ -607,9 +654,6 @@ impl Store {
                     .context("reading file list")?;
             }
             Some(scopes) => {
-                // Descendants of "/a/b" are exactly the strings in ["/a/b/", "/a/b0"),
-                // because '0' is the byte right after '/'. A range scan uses the
-                // UNIQUE index on files.path instead of scanning the table.
                 let mut stmt = self
                     .conn
                     .prepare(
@@ -617,10 +661,7 @@ impl Store {
                     )
                     .context("preparing scoped file list query")?;
                 for scope in scopes {
-                    let base = scope.to_string_lossy();
-                    let base = base.trim_end_matches('/');
-                    let lo = format!("{base}/");
-                    let hi = format!("{base}0");
+                    let (base, lo, hi) = scope_bounds(scope)?;
                     let found = stmt
                         .query_map(params![base, lo, hi], |row| Ok((row.get(0)?, row.get(1)?)))
                         .context("listing scoped files")?
@@ -633,10 +674,7 @@ impl Store {
             }
         }
 
-        let tx = self
-            .conn
-            .transaction()
-            .context("starting prune transaction")?;
+        let tx = write_tx(&mut self.conn)?;
         let mut removed = 0usize;
         {
             let mut del = tx
@@ -655,146 +693,427 @@ impl Store {
 
     /// Store a key/value pair in the `meta` table (upsert).
     pub fn set_meta(&mut self, key: &str, value: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT INTO meta (key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![key, value],
-            )
-            .with_context(|| format!("writing meta.{key}"))?;
-        Ok(())
+        set_meta(&self.conn, key, value)
     }
 
     /// Read a value from the `meta` table.
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
-        self.conn
-            .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
-                r.get(0)
-            })
-            .optional()
-            .with_context(|| format!("reading meta.{key}"))
+        get_meta(&self.conn, key)
     }
 
-    /// Delete all file and chunk records — used by `--full` re-index to ensure
-    /// out-of-scope entries (changed include_paths / exclude_dirs) are purged.
-    pub fn delete_all_files(&mut self) -> Result<usize> {
-        let count: usize = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
-            .context("counting files before wipe")?;
-        self.conn
-            .execute("DELETE FROM files", [])
-            .context("wiping files table")?;
-        // chunks are deleted via ON DELETE CASCADE on files.file_id
-        Ok(count)
-    }
-
-    /// Return aggregate statistics: (file_count, chunk_count, last_mtime).
-    ///
-    /// `last_mtime` is `None` when no files have been indexed yet.
+    /// Aggregate statistics: (file count, chunk count, newest file mtime).
     pub fn stats(&self) -> Result<(usize, usize, Option<f64>)> {
         let file_count: usize = self
             .conn
             .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
             .context("counting files")?;
-
         let chunk_count: usize = self
             .conn
             .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
             .context("counting chunks")?;
-
         let last_mtime: Option<f64> = self
             .conn
             .query_row("SELECT MAX(mtime) FROM files", [], |row| row.get(0))
-            .optional()
-            .context("reading max mtime")?
-            .flatten();
-
+            .context("reading max mtime")?;
         Ok((file_count, chunk_count, last_mtime))
     }
 
-    /// Return the stored embedding for the chunk that covers `line` in `path`.
-    ///
-    /// Returns `None` if no chunk covers that line.
+    /// The stored (normalised) vector of the first chunk that covers `line` in
+    /// `path`, or `None`.
     pub fn get_chunk_embedding_at(&self, path: &Path, line: usize) -> Result<Option<Vec<f32>>> {
-        let sql = "SELECT c.embedding FROM chunks c
-                   JOIN files f ON c.file_id = f.id
-                   WHERE f.path = ?1 AND c.start_line <= ?2 AND c.end_line >= ?2
-                   LIMIT 1";
-        let result: Option<Vec<u8>> = self
+        let Some(path_str) = path.to_str() else {
+            return Ok(None);
+        };
+        let blob: Option<Vec<u8>> = self
             .conn
             .query_row(
-                sql,
-                params![path.to_string_lossy().as_ref(), line as i64],
+                "SELECT c.embedding FROM chunks c JOIN files f ON c.file_id = f.id
+                 WHERE f.path = ?1 AND c.start_line <= ?2 AND c.end_line >= ?2
+                 ORDER BY c.id LIMIT 1",
+                params![path_str, line],
                 |row| row.get(0),
             )
             .optional()
             .context("looking up chunk embedding")?;
-        Ok(result.map(|blob| unpack_f32(&blob)))
+        blob.map(|b| vector_from_blob(&b)).transpose()
     }
 
-    /// Return all chunks that cover a given line in a file.
+    /// All chunks that cover `line` in `path`.
     pub fn get_chunks_covering(&self, path: &Path, line: usize) -> Result<Vec<ChunkRecord>> {
-        let sql = "SELECT c.id, c.file_id, c.byte_offset, c.byte_end, c.start_line, c.end_line
-                   FROM chunks c JOIN files f ON c.file_id = f.id
-                   WHERE f.path = ?1 AND c.start_line <= ?2 AND c.end_line >= ?2";
-        let mut stmt = self.conn.prepare(sql).context("preparing chunks query")?;
-        let rows = stmt
-            .query_map(
-                params![path.to_string_lossy().as_ref(), line as i64],
-                |row| {
-                    Ok(ChunkRecord {
-                        id: row.get(0)?,
-                        file_id: row.get(1)?,
-                        byte_offset: row.get::<_, i64>(2)? as usize,
-                        byte_end: row.get::<_, i64>(3)? as usize,
-                        start_line: row.get::<_, i64>(4)? as usize,
-                        end_line: row.get::<_, i64>(5)? as usize,
-                    })
-                },
+        let Some(path_str) = path.to_str() else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT c.id, c.file_id, c.byte_offset, c.byte_end, c.start_line, c.end_line
+                 FROM chunks c JOIN files f ON c.file_id = f.id
+                 WHERE f.path = ?1 AND c.start_line <= ?2 AND c.end_line >= ?2
+                 ORDER BY c.id",
             )
-            .context("querying chunks")?;
-        let mut result = Vec::new();
-        for r in rows {
-            result.push(r?);
-        }
-        Ok(result)
+            .context("preparing chunks query")?;
+        stmt.query_map(params![path_str, line], |row| {
+            Ok(ChunkRecord {
+                id: row.get(0)?,
+                file_id: row.get(1)?,
+                byte_offset: row.get(2)?,
+                byte_end: row.get(3)?,
+                start_line: row.get(4)?,
+                end_line: row.get(5)?,
+            })
+        })
+        .context("querying chunks")?
+        .collect::<rusqlite::Result<_>>()
+        .context("reading chunks")
     }
 
     /// Run `VACUUM` to reclaim space after large deletions.
     pub fn vacuum(&mut self) -> Result<()> {
-        self.conn
-            .execute_batch("VACUUM;")
-            .context("running VACUUM")?;
-        Ok(())
+        self.conn.execute_batch("VACUUM;").context("running VACUUM")
     }
+}
+
+/// A write transaction that takes the write lock at once (so a busy database
+/// waits for `busy_timeout` instead of failing on lock upgrade).
+fn write_tx(conn: &mut Connection) -> Result<Transaction<'_>> {
+    conn.transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("starting a write transaction")
+}
+
+fn mismatch(path: &Path, stored: &ModelIdentity, configured: &ModelIdentity) -> anyhow::Error {
+    ModelMismatch::Recorded {
+        db_path: path.to_path_buf(),
+        stored: stored.clone(),
+        expected: configured.clone(),
+    }
+    .into()
+}
+
+// ---------------------------------------------------------------------------
+// Opening and migrations
+// ---------------------------------------------------------------------------
+
+fn open_read_only(path: &Path, opts: &StoreOptions) -> Result<Connection> {
+    let exists = path
+        .try_exists()
+        .with_context(|| format!("checking for the index at {}", path.display()))?;
+    if !exists {
+        bail!(
+            "no index at {}: build it with `vec updatedb`",
+            path.display()
+        );
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening the index {} read-only", path.display()))?;
+    conn.busy_timeout(Duration::from_millis(opts.busy_timeout_ms))
+        .context("setting busy timeout")?;
+    let version = user_version(&conn)?;
+    match version.cmp(&SCHEMA_VERSION) {
+        Ordering::Equal => Ok(conn),
+        Ordering::Less => bail!(
+            "the index at {} uses schema version {version}, this vec needs version \
+             {SCHEMA_VERSION}; run `vec updatedb` (as the index owner) to upgrade it in place \
+             (if an upgrade is running right now, retry once it has finished)",
+            path.display()
+        ),
+        Ordering::Greater => Err(newer_schema(path, version)),
+    }
+}
+
+fn open_read_write(path: &Path, opts: &StoreOptions) -> Result<Connection> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating database directory {}", parent.display()))?;
+    }
+    let mut conn =
+        Connection::open(path).with_context(|| format!("opening database {}", path.display()))?;
+    conn.busy_timeout(Duration::from_millis(opts.busy_timeout_ms))
+        .context("setting busy timeout")?;
+    if opts.wal {
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .context("enabling WAL mode")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .context("setting synchronous = NORMAL")?;
+    }
+    conn.pragma_update(None, "foreign_keys", true)
+        .context("enabling foreign keys")?;
+    migrate(
+        &mut conn,
+        path,
+        Duration::from_millis(opts.migration_wait_ms),
+    )?;
+    Ok(conn)
+}
+
+fn user_version(conn: &Connection) -> Result<i64> {
+    conn.pragma_query_value(None, "user_version", |r| r.get(0))
+        .context("reading the schema version")
+}
+
+fn newer_schema(path: &Path, version: i64) -> anyhow::Error {
+    anyhow!(
+        "the index at {} uses schema version {version}, newer than this vec supports \
+         ({SCHEMA_VERSION}); upgrade vec",
+        path.display()
+    )
+}
+
+/// Bring the schema to [`SCHEMA_VERSION`]. Checks without a lock first, so an
+/// up-to-date database is never written (or locked) by opening it.
+///
+/// The upgrade takes the write lock. While another process holds it (most
+/// likely upgrading the same index, which rewrites every vector), each
+/// attempt waits `busy_timeout`; attempts are repeated until `wait` has
+/// passed, with one message on stderr saying why this process waits.
+fn migrate(conn: &mut Connection, path: &Path, wait: Duration) -> Result<()> {
+    if user_version(conn)? == SCHEMA_VERSION {
+        return Ok(());
+    }
+    let started = Instant::now();
+    let mut told = false;
+    let tx = loop {
+        match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+            Ok(tx) => break tx,
+            Err(e) if is_busy(&e) && started.elapsed() < wait => {
+                if !told {
+                    anstream::eprintln!(
+                        "vec: the index at {} needs a schema upgrade and another process holds \
+                         its lock (probably upgrading it); waiting up to {} s \
+                         ([database] migration_wait_ms)",
+                        path.display(),
+                        wait.as_secs()
+                    );
+                    told = true;
+                }
+            }
+            Err(e) if is_busy(&e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "the index at {} needs a schema upgrade, but another process held its \
+                         lock for more than [database] migration_wait_ms ({} ms); run \
+                         `vec updatedb` once when it is idle",
+                        path.display(),
+                        wait.as_millis()
+                    )
+                });
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("locking {} to upgrade its schema", path.display()));
+            }
+        }
+    };
+    let version = user_version(&tx)?;
+    if version > SCHEMA_VERSION {
+        return Err(newer_schema(path, version));
+    }
+    if version < 1 {
+        migrate_to_v1(&tx).context("upgrading the index schema to version 1")?;
+    }
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .context("writing the schema version")?;
+    tx.commit().context("committing the schema upgrade")
+}
+
+/// `true` for "database is locked" (`SQLITE_BUSY`, after `busy_timeout`).
+fn is_busy(e: &rusqlite::Error) -> bool {
+    matches!(e, rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::DatabaseBusy)
+}
+
+/// Version 0 (no `user_version`) → 1: create missing tables, add `files.size`
+/// and `chunks.text_hash`, and normalise stored vectors (version 1 stores them
+/// normalised and scores without re-normalising).
+fn migrate_to_v1(tx: &Transaction) -> Result<()> {
+    tx.execute_batch(SCHEMA_V1).context("creating tables")?;
+    add_column_if_missing(tx, "files", "size", "INTEGER")?;
+    add_column_if_missing(tx, "chunks", "text_hash", "TEXT")?;
+
+    // One row at a time by rowid: constant memory, and no row is updated
+    // while a statement is still reading it.
+    let mut next =
+        tx.prepare("SELECT id, embedding FROM chunks WHERE id > ?1 ORDER BY id LIMIT 1")?;
+    let mut update = tx.prepare("UPDATE chunks SET embedding = ?1 WHERE id = ?2")?;
+    let mut last = i64::MIN;
+    while let Some((id, blob)) = next
+        .query_row(params![last], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })
+        .optional()?
+    {
+        last = id;
+        if !blob.len().is_multiple_of(4) {
+            continue; // Reported by search as an inconsistent row.
+        }
+        let normalised = pack_f32(&normalize(&unpack_f32(&blob)));
+        if normalised != blob {
+            update.execute(params![normalised, id])?;
+        }
+    }
+    Ok(())
+}
+
+fn add_column_if_missing(tx: &Transaction, table: &str, column: &str, decl: &str) -> Result<()> {
+    let exists = tx
+        .prepare(&format!(
+            "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
+        ))?
+        .exists(params![column])?;
+    if !exists {
+        tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))
+            .with_context(|| format!("adding {table}.{column}"))?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Meta helpers
+// ---------------------------------------------------------------------------
+
+fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
+        r.get(0)
+    })
+    .optional()
+    .with_context(|| format!("reading meta.{key}"))
+}
+
+fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )
+    .with_context(|| format!("writing meta.{key}"))?;
+    Ok(())
+}
+
+fn read_model(conn: &Connection) -> Result<Option<ModelIdentity>> {
+    let Some(name) = get_meta(conn, META_MODEL_NAME)? else {
+        return Ok(None);
+    };
+    let dim = get_meta(conn, META_EMBEDDING_DIM)?.ok_or_else(|| {
+        anyhow!("meta.{META_MODEL_NAME} is set but meta.{META_EMBEDDING_DIM} is not")
+    })?;
+    let dim = dim
+        .parse()
+        .with_context(|| format!("meta.{META_EMBEDDING_DIM} is not a number: {dim:?}"))?;
+    let sha256 = get_meta(conn, META_MODEL_SHA256)?.filter(|s| !s.is_empty());
+    Ok(Some(ModelIdentity { name, dim, sha256 }))
+}
+
+fn write_model(conn: &Connection, id: &ModelIdentity) -> Result<()> {
+    set_meta(conn, META_MODEL_NAME, &id.name)?;
+    set_meta(conn, META_EMBEDDING_DIM, &id.dim.to_string())?;
+    match &id.sha256 {
+        Some(sha) => set_meta(conn, META_MODEL_SHA256, sha),
+        None => conn
+            .execute(
+                "DELETE FROM meta WHERE key = ?1",
+                params![META_MODEL_SHA256],
+            )
+            .map(drop)
+            .context("clearing meta.model_sha256"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Path helpers
+// ---------------------------------------------------------------------------
+
+fn utf8_path(path: &Path) -> Result<&str> {
+    path.to_str()
+        .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", path.display()))
+}
+
+/// `(base, lo, hi)` such that a path is `scope` or inside it exactly when
+/// `path = base OR (lo <= path < hi)`: descendants of `/a/b` are the strings in
+/// `["/a/b/", "/a/b0")` because `'0'` is the byte after `'/'`.
+fn scope_bounds(scope: &Path) -> Result<(String, String, String)> {
+    let base = utf8_path(scope)?.trim_end_matches('/');
+    Ok((base.to_owned(), format!("{base}/"), format!("{base}0")))
 }
 
 // ---------------------------------------------------------------------------
 // Embedding helpers
 // ---------------------------------------------------------------------------
 
-/// Pack a `f32` slice to a little-endian byte vector suitable for SQLite BLOB.
+/// A scored candidate in the top-k heap, ordered by score.
+struct Candidate {
+    score: f32,
+    result: SearchResult,
+}
+
+impl PartialEq for Candidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for Candidate {}
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score.total_cmp(&other.score)
+    }
+}
+
+/// Dot product of `query` with a little-endian f32 blob of the same length,
+/// without allocating.
+fn dot_blob(query: &[f32], blob: &[u8]) -> f32 {
+    let (words, _) = blob.as_chunks::<4>();
+    words
+        .iter()
+        .zip(query)
+        .map(|(w, q)| f32::from_le_bytes(*w) * q)
+        .sum()
+}
+
+/// Validate `v` (length `dim`, finite values) and pack it normalised.
+fn normalized_blob(v: &[f32], dim: usize) -> Result<Vec<u8>> {
+    if v.len() != dim {
+        bail!(
+            "vector has dimension {}, the index model has {dim}",
+            v.len()
+        );
+    }
+    if v.iter().any(|x| !x.is_finite()) {
+        bail!("vector contains non-finite values");
+    }
+    Ok(pack_f32(&normalize(v)))
+}
+
+fn vector_from_blob(blob: &[u8]) -> Result<Vec<f32>> {
+    if !blob.len().is_multiple_of(4) {
+        bail!(
+            "stored vector has {} bytes, not a multiple of 4",
+            blob.len()
+        );
+    }
+    Ok(unpack_f32(blob))
+}
+
+/// Pack a `f32` slice to little-endian bytes (the BLOB format).
 pub fn pack_f32(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
-/// Unpack a little-endian byte slice back to `Vec<f32>`.
-///
-/// Returns an empty Vec if `bytes.len()` is not a multiple of 4.
+/// Unpack little-endian bytes to `f32`s. Empty if the length is not a
+/// multiple of 4.
 pub fn unpack_f32(bytes: &[u8]) -> Vec<f32> {
     if !bytes.len().is_multiple_of(4) {
         return Vec::new();
     }
-    // The length check above guarantees an empty remainder.
     let (words, _) = bytes.as_chunks::<4>();
     words.iter().map(|w| f32::from_le_bytes(*w)).collect()
 }
 
-/// Return a new vector scaled so that its L2 norm equals 1.0.
-///
-/// If the input is all-zeros the output is also all-zeros (dot product will
-/// be 0 for any query, which is harmless).
+/// `v` scaled to unit L2 norm; an all-zero vector is returned unchanged.
 pub fn normalize(v: &[f32]) -> Vec<f32> {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm == 0.0 {
@@ -803,12 +1122,16 @@ pub fn normalize(v: &[f32]) -> Vec<f32> {
     v.iter().map(|x| x / norm).collect()
 }
 
-/// Dot product of two equal-length slices.
-///
-/// Returns 0.0 without panicking if the slices have different lengths
-/// (only the shorter length is used — in practice they should always match).
-pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+/// Dot product of two slices; an error when their lengths differ.
+pub fn dot(a: &[f32], b: &[f32]) -> Result<f32> {
+    if a.len() != b.len() {
+        bail!(
+            "dot product of vectors of dimension {} and {}",
+            a.len(),
+            b.len()
+        );
+    }
+    Ok(a.iter().zip(b).map(|(x, y)| x * y).sum())
 }
 
 // ---------------------------------------------------------------------------
@@ -819,230 +1142,584 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 mod tests {
     use super::*;
 
-    // A tiny 4-dimensional embedding used in tests so we don't need a real model.
-    fn tiny_embed(values: &[f32; 4]) -> Vec<f32> {
-        values.to_vec()
+    const DIM: usize = 4;
+
+    fn opts(read_only: bool) -> StoreOptions {
+        StoreOptions {
+            wal: false,
+            busy_timeout_ms: 1_000,
+            read_only,
+            migration_wait_ms: 1_000,
+        }
+    }
+
+    fn model() -> ModelIdentity {
+        ModelIdentity::new("test-model", DIM)
     }
 
     fn open_in_memory() -> Store {
-        Store::open(Path::new(":memory:"), false).expect("in-memory DB")
+        let mut store = Store::open(Path::new(":memory:"), &opts(false)).expect("in-memory DB");
+        store.ensure_model(&model()).unwrap();
+        store
     }
 
-    // --- Embedding helpers ---
+    fn chunk(start: usize, embedding: [f32; DIM]) -> NewChunk {
+        NewChunk {
+            byte_offset: start * 10,
+            byte_end: start * 10 + 9,
+            start_line: start,
+            end_line: start + 1,
+            text_hash: format!("h{start}"),
+            embedding: embedding.to_vec(),
+        }
+    }
+
+    fn put(store: &mut Store, path: &str, chunks: &[NewChunk]) {
+        store
+            .replace_file(&model(), Path::new(path), 1.0, 100, "hash", chunks)
+            .unwrap();
+    }
+
+    const E1: [f32; DIM] = [1.0, 0.0, 0.0, 0.0];
+    const E2: [f32; DIM] = [0.0, 1.0, 0.0, 0.0];
+
+    // --- helpers ---
 
     #[test]
-    fn pack_unpack_roundtrip() {
+    fn pack_unpack_roundtrip_and_dot() {
         let orig = vec![1.0_f32, -0.5, 0.0, 42.0];
-        let bytes = pack_f32(&orig);
-        let back = unpack_f32(&bytes);
-        assert_eq!(orig, back);
-    }
-
-    #[test]
-    fn normalize_unit_vector() {
-        let v = vec![3.0_f32, 4.0]; // norm = 5
-        let n = normalize(&v);
-        let len: f32 = n.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((len - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn dot_known_value() {
-        let a = vec![1.0_f32, 2.0, 3.0];
-        let b = vec![4.0_f32, 5.0, 6.0];
-        assert!((dot(&a, &b) - 32.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn cosine_identical_vectors() {
-        let v = vec![1.0_f32, 2.0, 3.0, 4.0];
-        let a = normalize(&v);
-        let b = normalize(&v);
-        assert!((dot(&a, &b) - 1.0).abs() < 1e-6);
-    }
-
-    // --- Store lifecycle ---
-
-    #[test]
-    fn open_creates_schema() {
-        let store = open_in_memory();
-        let (files, chunks, _) = store.stats().unwrap();
-        assert_eq!(files, 0);
-        assert_eq!(chunks, 0);
-    }
-
-    // --- Model metadata ---
-
-    #[test]
-    fn set_and_check_model() {
-        let mut store = open_in_memory();
-        store
-            .set_model("gte-multilingual-base", "abc123", 768)
-            .unwrap();
-        // Same values → should not error.
-        store
-            .check_model("gte-multilingual-base", "abc123", 768)
-            .unwrap();
-    }
-
-    #[test]
-    fn check_model_mismatch_errors() {
-        let mut store = open_in_memory();
-        store
-            .set_model("gte-multilingual-base", "abc123", 768)
-            .unwrap();
-        let err = store
-            .check_model("different-model", "abc123", 768)
-            .unwrap_err();
-        assert!(err.to_string().contains("vec updatedb --full"));
-    }
-
-    #[test]
-    fn check_model_on_empty_db_passes() {
-        let store = open_in_memory();
-        // No model set yet → should not error.
-        store.check_model("anything", "sha", 768).unwrap();
-    }
-
-    // --- Files ---
-
-    #[test]
-    fn upsert_and_get_file() {
-        let mut store = open_in_memory();
-        let id = store
-            .upsert_file(Path::new("/tmp/test.txt"), 1_700_000_000.0, "deadbeef")
-            .unwrap();
-        assert!(id > 0);
-
-        let rec = store.get_file(Path::new("/tmp/test.txt")).unwrap().unwrap();
-        assert_eq!(rec.id, id);
-        assert_eq!(rec.hash, "deadbeef");
-    }
-
-    #[test]
-    fn get_file_missing_returns_none() {
-        let store = open_in_memory();
-        let rec = store.get_file(Path::new("/nonexistent/path")).unwrap();
-        assert!(rec.is_none());
-    }
-
-    #[test]
-    fn upsert_updates_existing() {
-        let mut store = open_in_memory();
-        let id1 = store
-            .upsert_file(Path::new("/tmp/x.txt"), 1.0, "hash1")
-            .unwrap();
-        let id2 = store
-            .upsert_file(Path::new("/tmp/x.txt"), 2.0, "hash2")
-            .unwrap();
-        // Same path → same id.
-        assert_eq!(id1, id2);
-        let rec = store.get_file(Path::new("/tmp/x.txt")).unwrap().unwrap();
-        assert_eq!(rec.hash, "hash2");
-    }
-
-    // --- Chunks ---
-
-    #[test]
-    fn insert_and_search_chunk() {
-        let mut store = open_in_memory();
-        let file_id = store
-            .upsert_file(Path::new("/tmp/a.rs"), 1.0, "h1")
-            .unwrap();
-
-        let emb = tiny_embed(&[1.0, 0.0, 0.0, 0.0]);
-        store.insert_chunk(file_id, 0, 100, 0, 10, &emb).unwrap();
-
-        // Query with the same vector → score should be ~1.0.
-        let results = store.search(&emb, 5, 0.0, None).unwrap();
-        assert_eq!(results.len(), 1);
-        assert!((results[0].score - 1.0).abs() < 1e-5);
-        assert_eq!(results[0].path, Path::new("/tmp/a.rs"));
-    }
-
-    #[test]
-    fn search_respects_min_score() {
-        let mut store = open_in_memory();
-        let file_id = store
-            .upsert_file(Path::new("/tmp/b.rs"), 1.0, "h2")
-            .unwrap();
-
-        let emb = tiny_embed(&[1.0, 0.0, 0.0, 0.0]);
-        store.insert_chunk(file_id, 0, 50, 0, 5, &emb).unwrap();
-
-        // Query with an orthogonal vector → score = 0.
-        let query = tiny_embed(&[0.0, 1.0, 0.0, 0.0]);
-        let results = store.search(&query, 10, 0.5, None).unwrap();
+        assert_eq!(unpack_f32(&pack_f32(&orig)), orig);
+        assert!(unpack_f32(&[0u8; 5]).is_empty());
+        assert!((dot(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]).unwrap() - 32.0).abs() < 1e-6);
         assert!(
-            results.is_empty(),
-            "orthogonal vector should score below 0.5"
+            dot(&[1.0], &[1.0, 2.0]).is_err(),
+            "length mismatch is an error"
+        );
+        let n = normalize(&[3.0, 4.0]);
+        assert!((n[0] - 0.6).abs() < 1e-6 && (n[1] - 0.8).abs() < 1e-6);
+        assert!((dot_blob(&[0.5, 2.0], &pack_f32(&[2.0, 1.0])) - 3.0).abs() < 1e-6);
+    }
+
+    // --- schema and migrations ---
+
+    #[test]
+    fn new_database_is_at_current_version() {
+        let store = open_in_memory();
+        assert_eq!(user_version(&store.conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(store.stats().unwrap(), (0, 0, None));
+    }
+
+    /// The schema written by vec before versioning (no user_version, no
+    /// files.size, no chunks.text_hash, vectors not normalised).
+    const LEGACY_SCHEMA: &str = "
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL,
+                            mtime REAL NOT NULL, hash TEXT NOT NULL);
+        CREATE TABLE chunks (id INTEGER PRIMARY KEY,
+                             file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
+                             byte_offset INTEGER NOT NULL, byte_end INTEGER NOT NULL,
+                             start_line INTEGER NOT NULL, end_line INTEGER NOT NULL,
+                             embedding BLOB NOT NULL);
+        CREATE INDEX idx_chunks_file ON chunks(file_id);
+        INSERT INTO files (id, path, mtime, hash) VALUES (1, '/old/a.rs', 5.0, 'h');
+    ";
+
+    fn legacy_db(dir: &Path, vector: &[f32]) -> PathBuf {
+        let path = dir.join("legacy.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(LEGACY_SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO chunks (file_id, byte_offset, byte_end, start_line, end_line, embedding)
+             VALUES (1, 0, 10, 1, 2, ?1)",
+            params![pack_f32(vector)],
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn legacy_database_is_upgraded_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = legacy_db(dir.path(), &[3.0, 4.0, 0.0, 0.0]);
+
+        // Read-only cannot upgrade: a clear error.
+        let err = Store::open(&path, &opts(true)).err().unwrap().to_string();
+        assert!(err.contains("vec updatedb"), "{err}");
+
+        let mut store = Store::open(&path, &opts(false)).unwrap();
+        assert_eq!(user_version(&store.conn).unwrap(), SCHEMA_VERSION);
+        let rec = store.get_file(Path::new("/old/a.rs")).unwrap().unwrap();
+        assert_eq!((rec.size, rec.hash.as_str()), (None, "h"));
+        let v = store
+            .get_chunk_embedding_at(Path::new("/old/a.rs"), 1)
+            .unwrap()
+            .unwrap();
+        assert!(
+            (v[0] - 0.6).abs() < 1e-6 && (v[1] - 0.8).abs() < 1e-6,
+            "{v:?}"
+        );
+
+        // The old vectors have dimension 4: a 4-d model is adopted, then the
+        // index is usable read-only.
+        store.ensure_model(&model()).unwrap();
+        drop(store);
+        let ro = Store::open(&path, &opts(true)).unwrap();
+        assert_eq!(ro.search(&E1, 5, -1.0, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn legacy_vectors_of_another_dimension_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = legacy_db(dir.path(), &[1.0, 0.0]);
+        let mut store = Store::open(&path, &opts(false)).unwrap();
+        let err = store.ensure_model(&model()).unwrap_err().to_string();
+        assert!(err.contains("--full"), "{err}");
+    }
+
+    #[test]
+    fn newer_schema_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.db");
+        Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        assert!(Store::open(&path, &opts(false)).is_err());
+        assert!(Store::open(&path, &opts(true)).is_err());
+    }
+
+    #[test]
+    fn read_only_open_needs_an_existing_index_and_cannot_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub/vec.db");
+        let err = Store::open(&path, &opts(true)).err().unwrap().to_string();
+        assert!(err.contains("no index"), "{err}");
+        assert!(
+            !path.parent().unwrap().exists(),
+            "read-only creates nothing"
+        );
+
+        let mut rw = Store::open(&path, &opts(false)).unwrap();
+        rw.ensure_model(&model()).unwrap();
+        put(&mut rw, "/p/a.rs", &[chunk(1, E1)]);
+        drop(rw);
+        let mut ro = Store::open(&path, &opts(true)).unwrap();
+        assert_eq!(ro.search(&E1, 5, 0.0, None).unwrap().len(), 1);
+        assert!(ro.set_meta("k", "v").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn up_to_date_index_opens_read_write_without_write_access() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vec.db");
+        let mut rw = Store::open(&path, &opts(false)).unwrap();
+        rw.ensure_model(&model()).unwrap();
+        put(&mut rw, "/p/a.rs", &[chunk(1, E1)]);
+        drop(rw);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        // Opening must not take a write lock when no migration is due.
+        let store = Store::open(&path, &opts(false)).unwrap();
+        assert_eq!(store.search(&E1, 5, 0.0, None).unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_store_bad_parent_returns_err() {
+        assert!(Store::open(Path::new("/dev/null/vec.db"), &opts(false)).is_err());
+    }
+
+    // --- model identity ---
+
+    #[test]
+    fn ensure_model_sets_then_checks() {
+        let mut store = Store::open(Path::new(":memory:"), &opts(false)).unwrap();
+        assert_eq!(store.model().unwrap(), None);
+        store.check_model(&model()).unwrap();
+        store.ensure_model(&model()).unwrap();
+        assert_eq!(store.model().unwrap(), Some(model()));
+        store.ensure_model(&model()).unwrap();
+
+        for other in [
+            ModelIdentity::new("other-model", DIM),
+            ModelIdentity::new("test-model", DIM + 1),
+        ] {
+            let err = store.ensure_model(&other).unwrap_err().to_string();
+            assert!(
+                err.contains("model mismatch") && err.contains("--full"),
+                "{err}"
+            );
+            assert!(store.check_model(&other).is_err());
+        }
+    }
+
+    #[test]
+    fn ensure_model_fills_in_and_then_enforces_sha() {
+        let mut store = open_in_memory();
+        let mut with_sha = model();
+        with_sha.sha256 = Some("aaa".into());
+        store.ensure_model(&with_sha).unwrap();
+        assert_eq!(store.model().unwrap(), Some(with_sha.clone()));
+        store.ensure_model(&model()).unwrap(); // unknown sha: compatible
+        let mut other_sha = model();
+        other_sha.sha256 = Some("bbb".into());
+        assert!(store.ensure_model(&other_sha).is_err());
+    }
+
+    #[test]
+    fn reset_model_empties_index_and_records_new_identity() {
+        let mut store = open_in_memory();
+        put(&mut store, "/p/a.rs", &[chunk(1, E1)]);
+        let new = ModelIdentity::new("bigger", 8);
+        store.reset_model(&new).unwrap();
+        assert_eq!(store.stats().unwrap(), (0, 0, None));
+        assert_eq!(store.model().unwrap(), Some(new));
+    }
+
+    // --- replace_file ---
+
+    #[test]
+    fn replace_file_requires_a_model() {
+        let mut store = Store::open(Path::new(":memory:"), &opts(false)).unwrap();
+        let err = store
+            .replace_file(&model(), Path::new("/p/a.rs"), 1.0, 1, "h", &[chunk(1, E1)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ensure_model"), "{err}");
+    }
+
+    #[test]
+    fn replace_file_writes_record_and_chunks() {
+        let mut store = open_in_memory();
+        store
+            .replace_file(
+                &model(),
+                Path::new("/p/a.rs"),
+                7.5,
+                1234,
+                "h1",
+                &[chunk(1, [2.0, 0.0, 0.0, 0.0])],
+            )
+            .unwrap();
+        let rec = store.get_file(Path::new("/p/a.rs")).unwrap().unwrap();
+        assert_eq!(
+            (rec.mtime, rec.size, rec.hash.as_str()),
+            (7.5, Some(1234), "h1")
+        );
+        // Stored normalised.
+        assert_eq!(
+            store
+                .get_chunk_embedding_at(Path::new("/p/a.rs"), 1)
+                .unwrap(),
+            Some(E1.to_vec())
+        );
+
+        store
+            .replace_file(
+                &model(),
+                Path::new("/p/a.rs"),
+                8.0,
+                99,
+                "h2",
+                &[chunk(5, E2), chunk(6, E1)],
+            )
+            .unwrap();
+        let rec2 = store.get_file(Path::new("/p/a.rs")).unwrap().unwrap();
+        assert_eq!(rec2.id, rec.id, "same path keeps its id");
+        assert_eq!(rec2.hash, "h2");
+        assert_eq!(store.stats().unwrap().1, 2, "old chunks replaced");
+        assert!(
+            store
+                .get_chunks_covering(Path::new("/p/a.rs"), 1)
+                .unwrap()
+                .is_empty()
         );
     }
 
     #[test]
-    fn delete_chunks_for_file() {
+    fn failed_replace_leaves_the_old_state() {
+        // Regression: the hash used to be written before the chunks, so a
+        // failure left a record that looked up to date with no chunks.
         let mut store = open_in_memory();
-        let fid = store
-            .upsert_file(Path::new("/tmp/c.rs"), 1.0, "h3")
-            .unwrap();
-        let emb = tiny_embed(&[1.0, 0.0, 0.0, 0.0]);
-        store.insert_chunk(fid, 0, 20, 0, 5, &emb).unwrap();
+        put(&mut store, "/p/a.rs", &[chunk(1, E1)]);
+        let bad = NewChunk {
+            embedding: vec![1.0; DIM + 1],
+            ..chunk(2, E2)
+        };
+        let err = store
+            .replace_file(
+                &model(),
+                Path::new("/p/a.rs"),
+                9.0,
+                1,
+                "new-hash",
+                &[chunk(1, E2), bad],
+            )
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("dimension"), "{err:#}");
+        assert_eq!(
+            store.get_file(Path::new("/p/a.rs")).unwrap().unwrap().hash,
+            "hash"
+        );
+        assert_eq!(
+            store
+                .get_chunk_embedding_at(Path::new("/p/a.rs"), 1)
+                .unwrap(),
+            Some(E1.to_vec())
+        );
+        let nan = chunk(3, [f32::NAN, 0.0, 0.0, 0.0]);
+        assert!(
+            store
+                .replace_file(&model(), Path::new("/p/a.rs"), 9.0, 1, "x", &[nan])
+                .is_err()
+        );
+    }
 
-        let (_, chunks_before, _) = store.stats().unwrap();
-        assert_eq!(chunks_before, 1);
-
-        store.delete_chunks_for_file(fid).unwrap();
-
-        let (_, chunks_after, _) = store.stats().unwrap();
-        assert_eq!(chunks_after, 0);
+    #[cfg(unix)]
+    #[test]
+    fn replace_file_rejects_non_utf8_paths() {
+        use std::os::unix::ffi::OsStrExt;
+        let mut store = open_in_memory();
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"/p/\xff.rs"));
+        assert!(
+            store
+                .replace_file(&model(), path, 1.0, 1, "h", &[])
+                .is_err()
+        );
+        assert!(store.get_file(path).unwrap().is_none());
     }
 
     #[test]
-    fn delete_missing_files() {
+    fn embeddings_by_text_hash_returns_reusable_vectors() {
         let mut store = open_in_memory();
-        // Use a path that definitely does not exist.
-        store
-            .upsert_file(Path::new("/absolutely/does/not/exist/ever.rs"), 1.0, "h4")
-            .unwrap();
-        let removed = store.delete_missing_files().unwrap();
-        assert_eq!(removed, 1);
-        let (files, _, _) = store.stats().unwrap();
-        assert_eq!(files, 0);
+        put(&mut store, "/p/a.rs", &[chunk(1, E1), chunk(2, E2)]);
+        let map = store.embeddings_by_text_hash(Path::new("/p/a.rs")).unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["h1"], E1.to_vec());
+        assert_eq!(map["h2"], E2.to_vec());
+        assert!(
+            store
+                .embeddings_by_text_hash(Path::new("/nope"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // --- search ---
+
+    #[test]
+    fn search_ranks_and_respects_min_score() {
+        let mut store = open_in_memory();
+        put(
+            &mut store,
+            "/p/a.rs",
+            &[chunk(1, E1), chunk(2, [1.0, 1.0, 0.0, 0.0])],
+        );
+        put(&mut store, "/p/b.rs", &[chunk(1, E2)]);
+        let results = store.search(&[3.0, 0.0, 0.0, 0.0], 10, 0.5, None).unwrap();
+        assert_eq!(results.len(), 2, "the orthogonal chunk is below 0.5");
+        assert!((results[0].score - 1.0).abs() < 1e-6);
+        assert_eq!(results[0].start_line, 1);
+        assert!(results[0].score > results[1].score);
+        assert!(store.search(&E1, 0, -1.0, None).unwrap().is_empty());
     }
 
     #[test]
-    fn delete_missing_files_under_only_touches_scope() {
+    fn search_filtered_filters_before_the_limit() {
         let mut store = open_in_memory();
-        // Both paths are missing on disk; only the one in scope may be pruned.
-        store
-            .upsert_file(Path::new("/nonexistent/scope/a.rs"), 1.0, "a")
+        // Three files, best first; the filter rejects the best one.
+        put(&mut store, "/p/best.rs", &[chunk(1, [1.0, 0.0, 0.0, 0.0])]);
+        put(&mut store, "/p/mid.rs", &[chunk(1, [0.9, 0.1, 0.0, 0.0])]);
+        put(&mut store, "/p/low.rs", &[chunk(1, [0.5, 0.5, 0.0, 0.0])]);
+        let mut calls = 0;
+        let hits = store
+            .search_filtered(&E1, 2, -1.0, None, |r| {
+                calls += 1;
+                r.path != Path::new("/p/best.rs")
+            })
             .unwrap();
+        let paths: Vec<_> = hits.iter().map(|h| h.path.clone()).collect();
+        assert_eq!(
+            paths,
+            [PathBuf::from("/p/mid.rs"), PathBuf::from("/p/low.rs")]
+        );
+        assert!(calls >= 3);
+    }
+
+    #[test]
+    fn indexed_paths_are_listed_in_order() {
+        let mut store = open_in_memory();
+        put(&mut store, "/b", &[chunk(1, E1)]);
+        put(&mut store, "/a", &[chunk(1, E2)]);
+        let mut seen = Vec::new();
         store
-            .upsert_file(Path::new("/nonexistent/scope-sibling/b.rs"), 1.0, "b")
+            .for_each_indexed_path(|p| seen.push(p.to_path_buf()))
             .unwrap();
+        assert_eq!(seen, [PathBuf::from("/a"), PathBuf::from("/b")]);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn search_returns_top_k_over_many_rows() {
+        let mut store = open_in_memory();
+        let chunks: Vec<NewChunk> = (0..1_500)
+            .map(|i| chunk(i, [(i + 1) as f32 * 0.001, 0.5, 0.5, 0.5]))
+            .collect();
+        put(&mut store, "/p/big.rs", &chunks);
+        let results = store.search(&E1, 5, -1.0, None).unwrap();
+        let lines: Vec<usize> = results.iter().map(|r| r.start_line).collect();
+        assert_eq!(lines, [1499, 1498, 1497, 1496, 1495]);
+    }
+
+    #[test]
+    fn search_rejects_a_query_of_another_dimension() {
+        let mut store = open_in_memory();
+        put(&mut store, "/p/a.rs", &[chunk(1, E1)]);
+        let err = store
+            .search(&[1.0, 0.0], 5, 0.0, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("dimension 2") && err.contains("test-model"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn search_rejects_wrong_size_blobs_and_skips_nan_scores() {
+        let mut store = open_in_memory();
+        put(&mut store, "/p/a.rs", &[chunk(1, E1)]);
         store
-            .upsert_file(Path::new("/nonexistent/other/c.rs"), 1.0, "c")
+            .conn
+            .execute(
+                "INSERT INTO chunks (file_id, byte_offset, byte_end, start_line, end_line, embedding)
+                 VALUES (1, 0, 1, 9, 9, ?1)",
+                params![pack_f32(&[f32::NAN, 0.0, 0.0, 0.0])],
+            )
             .unwrap();
+        let results = store.search(&E1, 5, -1.0, None).unwrap();
+        assert_eq!(results.len(), 1, "the NaN-scored row is skipped");
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO chunks (file_id, byte_offset, byte_end, start_line, end_line, embedding)
+                 VALUES (1, 0, 1, 9, 9, ?1)",
+                params![pack_f32(&[1.0, 0.0])],
+            )
+            .unwrap();
+        let err = store.search(&E1, 5, -1.0, None).unwrap_err().to_string();
+        assert!(err.contains("8 bytes"), "{err}");
+    }
+
+    fn filtered(store: &Store, filter: &str) -> Vec<String> {
+        let mut paths: Vec<String> = store
+            .search(&E1, 100, -1.0, Some(Path::new(filter)))
+            .unwrap()
+            .into_iter()
+            .map(|r| r.path.display().to_string())
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn path_filter_respects_directory_boundaries() {
+        let mut store = open_in_memory();
+        for p in [
+            "/proj/a/file.rs",
+            "/proj/abc/file.rs",
+            "/proj/a",
+            "/proj/b/x.rs",
+        ] {
+            put(&mut store, p, &[chunk(1, E1)]);
+        }
+        assert_eq!(filtered(&store, "/proj/a"), ["/proj/a", "/proj/a/file.rs"]);
+        assert_eq!(filtered(&store, "/proj/a/"), ["/proj/a", "/proj/a/file.rs"]);
+        assert_eq!(filtered(&store, "/proj/a/file.rs"), ["/proj/a/file.rs"]);
+        assert_eq!(filtered(&store, "/").len(), 4);
+    }
+
+    #[test]
+    fn path_filter_treats_glob_characters_literally() {
+        // Regression: the GLOB escaping turned "[" into "[[" after adding "[*]".
+        let mut store = open_in_memory();
+        for p in [
+            "/proj/[module]/file.rs",
+            "/proj/module2/x.rs",
+            "/a[b/x.rs",
+            "/a*b/x.rs",
+            "/a?b/x.rs",
+            "/axb/x.rs",
+        ] {
+            put(&mut store, p, &[chunk(1, E1)]);
+        }
+        assert_eq!(
+            filtered(&store, "/proj/[module]"),
+            ["/proj/[module]/file.rs"]
+        );
+        assert_eq!(filtered(&store, "/a[b"), ["/a[b/x.rs"]);
+        assert_eq!(filtered(&store, "/a*b"), ["/a*b/x.rs"]);
+        assert_eq!(filtered(&store, "/a?b"), ["/a?b/x.rs"]);
+    }
+
+    // --- maintenance ---
+
+    #[test]
+    fn delete_missing_files_scoped_and_unscoped() {
+        let mut store = open_in_memory();
+        for p in [
+            "/nonexistent/scope/a.rs",
+            "/nonexistent/scope-sibling/b.rs",
+            "/nonexistent/other/c.rs",
+        ] {
+            put(&mut store, p, &[chunk(1, E1)]);
+        }
         let removed = store
-            .delete_missing_files_under(&[PathBuf::from("/nonexistent/scope")])
+            .delete_files_where(Some(&[PathBuf::from("/nonexistent/scope")]), is_gone)
             .unwrap();
         assert_eq!(removed, 1, "only the record under the scope is pruned");
-        let (files, _, _) = store.stats().unwrap();
-        assert_eq!(files, 2);
+        assert_eq!(store.delete_missing_files().unwrap(), 2);
+        assert_eq!(store.stats().unwrap(), (0, 0, None), "chunks cascade");
     }
 
     #[test]
     fn delete_files_where_uses_predicate_and_scope() {
         let mut store = open_in_memory();
         for p in ["/s/keep.rs", "/s/drop.rs", "/t/drop.rs"] {
-            store.upsert_file(Path::new(p), 1.0, "h").unwrap();
+            put(&mut store, p, &[]);
         }
         let removed = store
             .delete_files_where(Some(&[PathBuf::from("/s")]), |p| p.ends_with("drop.rs"))
             .unwrap();
-        assert_eq!(removed, 1, "only /s/drop.rs is in scope and stale");
+        assert_eq!(removed, 1);
         assert!(store.get_file(Path::new("/t/drop.rs")).unwrap().is_some());
         assert!(store.get_file(Path::new("/s/keep.rs")).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_file_paths_ignore_unreadable_paths() {
+        // Regression: Path::exists() reported EACCES as "deleted".
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let hidden = locked.join("f.rs");
+        std::fs::write(&hidden, "x").unwrap();
+        let mut store = open_in_memory();
+        store
+            .replace_file(&model(), &hidden, 1.0, 1, "h", &[])
+            .unwrap();
+        store
+            .replace_file(&model(), &dir.path().join("gone.rs"), 1.0, 1, "h", &[])
+            .unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let removed = store.delete_missing_files();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(removed.unwrap(), 1, "only the file that is gone");
+        assert!(store.get_file(&hidden).unwrap().is_some());
     }
 
     #[test]
@@ -1054,247 +1731,109 @@ mod tests {
         assert_eq!(store.get_meta("k").unwrap().as_deref(), Some("2"));
     }
 
-    #[test]
-    fn stats_empty_db() {
-        let store = open_in_memory();
-        let (files, chunks, last_mtime) = store.stats().unwrap();
-        assert_eq!(files, 0);
-        assert_eq!(chunks, 0);
-        assert!(last_mtime.is_none());
-    }
-
-    // --- New tests ---
+    // --- typed model mismatch (review 2026-11-19 #5, #8) ---
 
     #[test]
-    fn search_returns_empty_when_db_empty() {
-        let store = open_in_memory();
-        let query = tiny_embed(&[1.0, 0.0, 0.0, 0.0]);
-        let results = store.search(&query, 10, 0.0, None).unwrap();
-        assert!(results.is_empty(), "fresh DB should return no results");
-    }
-
-    #[test]
-    fn search_with_path_filter() {
+    fn model_mismatch_is_typed_and_other_errors_are_not() {
         let mut store = open_in_memory();
-
-        let fid_a = store
-            .upsert_file(Path::new("/proj/a/file.rs"), 1.0, "h_a")
-            .unwrap();
-        let fid_b = store
-            .upsert_file(Path::new("/proj/b/file.rs"), 1.0, "h_b")
-            .unwrap();
-
-        let emb_a = tiny_embed(&[1.0, 0.0, 0.0, 0.0]);
-        let emb_b = tiny_embed(&[0.0, 1.0, 0.0, 0.0]);
-
-        store.insert_chunk(fid_a, 0, 10, 1, 5, &emb_a).unwrap();
-        store.insert_chunk(fid_b, 0, 10, 1, 5, &emb_b).unwrap();
-
-        // Filter to /proj/a/ — only the chunk from fid_a should be returned.
-        let query = tiny_embed(&[1.0, 0.0, 0.0, 0.0]);
-        let results = store
-            .search(&query, 10, 0.0, Some(Path::new("/proj/a")))
-            .unwrap();
-
-        assert_eq!(results.len(), 1, "path filter should restrict to /proj/a");
-        assert_eq!(results[0].path, Path::new("/proj/a/file.rs"));
+        let other = ModelIdentity::new("other-model", DIM);
+        let err = store.ensure_model(&other).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<ModelMismatch>(),
+            Some(ModelMismatch::Recorded { stored, .. }) if *stored == model()
+        ));
+        assert!(store.check_model(&other).unwrap_err().is::<ModelMismatch>());
+        assert!(
+            !store
+                .ensure_model(&ModelIdentity::new("m", 0))
+                .unwrap_err()
+                .is::<ModelMismatch>()
+        );
     }
 
     #[test]
-    fn delete_missing_files_removes_stale() {
+    fn unrecorded_index_of_another_dimension_is_a_typed_mismatch() {
         let mut store = open_in_memory();
-        // Insert a file record whose path does not exist on disk.
+        put(&mut store, "/p/a.rs", &[chunk(1, E1)]);
+        store.conn.execute("DELETE FROM meta", []).unwrap();
+        let err = store
+            .ensure_model(&ModelIdentity::new("m", DIM * 2))
+            .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<ModelMismatch>(),
+            Some(ModelMismatch::Unrecorded {
+                stored_dim: DIM,
+                ..
+            })
+        ));
+    }
+
+    /// Regression (#8): a writer that passed `ensure_model` before another
+    /// process reset the index for a new model of the same dimension must not
+    /// write its old-model vectors.
+    #[test]
+    fn replace_file_refuses_vectors_of_a_model_reset_away() {
+        let mut store = open_in_memory();
+        let new = ModelIdentity::new("new-model", DIM);
+        store.reset_model(&new).unwrap();
+        let err = store
+            .replace_file(&model(), Path::new("/p/a.rs"), 1.0, 1, "h", &[chunk(1, E1)])
+            .unwrap_err();
+        assert!(err.is::<ModelMismatch>(), "{err:#}");
+        assert!(store.get_file(Path::new("/p/a.rs")).unwrap().is_none());
         store
-            .upsert_file(
-                Path::new("/this/path/absolutely/does/not/exist/stale.txt"),
-                1.0,
-                "stalehash",
-            )
+            .replace_file(&new, Path::new("/p/a.rs"), 1.0, 1, "h", &[chunk(1, E1)])
             .unwrap();
-
-        let (files_before, _, _) = store.stats().unwrap();
-        assert_eq!(files_before, 1);
-
-        let removed = store.delete_missing_files().unwrap();
-        assert_eq!(removed, 1, "stale record should have been removed");
-
-        let (files_after, _, _) = store.stats().unwrap();
-        assert_eq!(files_after, 0);
     }
 
-    #[test]
-    fn insert_multiple_chunks_same_file() {
-        let mut store = open_in_memory();
-        let fid = store
-            .upsert_file(Path::new("/tmp/multi.rs"), 1.0, "hmulti")
+    // --- schema upgrade under contention (review 2026-11-19 #11) ---
+
+    /// A version-0 database whose write lock another connection holds for
+    /// `hold`.
+    fn locked_v0_db(hold: Duration) -> (tempfile::TempDir, PathBuf, std::thread::JoinHandle<()>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v0.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
             .unwrap();
-
-        let emb = tiny_embed(&[1.0, 0.0, 0.0, 0.0]);
-        store.insert_chunk(fid, 0, 40, 1, 10, &emb).unwrap();
-        store.insert_chunk(fid, 41, 80, 11, 20, &emb).unwrap();
-        store.insert_chunk(fid, 81, 120, 21, 30, &emb).unwrap();
-
-        let (file_count, chunk_count, _) = store.stats().unwrap();
-        assert_eq!(file_count, 1);
-        assert_eq!(chunk_count, 3, "expected 3 chunks for the file");
-    }
-
-    #[test]
-    fn cosine_search_finds_similar() {
-        let mut store = open_in_memory();
-        let fid = store
-            .upsert_file(Path::new("/tmp/cosine.rs"), 1.0, "hcos")
-            .unwrap();
-
-        // Use a 4-d vector: e1 = [1,0,0,0]
-        let known_emb = tiny_embed(&[1.0, 0.0, 0.0, 0.0]);
-        store.insert_chunk(fid, 0, 50, 1, 5, &known_emb).unwrap();
-
-        // Query with the identical vector → cosine score should be ~1.0.
-        let results = store.search(&known_emb, 5, 0.0, None).unwrap();
-        assert_eq!(results.len(), 1);
-        assert!(
-            (results[0].score - 1.0).abs() < 1e-5,
-            "identical vector should score ~1.0, got {}",
-            results[0].score
-        );
-
-        // Query with the orthogonal vector [0,1,0,0] → score should be ~0.0.
-        let ortho = tiny_embed(&[0.0, 1.0, 0.0, 0.0]);
-        let results_ortho = store.search(&ortho, 5, 0.0, None).unwrap();
-        if !results_ortho.is_empty() {
-            assert!(
-                results_ortho[0].score.abs() < 1e-5,
-                "orthogonal vector should score ~0.0, got {}",
-                results_ortho[0].score
-            );
-        }
-    }
-
-    #[test]
-    fn model_mismatch_after_set() {
-        let mut store = open_in_memory();
-        store.set_model("model-a", "sha-a", 768).unwrap();
-
-        // Check with a different model name → must return an error.
-        let err = store.check_model("model-b", "sha-a", 768).unwrap_err();
-        assert!(
-            err.to_string().contains("vec updatedb --full"),
-            "error message should mention 'vec updatedb --full'"
-        );
-    }
-
-    // --- Gap 2: byte_end clamping ---
-
-    #[test]
-    fn byte_end_clamping_is_safe() {
-        // Regression for the file-truncation race at query time.
-        // The DB may store a byte_end that exceeds the file's current length
-        // (file truncated after indexing). cmd_search clamps before slicing;
-        // this test verifies the pattern doesn't panic.
-        let bytes = b"hello world"; // 11 bytes
-        let stored_byte_end = 10_000usize; // stale value from before truncation
-        let stored_byte_offset = 0usize;
-        let end = stored_byte_end.min(bytes.len());
-        let start = stored_byte_offset.min(end);
-        let slice = &bytes[start..end];
-        assert_eq!(slice, b"hello world");
-    }
-
-    // --- Gap 3: GLOB escaping for special-char paths ---
-
-    #[test]
-    fn search_path_filter_with_bracket_char() {
-        // Paths containing '[' are valid on Linux. They must be treated as
-        // literals in the GLOB prefix filter, not as GLOB character classes.
-        let mut store = open_in_memory();
-        let special_path = "/proj/[module]/file.rs";
-        let normal_path = "/proj/normal/file.rs";
-
-        let fid_s = store
-            .upsert_file(Path::new(special_path), 1.0, "hs")
-            .unwrap();
-        let fid_n = store
-            .upsert_file(Path::new(normal_path), 1.0, "hn")
-            .unwrap();
-
-        let emb = tiny_embed(&[1.0, 0.0, 0.0, 0.0]);
-        store.insert_chunk(fid_s, 0, 10, 1, 5, &emb).unwrap();
-        store.insert_chunk(fid_n, 0, 10, 1, 5, &emb).unwrap();
-
-        let results = store
-            .search(&emb, 10, 0.0, Some(Path::new("/proj/[module]")))
-            .unwrap();
-
-        assert_eq!(
-            results.len(),
-            1,
-            "path filter with '[' should return exactly 1 result"
-        );
-        assert_eq!(results[0].path, Path::new(special_path));
-    }
-
-    // --- Gap 8: paged search memory bound ---
-
-    #[test]
-    fn search_paged_returns_correct_top_k() {
-        // Insert 1 500 chunks — more than SEARCH_PAGE_SIZE (1 000) — and verify
-        // that paged loading returns the correct top-5, properly ranked.
-        //
-        // Embedding for chunk i: normalize([x, 0.5, 0.5, 0.5]) where
-        // x = (i+1) * 0.001 (so x ranges from 0.001 to 1.5, keeping f32
-        // scores distinct throughout).  Query: [1,0,0,0].
-        // Cosine score = x / sqrt(x² + 0.75) which is strictly increasing in x,
-        // so the highest-indexed chunks always have the highest scores.
-        let mut store = open_in_memory();
-        let fid = store
-            .upsert_file(Path::new("/tmp/paged.rs"), 1.0, "hpaged")
-            .unwrap();
-
-        for i in 0..1_500usize {
-            let x = (i + 1) as f32 * 0.001;
-            let raw = [x, 0.5, 0.5, 0.5];
-            let emb = normalize(&raw);
-            store
-                .insert_chunk(fid, i * 10, i * 10 + 9, i, i + 1, &emb)
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let mut conn = conn;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
                 .unwrap();
-        }
-
-        let query = tiny_embed(&[1.0, 0.0, 0.0, 0.0]);
-        let results = store.search(&query, 5, -1.0, None).unwrap();
-
-        assert_eq!(results.len(), 5, "must return exactly 5 results");
-
-        // Results must be sorted descending.
-        for w in results.windows(2) {
-            assert!(
-                w[0].score >= w[1].score,
-                "results not sorted: {} < {}",
-                w[0].score,
-                w[1].score
-            );
-        }
-
-        // The top result must come from the highest-indexed chunk (i=1499).
-        assert_eq!(
-            results[0].start_line, 1499,
-            "top result should be chunk at start_line=1499, got {}",
-            results[0].start_line
-        );
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(hold);
+            tx.commit().unwrap();
+        });
+        locked_rx.recv().unwrap();
+        (dir, path, holder)
     }
 
-    // --- Gap 7: SQLite error conditions ---
-
-    #[cfg(unix)]
     #[test]
-    fn open_store_bad_parent_returns_err() {
-        // /dev/null is a character device on Linux; create_dir_all("/dev/null")
-        // fails because the path already exists but is not a directory.
-        // Store::open calls create_dir_all on the parent, so this must Err.
-        let result = Store::open(Path::new("/dev/null/vec.db"), false);
-        assert!(
-            result.is_err(),
-            "Store::open under /dev/null should return Err"
-        );
+    fn schema_upgrade_waits_for_a_lock_held_by_another_process() {
+        let hold = Duration::from_millis(600);
+        let (_dir, path, holder) = locked_v0_db(hold);
+        let opts = StoreOptions {
+            busy_timeout_ms: 100,
+            migration_wait_ms: 30_000,
+            ..opts(false)
+        };
+        let store = Store::open(&path, &opts).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        holder.join().unwrap();
+    }
+
+    #[test]
+    fn schema_upgrade_gives_up_after_migration_wait_with_a_clear_message() {
+        let (_dir, path, holder) = locked_v0_db(Duration::from_millis(1_500));
+        let opts = StoreOptions {
+            busy_timeout_ms: 100,
+            migration_wait_ms: 300,
+            ..opts(false)
+        };
+        let err = format!("{:#}", Store::open(&path, &opts).err().unwrap());
+        assert!(err.contains("migration_wait_ms"), "{err}");
+        holder.join().unwrap();
     }
 }

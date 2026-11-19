@@ -1,0 +1,287 @@
+# ==============================================================================
+# vec — compiled-in defaults
+# ==============================================================================
+#
+# This file is embedded into the vec binary (include_str!) and is the single
+# source of every default value: the Rust code contains none. It is also the
+# source of the `vec init` templates (contrib/vec.conf is maintained by hand
+# and checked by a test to stay a valid layer).
+#
+# Configuration layers, each overriding the previous one:
+#   1. this file (compiled in)
+#   2. the system config file      (/etc/vec.conf, see locations.toml)
+#   3. the per-user config file    (~/.config/vec/config.toml; skipped with --config)
+#   4. --config <file>             (explicit file)
+#
+# Every key of every layer must be one that appears below (or embed_url);
+# an unknown key is an error, so a typo never goes unnoticed.
+#
+# Lists replace the list of the previous layer, except exclude_dirs and
+# exclude_files, which add to it. In those two lists an entry "!pattern"
+# removes "pattern" from the list built so far (e.g. "!build" indexes build/
+# directories again).
+#
+# Paths may start with "~/" (the home directory of the user running vec).
+# After that expansion every path must be absolute.
+# ==============================================================================
+
+
+# ------------------------------------------------------------------------------
+# Embedding model
+# ------------------------------------------------------------------------------
+[embed]
+# "onnx": run a local ONNX model in-process (tract, pure Rust).
+# "ollama": call an Ollama-compatible HTTP embedding API (needs embed_url).
+backend = "onnx"
+
+# onnx: a short name resolved in model_search_path, or an absolute path to an
+#       .onnx file (tokenizer.json must sit next to it).
+# ollama: the model name sent to the server.
+# Changing the model makes existing vectors incompatible: vec refuses to mix
+# them and asks for `vec updatedb --full`.
+model = "gte-multilingual-base"
+
+# ollama only: base URL of the server, http://host:port[/path]. No default.
+# embed_url = "http://ollama.example:11434"
+
+# ollama only: endpoint path, appended to the path of embed_url.
+http_endpoint_path = "/api/embed"
+# ollama only: TCP connect timeout (milliseconds).
+http_connect_timeout_ms = 5000
+# ollama only: read/write timeout of one request (milliseconds).
+http_read_timeout_ms = 300000
+# ollama only: requests in flight at once.
+http_concurrency = 4
+# ollama only: texts are cut to this many bytes before sending (some servers
+# ignore their own truncation flag and fail on long inputs).
+http_max_input_bytes = 1200
+# ollama only: characters of an error response body quoted in error messages.
+http_error_preview_chars = 200
+
+# onnx only: directories searched, in order, for a short model name. Each
+# directory is tried for {name}.onnx, then {name}/<each model_files entry>.
+model_search_path = ["/usr/share/vec/models"]
+
+# onnx only: file names tried inside {dir}/{name}/, in order (quantized first).
+model_files = ["model_int8.onnx", "model.onnx"]
+
+# Texts per embedding call during indexing: per HTTP request (ollama), and the
+# unit of work handed to each indexing thread (onnx).
+batch_size = 16
+
+# onnx only: texts per forward pass. 1 runs every text alone, unpadded, so a
+# text always gets the same vector (also the one a query would get). Larger
+# values pad a batch to its longest text: faster (about 1.5x), but dynamically
+# quantized int8 models then return slightly different vectors (cosine ~0.98).
+onnx_batch_size = 1
+
+# onnx only: token limit per chunk; longer chunks are truncated.
+max_tokens = 128
+
+# Threads used to embed during indexing (onnx). 0 = one per CPU core.
+index_threads = 0
+
+# `vec model download` prints commands that fetch these files of the default
+# model: each entry of model_download_files, relative to model_download_url,
+# saved under its last path component in {model_search_path[0]}/{model}/.
+# Change both when you change model.
+model_download_url = "https://huggingface.co/onnx-community/gte-multilingual-base/resolve/main"
+model_download_files = ["onnx/model_int8.onnx", "tokenizer.json"]
+
+
+# ------------------------------------------------------------------------------
+# Indexing
+# ------------------------------------------------------------------------------
+[index]
+# Target lines per chunk (> 0).
+chunk_size = 40
+
+# Lines shared by adjacent chunks (< chunk_size).
+chunk_overlap = 10
+
+# Skip files larger / smaller than this (bytes).
+max_file_size = 10485760
+min_file_size = 50
+
+# Skip chunks with fewer non-blank lines than this.
+min_chunk_lines = 5
+
+# Respect .gitignore files while walking.
+gitignore = true
+
+# Root paths to walk.
+include_paths = ["/"]
+
+# Directories to skip, .gitignore syntax rooted at each include path: a bare
+# name matches at any depth, "/builds" only <include_path>/builds.
+# Adds to the previous layer; "!name" removes a default entry.
+exclude_dirs = [
+    ".git", "node_modules", "target", "dist", "build", "__pycache__", ".venv",
+    ".cache", ".cargo",
+    # Linux virtual filesystems: transient entries cause spurious errors.
+    "proc", "sys", "dev", "run",
+    # Certificate stores: binary blobs and public certificates.
+    "ssl", "certs",
+    # Package manager databases: file lists and checksums.
+    "dpkg", "apt", "rpm",
+    # Runtime state.
+    "cloud", "alternatives",
+    # Installed Python packages (not user code).
+    "dist-packages", "site-packages",
+    # Terse lookup tables with no semantic content.
+    "apparmor.d", "iproute2", "abi",
+]
+
+# File-name glob patterns to skip. Adds to the previous layer; "!pattern"
+# removes a default entry.
+exclude_files = [
+    "*.lock", "*.min.js", "*.map", "*.pyc",
+    ".env", ".env.*", "*.key", "*.pem", "*.p12", "*.pfx",
+    "*.onnx", "*.bin", "*.so", "*.dylib",
+]
+
+# Chunk boundaries move up to this many lines to land on a line that starts
+# with one of boundary_patterns (after leading whitespace). 0 = never move.
+boundary_scan = 5
+boundary_patterns = [
+    "fn ", "pub fn ", "async fn ", "pub async fn ", "impl ",
+    "pub struct ", "pub enum ", "mod ", "pub mod ",
+    "def ", "class ", "func ", "function ",
+]
+
+
+# ------------------------------------------------------------------------------
+# Search
+# ------------------------------------------------------------------------------
+[search]
+# Results shown without --limit (> 0).
+default_limit = 10
+
+# Snippet radius: lines shown before AND after the best line of a result
+# (--snippet, MCP), so a snippet has up to 2 * snippet_lines + 1 lines.
+snippet_lines = 3
+
+# Score added for each query word found in the result's path below its
+# include path (0.0 = off). A boosted score never exceeds 1.0.
+path_boost = 0.05
+
+# Query words shorter than this (characters) never boost a path, so that
+# words like "a" or "in" do not boost nearly every result.
+path_boost_min_word_chars = 3
+
+# Most queries one search accepts (`vec a b c`, MCP `queries`): each one is
+# embedded and scans the whole index.
+max_queries = 8
+
+# Results scoring below this cosine similarity are dropped (-1.0 to 1.0).
+min_score = 0.0
+
+# Lines shown before and after the line asked for by `vec context`.
+context_window = 10
+
+
+# ------------------------------------------------------------------------------
+# Database
+# ------------------------------------------------------------------------------
+[database]
+# SQLite database. The default is the central, system-wide index (built by the
+# vec-updatedb service); access() checks each result against the reader's own
+# permissions at query time.
+db_path = "/var/lib/vec/vec.db"
+
+# Write-ahead logging (readers never block the indexer). Uses synchronous=NORMAL.
+wal = true
+
+# How long a connection waits for a lock held by another process (ms, > 0).
+busy_timeout_ms = 5000
+
+# Opening an index of an older schema for writing upgrades it in place, in one
+# transaction (every stored vector is rewritten). Another process opening the
+# index meanwhile keeps retrying for the lock for up to this long (ms,
+# >= busy_timeout_ms) instead of failing. After upgrading vec, run
+# `vec updatedb` once so the upgrade happens before services start.
+migration_wait_ms = 600000
+
+
+# ------------------------------------------------------------------------------
+# Real-time watcher (vec watch)
+# ------------------------------------------------------------------------------
+[watch]
+# Re-index once no event has arrived for this long (ms).
+debounce_ms = 3000
+
+# Re-index at the latest this long after the first pending change (ms), even
+# while events keep arriving (>= debounce_ms).
+max_wait_ms = 30000
+
+# Distinct pending paths kept in memory; above it they collapse into their
+# parent directories, which are then re-walked (> 0).
+max_pending = 10000
+
+# Re-index the include paths when the watcher starts, to catch changes made
+# while it was not running.
+startup_rescan = true
+
+# Upper bound of the retry delay after a failed re-index (ms, >= debounce_ms).
+# Retries start at debounce_ms and double.
+retry_max_ms = 60000
+
+
+# ------------------------------------------------------------------------------
+# Embedding daemon (vec daemon)
+# ------------------------------------------------------------------------------
+[daemon]
+# Unix socket the daemon listens on and `vec` tries first for queries.
+socket = "/run/vec/embed.sock"
+
+# Permission bits of the socket (octal string). The daemon returns only
+# vectors for texts the client sends, so any local user may connect.
+socket_mode = "0666"
+
+# Largest request accepted (bytes).
+max_request_bytes = 1048576
+
+# Most texts in one request (> 0). It bounds the work and the reply size of a
+# request: each text costs one inference and a reply of dimension * 4 bytes
+# (3 KiB for a 768-dimension model), however short the text. Clients split
+# larger batches.
+max_texts_per_request = 64
+
+# Timeout of a stalled exchange (ms). On the daemon it is a deadline for the
+# whole of each request (from the moment the daemon waits for it until its
+# last byte has arrived) and for the whole of each reply write: a client that
+# sends nothing, trickles its request, or stops reading is dropped after it,
+# however it spreads its bytes. A client gives up on a daemon that stops in
+# the middle of a reply. It does not bound how long the daemon may compute:
+# that is reply_timeout_ms.
+io_timeout_ms = 10000
+
+# How long a client (`vec` queries, `vec status`, MCP) waits for the daemon
+# to answer (ms, >= io_timeout_ms). It must cover the slowest legitimate
+# reply:
+#   - the handshake of the first query after a socket-activated start (or an
+#     idle exit): the daemon loads the model and hashes its file (sha256)
+#     before it accepts connections, so that query waits for both;
+#   - the inference of one request (up to max_request_bytes of text).
+# A release build starts in seconds; a debug build or a slow disk can take
+# much longer. Lower it if a hung daemon must fail queries sooner.
+reply_timeout_ms = 60000
+
+# Exit after this many seconds without a request (0 = never). Useful with
+# systemd socket activation.
+#
+# Start-up is eager: the daemon loads the model and hashes its file before it
+# accepts any connection, rather than lazily on the first request. The
+# handshake reply carries that hash, so no client could be answered sooner
+# anyway, and a model that cannot be loaded fails the service at once
+# (`systemctl status`) instead of failing every query. The cost: after each
+# activation the first query waits for the whole start-up (reply_timeout_ms).
+idle_exit_secs = 0
+
+# Connections served at once. A client arriving while all are busy gets an
+# immediate "busy" reply and embeds in-process instead of waiting.
+max_connections = 16
+
+# Pause after a failed accept() (e.g. out of file descriptors), so a
+# persistent error does not spin the CPU (ms).
+accept_retry_ms = 100

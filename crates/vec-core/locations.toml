@@ -1,0 +1,29 @@
+# Where vec looks for its configuration files.
+#
+# These locations cannot come from a configuration file (vec reads them to find
+# the configuration files), so they are compiled in from this file. Packagers
+# may change them before building.
+
+# System-wide configuration file (admin-controlled).
+system = "/etc/vec.conf"
+
+# Per-user configuration file, relative to the user's configuration directory
+# ($XDG_CONFIG_HOME, usually ~/.config). Skipped when --config is given.
+user = "vec/config.toml"
+
+# `vec init --user` (userland install): where the generated configuration puts
+# the model directory, the index and the daemon socket, relative to the user's
+# data directory ($XDG_DATA_HOME, usually ~/.local/share).
+user_model_dir = "vec/models"
+user_db_path = "vec/vec.db"
+user_socket = "vec/embed.sock"
+
+# Cache of model file hashes (sha256), relative to the user's cache directory
+# ($XDG_CACHE_HOME, usually ~/.cache). Keyed by the model file's path, size,
+# mtime, device and inode, so queries need not hash a large model file on
+# every run.
+user_sha_cache = "vec/model-sha256.toml"
+
+# `vec init --user` warns when one of these exists: a system-wide vec is
+# installed, so a userland install is usually not needed.
+system_binaries = ["/usr/bin/vec", "/usr/local/bin/vec"]

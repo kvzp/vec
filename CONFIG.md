@@ -1,258 +1,218 @@
 # vec Configuration Reference
 
-## Config file
+Every key, its default and its meaning. The defaults are compiled in from
+[`crates/vec-core/defaults.toml`](crates/vec-core/defaults.toml), which is the
+single source of truth (the Rust code holds no default values). No config file
+is needed.
 
-Config files (TOML format), merged in order — last wins:
-
-```
-compiled-in defaults
-  → /etc/vec.conf                      (system admin config)
-  → ~/.config/vec/config.toml          (per-user config, overrides system)
-  → --config flag                      (explicit override, highest priority)
-  → CLI flags                          (--path, --limit, --snippet, etc.)
-```
-
-**System-wide:** Admins control indexing policy via `/etc/vec.conf`.
-
-**Per-user:** Users can override any setting via `~/.config/vec/config.toml` — useful for a personal DB, different model, or scoped include_paths even when a system install exists. Generate one with `vec init --user > ~/.config/vec/config.toml`.
-
-**Explicit:** `--config /path/to/file.toml` skips user config auto-detection and applies on top of the system config.
-
-Every setting has a sensible compiled-in default. No config file is required — vec works out of the box.
-
-Generate a starter config:
 ```bash
-vec init | sudo tee /etc/vec.conf
+vec init | sudo tee /etc/vec.conf                  # every key, commented out
+vec init --user > ~/.config/vec/config.toml         # userland: paths under your home
+vec config show                                     # effective values + which layer set each
+vec config check /etc/vec.conf                      # validate one file (exit 1 on error)
 ```
 
----
+## Layers
 
-## Merge semantics
+Applied in order, each overriding the previous one:
 
-Most settings **replace** the default when set in `/etc/vec.conf`. Two exceptions that **append** instead:
+| # | Layer | Notes |
+|---|-------|-------|
+| 1 | compiled-in defaults | `defaults.toml` |
+| 2 | `/etc/vec.conf` | system-wide, admin-controlled |
+| 3 | `$XDG_CONFIG_HOME/vec/config.toml` (usually `~/.config/vec/config.toml`) | per-user; **skipped when `--config` is given** |
+| 4 | `--config <file>` | explicit file |
+| 5 | command-line flags | `--limit`, `--min-score`, `--path`, ... |
 
-| Setting | Behaviour |
-|---------|-----------|
-| `include_paths` | **Replaces** — explicitly defines the scan root(s) |
-| `exclude_dirs` | **Appends** to compiled defaults |
-| `exclude_files` | **Appends** to compiled defaults |
+The locations of layers 2 and 3 cannot come from a config file; they are
+compiled in from [`crates/vec-core/locations.toml`](crates/vec-core/locations.toml)
+(packagers may change them before building).
 
-This means for `exclude_dirs` and `exclude_files` you only specify what you want to add. The compiled defaults (`.git`, `node_modules`, `proc`, `ssl`, `dpkg`, etc.) are always in effect.
+**Provenance.** `vec config show` prints each effective key with the layer(s)
+that set it (`# defaults`, `# /etc/vec.conf`, ...). Validation errors name the
+file(s) that set the offending key.
 
-For `include_paths`, you define the full list — it replaces `["/"]` entirely.
+**Merge rules.**
 
-**How `exclude_dirs` patterns match.** Entries use `.gitignore` syntax, rooted at each include path:
+- Scalars and most lists **replace** the value of the previous layer (`include_paths` included).
+- `exclude_dirs` and `exclude_files` **add** to the list built so far. An entry
+  `"!pattern"` removes `pattern` from it (`exclude_dirs = ["!build"]` indexes
+  `build/` directories again).
 
-- A bare name (`"builds"`) matches a directory **or file** of that name at any depth. This is almost always what you want.
-- A pattern with a leading or inner `/` (`"/builds"`, `"web/dist"`) is anchored to the include path: `"/builds"` matches only `<include_path>/builds`.
-- An absolute path inside an include path (`"/home/me/builds"` with `include_paths = ["/home/me"]`) matches exactly that directory.
-- Hidden entries (names starting with `.`) are always skipped.
+**Strictness.** An unknown key or section is an error in every layer, so a typo
+never goes unnoticed. Paths may start with `~/` (home of the user running vec);
+after that expansion they must be absolute.
 
----
+**Deprecated.** `[embed] daemon_socket` is accepted for one more release: its
+value is used as `[daemon] socket` with a warning naming the file (ignored, with
+a warning, when the same file also sets `[daemon] socket`). Move it.
 
-## Settings reference
+## `[embed]`
 
-### `[embed]`
+| Key | Default | Meaning | Validation |
+|-----|---------|---------|------------|
+| `backend` | `"onnx"` | `"onnx"`: local ONNX model in-process (tract, pure Rust). `"ollama"`: Ollama-compatible HTTP embedding API | one of the two |
+| `model` | `"gte-multilingual-base"` | onnx: short name resolved in `model_search_path`, or an absolute `.onnx` path (`tokenizer.json` beside it). ollama: model name sent to the server | non-empty |
+| `embed_url` | unset | ollama: base URL `http://host:port[/path]` | required for ollama; must start with `http://` (no TLS client) |
+| `http_endpoint_path` | `"/api/embed"` | ollama: path appended to the path of `embed_url` | starts with `/` |
+| `http_connect_timeout_ms` | `5000` | ollama: TCP connect timeout | > 0 |
+| `http_read_timeout_ms` | `300000` | ollama: read/write timeout of one request | > 0 |
+| `http_concurrency` | `4` | ollama: requests in flight at once | > 0 |
+| `http_max_input_bytes` | `1200` | ollama: texts are cut to this many bytes (at a character boundary) before sending | > 0 |
+| `http_error_preview_chars` | `200` | ollama: characters of an error response body quoted in errors | > 0 |
+| `model_search_path` | `["/usr/share/vec/models"]` | onnx: directories searched in order for a short model name | non-empty, absolute |
+| `model_files` | `["model_int8.onnx", "model.onnx"]` | onnx: file names tried inside `{dir}/{model}/` | non-empty entries |
+| `batch_size` | `16` | texts per embedding call during indexing (per HTTP request; per indexing work unit for onnx) | > 0 |
+| `onnx_batch_size` | `1` | onnx: texts per forward pass. `1` = unpadded and deterministic (a text always gets the vector a query would get). Larger is ~1.5x faster but int8 models then return slightly different vectors (cosine ~0.98) | > 0 |
+| `max_tokens` | `128` | onnx: token limit per chunk; longer chunks are truncated | > 0 |
+| `index_threads` | `0` | onnx: embedding threads during indexing; `0` = one per CPU core | |
+| `model_download_url` | Hugging Face URL of the default model | base URL used by `vec model download` | `http(s)://` |
+| `model_download_files` | `["onnx/model_int8.onnx", "tokenizer.json"]` | files fetched by `vec model download`, relative to the URL, saved under their last path component in `{model_search_path[0]}/{model}/` | relative, no `..` |
+| `daemon_socket` | — | **deprecated**, see above | |
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `model` | string | `"gte-multilingual-base"` | Model name or absolute path to ONNX file |
-| `model_search_path` | array of paths | `["/usr/share/vec/models"]` | Directories searched for named models, in order |
-| `batch_size` | integer | `16` | Chunks per inference call. Higher = better throughput; lower = less peak RAM |
-| `max_tokens` | integer | `128` | Token limit per chunk passed to the tokeniser. Longer chunks are truncated. Attention is O(n²) — halving this quadruples indexing speed |
-| `daemon_socket` | path | `"/run/vec/embed.sock"` | **Optional.** Unix socket path for `vec daemon`. `vec` tries this socket first and falls back to in-process model loading if the daemon is not running. See note below. |
-| `index_threads` | integer | `0` | Number of threads for parallel embedding during indexing. `0` = automatic (all available cores). Set to a lower number on memory-constrained systems |
+**Model resolution** (onnx): an absolute `model` is used as is. Otherwise, for
+each directory of `model_search_path`: `{dir}/{model}.onnx`, then
+`{dir}/{model}/{f}` for each `f` of `model_files`. The first existing file wins.
 
-> **`daemon_socket` / `vec daemon` is completely optional.**
-> The daemon keeps the compiled ONNX model in resident memory (150–300 MB)
-> to eliminate per-query startup latency. Only enable it if you run `vec`
-> interactively many times a day **and** have RAM to spare. vec works
-> identically without it — the only difference is a few seconds of startup
-> time per query. See `contrib/vec-embed.service` for the systemd unit.
+**Changing the model** makes existing vectors incompatible. vec records the
+model identity (name, dimension, sha256 of the model file) in the index and
+refuses to mix: queries and incremental updates fail with a "model mismatch"
+error until you run `vec updatedb --full`. See
+[ARCHITECTURE.md](ARCHITECTURE.md#model-identity).
 
-**Model resolution:** given `model = "gte-multilingual-base"`, vec searches each `model_search_path` directory for:
-1. `{dir}/gte-multilingual-base/model_int8.onnx`
-2. `{dir}/gte-multilingual-base/model.onnx`
-3. `{dir}/gte-multilingual-base.onnx`
+## `[index]`
 
-Or set `model` to an absolute path to bypass the search.
+| Key | Default | Meaning | Validation |
+|-----|---------|---------|------------|
+| `include_paths` | `["/"]` | root paths to walk (**replaces**) | non-empty, absolute |
+| `exclude_dirs` | see `defaults.toml` | directories to skip, `.gitignore` syntax rooted at each include path (**adds**; `!name` removes) | |
+| `exclude_files` | see `defaults.toml` | file-name globs to skip (**adds**; `!pattern` removes) | |
+| `chunk_size` | `40` | target lines per chunk | > 0 |
+| `chunk_overlap` | `10` | lines shared by adjacent chunks | < `chunk_size` |
+| `max_file_size` | `10485760` | skip larger files (bytes); also the read cap for snippets and MCP `context` | >= `min_file_size` |
+| `min_file_size` | `50` | skip smaller files (bytes) | |
+| `min_chunk_lines` | `5` | a window with fewer non-blank lines is merged into a neighbour; a file with fewer in total gets no chunk | |
+| `gitignore` | `true` | honour `.gitignore` and `.git/info/exclude` (`.ignore` files are always honoured, the global git excludes file never) | |
+| `boundary_scan` | `5` | chunk boundaries may move up to this many lines to land on a boundary line; `0` = never | |
+| `boundary_patterns` | `fn `, `pub fn `, `impl `, `def `, `class `, `func `, `function `, ... | a line starting with one of these (after leading whitespace) is a boundary line | no blank entries |
 
-**Changing the model** invalidates all existing embeddings. Run `vec updatedb --full` after any model change.
+`exclude_dirs` matching: a bare name (`"builds"`) matches at any depth; a
+pattern with a leading or inner `/` (`"/builds"`, `"web/dist"`) is anchored to
+the include path; an absolute path inside an include path matches exactly that
+directory. Hidden entries (names starting with `.`) are always skipped, and
+symlinks are never followed.
 
----
+The default `exclude_dirs` cover VCS metadata and build output (`.git`,
+`node_modules`, `target`, `build`, ...), virtual filesystems (`proc`, `sys`,
+`dev`, `run`), certificate stores, package-manager databases and installed
+Python packages. The default `exclude_files` cover lock files, minified files,
+bytecode, **secret material** (`.env`, `.env.*`, `*.key`, `*.pem`, `*.p12`,
+`*.pfx`) and binary blobs. The full lists, with reasons, are in
+`defaults.toml` and `vec config show`.
 
-### `[index]`
+## `[search]`
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `include_paths` | array of paths | `["/"]` | Root paths to walk. **Replaces** the default — specify the full list |
-| `exclude_dirs` | array of strings | *(see below)* | Directory names to skip. **Appends** to compiled defaults |
-| `exclude_files` | array of patterns | *(see below)* | Glob patterns matched against filenames. **Appends** to compiled defaults |
-| `chunk_size` | integer | `40` | Target lines per chunk |
-| `chunk_overlap` | integer | `10` | Overlap lines between adjacent chunks — prevents concepts at boundaries from being missed |
-| `max_file_size` | integer (bytes) | `10485760` | Skip files larger than this (10 MB). Prevents indexing huge logs or binaries |
-| `min_file_size` | integer (bytes) | `50` | Skip files smaller than this. Avoids embedding near-empty files |
-| `min_chunk_lines` | integer | `5` | Skip chunks with fewer non-blank lines. Short fragments embed near the centroid of the vector space and score misleadingly high for unrelated queries. **Note:** the chunker currently uses this as a compiled constant; the config value is stored but not yet read by the chunker. |
-| `gitignore` | bool | `true` | Respect `.gitignore` files at every directory level |
+| Key | Default | Meaning | Validation |
+|-----|---------|---------|------------|
+| `default_limit` | `10` | results without `--limit` | > 0 |
+| `snippet_lines` | `3` | snippet **radius**: lines before and after the best line (`--snippet`, MCP), so up to `2n+1` lines | |
+| `path_boost` | `0.05` | added to the score for each query word found in the result's path below its include path; a boosted score never exceeds 1.0; `0` = off | >= 0 |
+| `path_boost_min_word_chars` | `3` | shorter query words never boost | |
+| `max_queries` | `8` | most queries per search (`vec a b c`, MCP `queries`) | > 0 |
+| `min_score` | `0.0` | results below this cosine similarity are dropped | -1.0 to 1.0 |
+| `context_window` | `10` | lines before and after the line of `vec context` / MCP `context` | |
 
-#### Compiled-in `exclude_dirs` defaults
+## `[database]`
 
-These are always excluded regardless of config:
+| Key | Default | Meaning | Validation |
+|-----|---------|---------|------------|
+| `db_path` | `"/var/lib/vec/vec.db"` | the SQLite index | absolute |
+| `wal` | `true` | write-ahead logging (`synchronous=NORMAL`): readers never block the indexer | |
+| `busy_timeout_ms` | `5000` | how long a connection waits for a lock held by another process | > 0 |
+| `migration_wait_ms` | `600000` | while another process holds the lock during a schema upgrade, keep retrying this long (one message on stderr) | >= `busy_timeout_ms` |
 
-| Directory name | Reason |
-|----------------|--------|
-| `.git` | VCS metadata |
-| `node_modules`, `target`, `dist`, `build` | Build artifacts |
-| `__pycache__`, `.venv`, `.cache`, `.cargo` | Toolchain caches |
-| `proc`, `sys`, `dev`, `run` | Linux virtual filesystems — entries vanish mid-scan, causing spurious errors |
-| `ssl`, `certs` | Certificate stores — binary DER/PEM blobs; public certs carry no semantic meaning |
-| `dpkg`, `apt`, `rpm` | Package manager databases — file lists and checksums, not useful search content |
-| `cloud`, `alternatives` | Runtime/cloud-init state |
-| `dist-packages`, `site-packages` | Installed Python packages, not user code |
-| `apparmor.d`, `iproute2`, `abi` | System lookup tables (ABI flags, routing scopes) — terse key/value files that embed near the vector centroid and pollute results |
+After upgrading vec, run `vec updatedb` once (as the index owner) before
+restarting services: opening an index of an older schema for writing upgrades it
+in place, in one transaction; queries cannot read it until then. See the upgrade
+note in [README.md](README.md#upgrading).
 
-#### Compiled-in `exclude_files` defaults
+## `[watch]`
 
-| Pattern | Reason |
-|---------|--------|
-| `*.lock` | Dependency lockfiles — generated, not authored |
-| `*.min.js`, `*.map` | Minified/source-map files |
-| `*.pyc` | Python bytecode |
-| `.env`, `.env.*` | **Secret material** — environment variables, credentials |
-| `*.key`, `*.pem`, `*.p12`, `*.pfx` | **Key material** — never index private keys |
-| `*.onnx`, `*.bin`, `*.so`, `*.dylib` | Binary blobs |
+Settings of `vec watch` (`vec-watch.service`); behaviour in
+[ARCHITECTURE.md](ARCHITECTURE.md#real-time-watcher).
 
----
+| Key | Default | Meaning | Validation |
+|-----|---------|---------|------------|
+| `debounce_ms` | `3000` | re-index once no event arrived for this long; also the first retry delay | > 0 |
+| `max_wait_ms` | `30000` | re-index at the latest this long after the first pending change, even under constant churn | >= `debounce_ms` |
+| `max_pending` | `10000` | distinct pending paths kept; above it they collapse into parent directories (never above an include path), and failing that into a rescan of the include paths | > 0 |
+| `startup_rescan` | `true` | re-index the include paths at start (catches changes made while stopped; reads every file whose size or mtime changed) | |
+| `retry_max_ms` | `60000` | upper bound of the retry delay after a failed re-index (doubles from `debounce_ms`) | >= `debounce_ms` |
 
-### `[search]`
+`SIGHUP` (`systemctl reload vec-watch`) reloads the configuration and the
+embedder; a reload that fails keeps the running configuration.
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `default_limit` | integer | `10` | Results returned when `--limit` is not specified |
-| `snippet_lines` | integer | `3` | Lines of context above and below the best-matching line shown with `--snippet` (±N, so 3 means 7 lines total) |
-| `path_boost` | float | `0.05` | Score bonus per query keyword found in the file path. Searching "auth" boosts `auth/middleware.rs` over `utils/helpers.rs` at equal embedding similarity. Set to `0.0` to disable. |
+## `[daemon]`
 
----
+The optional embedding daemon (`vec daemon`, `vec-embed.socket` /
+`vec-embed.service`). Queries use it when it serves the index's model, otherwise
+they embed in-process (with a one-line warning when the daemon exists but cannot
+be used). Protocol and threat model: [ARCHITECTURE.md](ARCHITECTURE.md#embedding-daemon),
+[SECURITY.md](SECURITY.md#embedding-daemon).
 
-### `[watch]`
+| Key | Default | Meaning | Validation |
+|-----|---------|---------|------------|
+| `socket` | `"/run/vec/embed.sock"` | Unix socket the daemon listens on and queries try first | absolute |
+| `socket_mode` | `"0666"` | permission bits of a socket the daemon binds itself (with systemd, the `.socket` unit's `SocketMode=` applies instead) | octal string, <= `0777` |
+| `max_request_bytes` | `1048576` | largest request accepted, headers included | > 0 |
+| `max_texts_per_request` | `64` | most texts per request (each costs one inference and `dim × 4` reply bytes); clients split larger batches | > 0 |
+| `io_timeout_ms` | `10000` | daemon: deadline for each whole request and each whole reply write (a trickling or non-reading client is dropped). Client: bound on finishing a reply once it started | > 0 |
+| `reply_timeout_ms` | `60000` | how long a client waits for a reply to start: covers a socket-activated cold start (model load + sha256) and the inference of one request | >= `io_timeout_ms` |
+| `idle_exit_secs` | `0` | exit after this many seconds without a request; `0` = never (useful with socket activation) | |
+| `max_connections` | `16` | connections served at once; one more gets an immediate "busy" reply and embeds in-process | > 0 |
+| `accept_retry_ms` | `100` | pause after a failed `accept()` (e.g. out of file descriptors) | > 0 |
 
-Settings for `vec watch` (`vec-watch.service`).
+`vec status` does not contact the daemon (with socket activation that would
+start it); `vec status --daemon` and `vec doctor` do.
 
-**Correctness model.** The indexer's walker is the only judge of what belongs in the index; the watcher never re-implements its rules in a way that could disagree. After the watcher settles, the index is exactly what `vec updatedb --full` would produce (verified by a randomised end-to-end test that compares the two after file/directory creates, edits, deletes, renames, moves in and out, `.gitignore`/`.ignore`/`.git/info/exclude` edits, database write failures and overflow).
-
-- **Watches**: one non-recursive inotify watch per directory the walker would enter. Excluded, hidden and ignored trees (`target/`, `node_modules/`, gitignored build areas) get no watch, which saves kernel memory (counted against the service's `MemoryMax`) and `fs.inotify.max_user_watches`, and makes startup fast. Watches follow changes: new and moved-in directories are watched at once and then re-indexed (so files written before their watch existed are not missed); deleted, moved-out and newly ignored directories lose theirs.
-- **Events**: dropped early only when the path alone proves the walker would skip it (outside `include_paths`, the database directory, a hidden component, an `exclude_dirs` match). Everything else is de-duplicated into a bounded set, so memory does not grow with the number of events.
-- **Re-index**: a flush walks only the changed paths, from their include path, so every ancestor's ignore rules apply exactly. Records in scope that the walk did not accept are pruned; records under a directory that could not be read are kept unless their file is definitely gone.
-- **Nothing is dropped**: a failed flush (e.g. the database is not writable) is put back and retried with exponential backoff; an inotify queue overflow, or more distinct changes than `max_pending`, becomes a rescan of the include paths.
-- **Status**: each flush records its time, size, error and the number of watched directories / watch failures in the database; `vec status` shows them.
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `debounce_ms` | integer (ms) | `3000` | Re-index once no event has arrived for this long. Also the first retry delay after a failed re-index |
-| `max_wait_ms` | integer (ms) | `30000` | Re-index at the latest this long after the first pending change, even if events keep arriving. Prevents starvation on trees with constant churn |
-| `max_pending` | integer | `10000` | Maximum distinct pending paths. Above it, pending paths are collapsed into their parent directories (never above an include path), which are then re-walked (unchanged files are skipped by hash). If that cannot get the set small enough, the next flush re-indexes all include paths instead. Also caps the queue of directories waiting for a watch update (overflow: re-walk the include paths) |
-| `retry_max_ms` | integer (ms) | `60000` | Upper bound of the retry delay after a failed re-index (the delay doubles from `debounce_ms`) |
-| `startup_rescan` | bool | `true` | Re-index the include paths when the watcher starts, to catch changes made while it was not running. Unchanged files are skipped by hash, but every file is read; set `false` if the daily `vec updatedb` is enough |
-
----
-
-### `[database]`
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `db_path` | path | `/var/lib/vec/vec.db` | Path to the SQLite database. `~` is expanded |
-| `wal` | bool | `true` | Enable SQLite WAL mode — allows concurrent reads during indexing |
-
-The DB stores only file paths, byte offsets, and embedding vectors — no source text. It is safe to make world-readable (mode 644). Access control is enforced by `access(path, R_OK)` at query time.
-
----
-
-## Common recipes
-
-### Server deployment — index only meaningful paths
+## Recipes
 
 ```toml
-# /etc/vec.conf
-[embed]
-model = "all-MiniLM-L6-v2"
-
+# Server: index only meaningful paths (include_paths replaces ["/"])
 [index]
 include_paths = ["/etc", "/home", "/root", "/opt", "/srv", "/usr/local", "/var/www"]
-```
 
-`include_paths` replaces the default `["/"]`, so the walker never touches `/var/lib`, `/usr/share`, or other system noise.
-
-### Developer workstation — index home directory only
-
-```toml
+# Workstation: home only, skip media; re-include build/ directories
 [index]
 include_paths = ["~"]
-exclude_dirs = ["Downloads", "Videos", "Music", "Pictures"]
-```
+exclude_dirs = ["Downloads", "Videos", "Music", "Pictures", "!build"]
+exclude_files = ["*.generated.ts", "*.pb.go", "secrets.yaml", "credentials.json"]
 
-### Add project-specific exclusions
-
-```toml
-[index]
-# These append to the compiled defaults — .git, node_modules etc. still excluded
-exclude_dirs = ["vendor", "third_party", ".terraform"]
-exclude_files = ["*.generated.ts", "*.pb.go"]
-```
-
-### Custom model
-
-```toml
+# Remote embeddings (text leaves the machine)
 [embed]
-model = "/path/to/custom/model_int8.onnx"
+backend = "ollama"
+embed_url = "http://ollama.example:11434"
+model = "nomic-embed-text"
+
+# Socket-activated daemon that frees its memory after 10 idle minutes
+[daemon]
+idle_exit_secs = 600
 ```
 
-Absolute paths bypass the search. Run `vec updatedb --full` after changing models — old embeddings are incompatible.
-
-### Suppress weak matches
-
-Use the `--min-score` CLI flag at query time:
-```bash
-vec --min-score 0.82 "authentication middleware"
-```
-
-### Large codebase — tune chunking
-
-```toml
-[index]
-chunk_size = 60
-chunk_overlap = 15
-max_tokens = 256  # more context per chunk; slower indexing
-```
-
----
-
-## What NOT to index
-
-**Never index secret material.** The compiled defaults exclude the common patterns (`.env`, `*.key`, `*.pem`), but project-specific secret files may need explicit exclusion:
-
-```toml
-[index]
-exclude_files = ["secrets.yaml", "credentials.json", "*.vault"]
-exclude_dirs = ["secrets", "private", ".secrets"]
-```
-
-Although the vec DB contains no source text, the existence of a file path in search results can leak information. Exclude sensitive files from indexing entirely.
-
----
+After changing `model`, `backend` or the chunking keys, run
+`vec updatedb --full`. Exclusion changes need only `vec updatedb` (it prunes
+newly excluded files) or, for the watcher, `systemctl reload vec-watch`.
 
 ## Troubleshooting
 
-**"Why is `/var/lib/dpkg` showing up in results?"**
-You're running an old binary or the current binary was built before the `dpkg` exclusion was added. Run `vec updatedb --full` to purge the old entries.
+Start with `vec doctor`: it checks the configuration, model, index and daemon
+and exits non-zero on a problem. Failure behaviour in detail:
+[FAILURE-ZONE.md](FAILURE-ZONE.md).
 
-**"Why isn't `/home/user/project` being indexed?"**
-Check two things: (1) `include_paths` — if set in `/etc/vec.conf`, it replaces the default `["/"]`; add your path. (2) `.gitignore` — if `gitignore = true` (the default), gitignored files are skipped.
-
-**"Why are scores so high for unrelated files?"**
-The stub embedder is running — the model failed to load. Check `vec status` for `Model path: not found`. Fix with `vec model download` or check the model path in `/etc/vec.conf`.
-
-**"Indexing is very slow."**
-`max_tokens` is O(n²) in the attention mechanism. Halving it (e.g. 128 → 64) quadruples speed with minimal quality impact for short code chunks. Also verify indexing runs under `nice -n 19`.
-
-**"How do I re-index after changing config?"**
-Run `vec updatedb --full`. A plain `vec updatedb` only re-indexes files with changed checksums; it won't remove chunks from paths that are now excluded.
+| Symptom | Cause / fix |
+|---------|-------------|
+| `model mismatch: the index at ... was built with ...` | model changed, or index built by vec before this release: `vec updatedb --full` |
+| `the index ... uses schema version 0` | run `vec updatedb` once as the index owner |
+| `unknown field` at startup | typo or removed key in a config layer; `vec config check <file>` |
+| `/home/user/project` not indexed | `include_paths` replaces `["/"]`; gitignored; hidden directory; `exclude_dirs` match |
+| indexing slow | lower `max_tokens`; raise `onnx_batch_size` (see its trade-off); limit `include_paths` |

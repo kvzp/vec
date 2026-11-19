@@ -1303,6 +1303,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1388,6 +1397,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -2130,6 +2140,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_spanned"
 version = "0.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2165,6 +2186,16 @@ name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
+
+[[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
 
 [[package]]
 name = "simd-adler32"
@@ -2778,19 +2809,19 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 name = "vec-cli"
 version = "0.1.0"
 dependencies = [
- "anstream",
  "anyhow",
  "clap",
  "clap_complete",
- "dirs",
- "serde",
+ "nix",
  "serde_json",
+ "tempfile",
  "tokio",
  "vec-core",
  "vec-daemon",
  "vec-embed",
  "vec-index",
  "vec-mcp",
+ "vec-query",
  "vec-store",
  "vec-watch",
 ]
@@ -2804,6 +2835,7 @@ dependencies = [
  "dirs",
  "nix",
  "serde",
+ "serde_path_to_error",
  "tempfile",
  "toml",
  "vec-embed",
@@ -2815,9 +2847,11 @@ version = "0.1.0"
 dependencies = [
  "anstream",
  "anyhow",
+ "nix",
+ "serde_json",
  "tempfile",
+ "vec-core",
  "vec-embed",
- "vec-store",
 ]
 
 [[package]]
@@ -2828,6 +2862,7 @@ dependencies = [
  "hex",
  "prost",
  "rayon",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
@@ -2842,7 +2877,9 @@ dependencies = [
  "anyhow",
  "hex",
  "ignore",
+ "nix",
  "rayon",
+ "rusqlite",
  "sha2 0.10.9",
  "tempfile",
  "vec-core",
@@ -2854,23 +2891,45 @@ dependencies = [
 name = "vec-mcp"
 version = "0.1.0"
 dependencies = [
- "anstream",
  "anyhow",
  "rmcp",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "vec-core",
  "vec-embed",
+ "vec-index",
+ "vec-query",
  "vec-store",
+]
+
+[[package]]
+name = "vec-query"
+version = "0.1.0"
+dependencies = [
+ "anstream",
+ "anyhow",
+ "serde",
+ "tempfile",
+ "vec-core",
+ "vec-daemon",
+ "vec-embed",
+ "vec-index",
+ "vec-store",
+ "vec-watch",
 ]
 
 [[package]]
 name = "vec-store"
 version = "0.1.0"
 dependencies = [
+ "anstream",
  "anyhow",
  "rusqlite",
+ "tempfile",
+ "vec-core",
+ "vec-embed",
 ]
 
 [[package]]
@@ -2879,7 +2938,10 @@ version = "0.1.0"
 dependencies = [
  "anstream",
  "anyhow",
+ "libc",
+ "nix",
  "notify",
+ "signal-hook-registry",
  "tempfile",
  "vec-core",
  "vec-embed",

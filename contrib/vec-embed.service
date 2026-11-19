@@ -36,20 +36,41 @@
 # vec works correctly without this service. The only difference is
 # a few seconds of startup latency on each `vec <query>` invocation.
 #
+# SOCKET ACTIVATION
+# -----------------
+# This service is started by vec-embed.socket on the first query. Set
+# [daemon] idle_exit_secs in /etc/vec.conf to have it exit when idle, which
+# frees the memory until the next query: the RAM cost then only applies
+# while vec is in use. The query that starts the daemon waits for the model
+# to load and be hashed, bounded by [daemon] reply_timeout_ms (raise it on a
+# slow machine).
+#
 # HOW TO ENABLE (user's explicit choice only)
 # -------------------------------------------
-#   systemctl enable --now vec-embed.service
+#   systemctl enable --now vec-embed.socket
 #
 # HOW TO DISABLE
 # --------------
-#   systemctl disable --now vec-embed.service
+#   systemctl disable --now vec-embed.socket vec-embed.service
+#
+# SANDBOX
+# -------
+# The daemon runs as a transient unprivileged user (DynamicUser=) with a
+# read-only system and no network: the ONNX backend needs neither. It reads
+# /etc/vec.conf and the model under /usr/share/vec/models (both world-
+# readable). For [embed] backend = "ollama" the daemon needs the network:
+#   systemctl edit vec-embed.service
+#   [Service]
+#   PrivateNetwork=no
+#   RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 #
 # Packagers: DO NOT enable this in postinst. Ship it disabled.
 
 [Unit]
 Description=vec embedding daemon (OPTIONAL — see comments before enabling)
-Documentation=man:vec(1)
-After=local-fs.target
+Documentation=https://github.com/kvzp/vec/blob/main/CONFIG.md#daemon
+Requires=vec-embed.socket
+After=vec-embed.socket
 
 [Service]
 Type=simple
@@ -57,13 +78,36 @@ ExecStart=/usr/bin/vec daemon
 Restart=on-failure
 RestartSec=30s
 
-# Create /run/vec/ automatically (mode 755, owned by root).
-RuntimeDirectory=vec
-RuntimeDirectoryMode=0755
-
-# Low scheduling priority — this is a background helper, not latency-sensitive.
+# Low scheduling priority — this is a background helper.
 Nice=19
 IOSchedulingClass=idle
 
+# Sandbox (see above).
+DynamicUser=yes
+UMask=0077
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
 [Install]
-WantedBy=multi-user.target
+# Started through the socket; enabling the service enables the socket.
+Also=vec-embed.socket

@@ -1,76 +1,69 @@
-# TESTING.md
+# Testing
 
-Testing strategy, current coverage, and known gaps for `vec`.
-
-## Running tests
+## Run
 
 ```bash
-cargo test                          # all unit tests (no network, no model)
-cargo test -- --nocapture           # show println! output
-cargo test store                    # tests in a specific module
-cargo test --features integration   # tests requiring a live ONNX model (future)
+cargo test                          # whole workspace; no network, no model, no system paths
+cargo test -p vec-store             # one crate
+cargo test chunker                  # tests whose name matches
+cargo clippy -- -D warnings          # as CI; add --all-targets to lint tests too
+cargo fmt --check
+cargo build -p vec-cli --no-default-features --features system-sqlite   # distro build (needs libsqlite3-dev)
 ```
 
-## Current coverage (79 tests across 8 crates)
+CI (`.github/workflows/ci.yml`) runs build, test, clippy, fmt, `cargo audit`
+and the `system-sqlite` build.
 
-| Crate | Tests | What's covered |
-|-------|-------|----------------|
-| `vec-store` | 26 | open/create schema, upsert, get, delete, search, cosine math, path filter (incl. `[` special char), model check, stats, byte_end clamping, bad-parent error, paged search top-k correctness |
-| `vec-index` | 25 | chunker (empty, short, boundary snap, offsets, overlap, no trailing newline, CRLF), glob matching, updatedb (index, skip unchanged, full re-index, binary skip, size limit, path filter, unreadable dir, symlink skip), full pipeline with stub |
-| `vec-embed` | 10 | stub unit length, determinism, different texts differ, batch vs single, empty batch, long text, sha256, missing model error, missing tokenizer error |
-| `vec-core` | 16 | defaults, merge, extra path, bad TOML, load succeeds, central DB path, system model dir, include paths, tilde expansion (plain path, bare `~`) |
-| `vec-daemon` | 2 | embed request round-trip, oversized request rejection |
+### Real-model tests
 
-### Known gaps
+Tests that need a real ONNX model are `#[ignore]`d and read its path from
+`VEC_TEST_MODEL` (`tokenizer.json` must sit beside it):
 
-- New subcommands (`context`, `similar`, `repl`, `gc`, `explain`, `diff`, `completions`) lack unit tests — tested manually
-- Multi-query merge/dedup logic untested
-- Path-weighted re-ranking untested
-- `--json` output format untested
+```bash
+VEC_TEST_MODEL=/usr/share/vec/models/gte-multilingual-base/model_int8.onnx \
+  cargo test -- --ignored
+```
 
-All tests run without network access, without a real ONNX model, and without writing to system paths.
-The stub embedder (`Embedder::stub(768)`) is used wherever an embedder is needed.
+They cover: output selection and pooling, batched vs single-text vectors
+(`onnx_batch_size`), daemon vectors equal to in-process vectors within 1e-4,
+model sha256 caching, and an index + search round trip (vec-embed, vec-daemon,
+vec-core, vec-index, vec-query).
 
-## Known gaps
+### Unix-socket tests
 
-### Open
+The vec-daemon tests (`server.rs`, `client.rs`, `activation.rs`) bind and
+connect Unix sockets in a temporary directory: lifecycle, stalled and trickling
+clients, short bodies, bad UTF-8, busy replies, limits, idle exit, socket
+activation. They need nothing but a filesystem that allows sockets; a sandbox
+that blocks `bind`/`connect` on Unix sockets (some bubblewrap or seccomp
+setups) makes them fail, so run them outside such a sandbox.
 
-**1. Real model integration tests** (`#[cfg(feature = "integration")]`)
-- `Embedder::load` + `embed_batch` with actual `gte-multilingual-base` ONNX
-- Validates `probe_dim`, `is_pre_pooled`, L2-normalisation on real output
-- Requires model file at test time; gate behind `--features integration`
-- Without this, the ONNX inference path (`EmbedderInner::Tract`) is untested
+## Conventions
 
-### Resolved
+- **Hermetic configuration.** Tests build configs with `Config::defaults()` or
+  `Config::from_toml(..)` (no file read), and layering tests pass explicit
+  system/user paths, so `/etc/vec.conf` and `~/.config/vec/config.toml` of the
+  machine never change a result.
+- **No model by default.** `Embedder::stub(dim)` gives deterministic unit vectors.
+- **Temporary files only** (`tempfile`); never write to system paths.
+- Unit tests live in `#[cfg(test)]` modules (vec-mcp and vec-query keep them in
+  `src/tests.rs`).
+- Deterministic: no network, no wall-clock assertions beyond generous timeouts.
 
-**1 (remaining). Real model integration tests** (`#[cfg(feature = "integration")]`)
-- `Embedder::load` + `embed_batch` with actual `gte-multilingual-base` ONNX
-- Requires model file at test time; gate behind `--features integration`
-- Without this, the ONNX inference path (`EmbedderInner::Tract`) is untested
+## What is covered
 
-**2. File race condition at query time** — fixed in `main.rs`; pattern tested in `store::tests::byte_end_clamping_is_safe`
+| Crate | Highlights |
+|-------|-----------|
+| vec-core | layers, deny-unknown-fields, every validation rule, `!pattern` removal, provenance, deprecated `daemon_socket`, `vec init` templates, snippets on stale offsets and UTF-8 boundaries, symlink-safe capped reads, sha cache |
+| vec-embed | HTTP client (status, chunked bodies, Content-Length, numeric checks and counts, URL path, request batching, connect failure), truncation at character boundaries, identity compatibility |
+| vec-store | migration v0 → v1, model identity (`ensure_model`/`check_model`/`ModelMismatch`), atomic `replace_file`, search (filters before limit, directory-boundary path filter, blob checks), read-only open |
+| vec-index | chunker property test (every line covered, ordered offsets), incremental update (size+mtime skip, hash refresh, chunk reuse), prune, `--full` semantics, probe-text failure handling, symlink swaps (`O_NOFOLLOW` + dev/inode), FIFO, non-UTF-8 names, `diff` |
+| vec-watch | pending set and collapse, overflow → rescan, retry backoff, failing flushes, watches following the walker, SIGHUP reload (and keeping the old runtime on failure) |
+| vec-daemon | protocol, deadlines, busy reply, limits, stale socket, socket activation |
+| vec-query | ranking and path boost, filters, model checks, daemon fallback, status |
+| vec-mcp | multi-query search with excludes, error results, `context` limited to indexed files, `similar`/`explain`, `index_status` |
 
-**3. Search path filter with special characters** — fixed (LIKE → GLOB with `[[` escaping); tested in `store::tests::search_path_filter_with_bracket_char`
-
-**4. `chunk_file` edge cases** — no-trailing-newline and CRLF tested in `index::tests::chunk_file_no_trailing_newline` / `chunk_file_crlf_line_endings`; a file with no `\n` at all produces a single "line" below `MIN_CHUNK_LINES` → zero chunks (correct, not a bug)
-
-**5. `expand_tilde` with missing home dir** — current behaviour (return path with literal `~`) is documented and tested in `config::tests::expand_tilde_tilde_alone`; returning `Err` would break `Config::load` in containers and is not worth the churn
-
-**6. `run_updatedb` walk error handling** — unreadable directories produce a `warn:` progress line and increment `stats.errors`; tested (Unix-only, skipped as root) in `index::tests::run_updatedb_skips_unreadable_directory`
-
-**7. SQLite error conditions** — opening a store under an invalid parent (`/dev/null/`) returns `Err`; tested in `store::tests::open_store_bad_parent_returns_err`
-
-**8. Brute-force search memory limit** — `Store::search` now pages through chunks in batches of 1 000 rows; memory is O(page × dim + k) regardless of index size; top-k tracked with a min-heap. Tested in `store::tests::search_paged_returns_correct_top_k`.
-
-**9. Model graph caching** — `vec daemon` keeps the compiled ONNX graph in memory over a Unix socket (`/run/vec/embed.sock`). `vec <query>` tries the socket first, falls back to in-process load if the daemon is not running. Tested in `daemon::tests::*`. Systemd unit: `contrib/vec-embed.service`.
-
-**10. Probe token hardcoding** — `probe_dim` now tokenizes `"hello"` with the real tokenizer instead of hardcoding BERT IDs; fixed in `embed.rs`
-
-## Test conventions
-
-- Unit tests live in `#[cfg(test)] mod tests { ... }` at the bottom of each source file
-- Use `tempfile::NamedTempFile` / `tempfile::TempDir` — never write to system paths
-- Use `Embedder::stub(768)` — never require a model file in unit tests
-- Use `Store::open(":memory:")` — never write to disk in unit tests
-- Integration tests (real model, disk I/O) → `cargo test --features integration`
-- Tests must be deterministic: no `std::time`, no randomness, no network
+Known gaps: macOS/BSD are not tested; the inotify queue-overflow path is
+exercised by unit tests only (forcing a kernel overflow needs root); the
+randomised watcher-vs-`--full` comparison used while developing `vec watch` is
+not part of the test suite (`scoped_and_full_runs_agree` covers the indexer side).

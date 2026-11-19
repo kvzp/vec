@@ -1,3 +1,16 @@
+# vec-watch.service — real-time index updates (inotify)
+#
+# Runs as root to read every indexed file, with only the capability to read
+# (CAP_DAC_READ_SEARCH) and a read-only system except the index directory.
+# If [database] db_path is not under /var/lib/vec, add it:
+#   systemctl edit vec-watch.service
+#   [Service]
+#   ReadWritePaths=/path/to/index/dir
+#
+# Reload the configuration (include/exclude paths, model, [watch] timings)
+# without losing pending changes:
+#   systemctl reload vec-watch.service
+
 [Unit]
 Description=vec real-time semantic index watcher
 After=local-fs.target
@@ -8,12 +21,40 @@ StartLimitIntervalSec=60
 [Service]
 Type=simple
 ExecStart=/usr/bin/vec watch
+ExecReload=/bin/kill -HUP $MAINPID
 Nice=19
 IOSchedulingClass=idle
 Restart=on-failure
 RestartSec=5s
 # Give inotify enough room for large trees
 LimitNOFILE=65536
+
+# Sandbox (see above). The network stays available for an Ollama backend.
+StateDirectory=vec
+StateDirectoryMode=0755
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# No PrivateTmp=: with a private /tmp the indexer would see an empty /tmp and
+# /var/tmp, prune every record there and never index new files there. To keep
+# /tmp out of the index, exclude it in the configuration instead.
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

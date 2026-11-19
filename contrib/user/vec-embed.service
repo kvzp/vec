@@ -6,19 +6,27 @@
 #
 # Same trade-offs as the system-level vec-embed.service:
 #   - Saves 2–5 seconds of model compile time per query
-#   - Costs 150–300 MB of permanent resident RAM
+#   - Costs 150–300 MB of resident RAM while it runs; with socket activation
+#     and [daemon] idle_exit_secs, only while vec is in use
 #
-# Only enable if you run `vec <query>` many times per day AND have RAM to spare.
+# Started by vec-embed.socket on the first query, which waits for the model
+# to load and be hashed (bounded by [daemon] reply_timeout_ms).
 #
 # HOW TO ENABLE
-#   systemctl --user enable --now vec-embed.service
+#   systemctl --user enable --now vec-embed.socket
 #
 # HOW TO DISABLE
-#   systemctl --user disable --now vec-embed.service
+#   systemctl --user disable --now vec-embed.socket vec-embed.service
+#
+# For [embed] backend = "ollama", allow the network:
+#   systemctl --user edit vec-embed.service
+#   [Service]
+#   RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Unit]
 Description=vec embedding daemon (userland, OPTIONAL — see comments before enabling)
-After=default.target
+Requires=vec-embed.socket
+After=vec-embed.socket
 
 [Service]
 Type=simple
@@ -27,6 +35,21 @@ Restart=on-failure
 RestartSec=30s
 Nice=19
 IOSchedulingClass=idle
+UMask=0077
+
+# Sandbox options that work in a user manager (seccomp, no namespaces:
+# ProtectSystem=, PrivateNetwork= etc. need unprivileged user namespaces,
+# which some distributions disable).
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 [Install]
-WantedBy=default.target
+Also=vec-embed.socket

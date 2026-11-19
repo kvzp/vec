@@ -8,24 +8,34 @@ override_dh_auto_build:
 	cargo build --release -p vec-cli --no-default-features --features system-sqlite
 
 override_dh_auto_install:
-	# Binary
+	# Binary. Defaults and file locations are compiled in
+	# (crates/vec-core/defaults.toml, locations.toml): nothing else to install.
 	install -D -m 0755 target/release/vec \
 	    debian/vec/usr/bin/vec
 	# Config template
 	install -D -m 0644 contrib/vec.conf \
 	    debian/vec/etc/vec.conf
 	# systemd units (vendor path)
-	install -D -m 0644 contrib/vec-updatedb.service \
-	    debian/vec/usr/lib/systemd/system/vec-updatedb.service
-	install -D -m 0644 contrib/vec-updatedb.timer \
-	    debian/vec/usr/lib/systemd/system/vec-updatedb.timer
-	install -D -m 0644 contrib/vec-watch.service \
-	    debian/vec/usr/lib/systemd/system/vec-watch.service
+	for u in vec-updatedb.service vec-updatedb.timer vec-watch.service \
+	         vec-embed.service vec-embed.socket; do \
+	    install -D -m 0644 contrib/$$u debian/vec/usr/lib/systemd/system/$$u; \
+	done
 	# sysctl
 	install -D -m 0644 contrib/99-vec.conf \
 	    debian/vec/usr/lib/sysctl.d/99-vec.conf
+	# Userland units, for users to copy (not installed as units)
+	for u in contrib/user/*; do \
+	    install -D -m 0644 $$u debian/vec/usr/share/doc/vec/contrib/user/$$(basename $$u); \
+	done
 	# Model package files are installed from a separate source tarball.
-	# See PACKAGING.md — vec-model-base builds from the GitHub release asset.
+	# See PACKAGING.md.
+
+override_dh_installsystemd:
+	# Optional embedding daemon: shipped, never enabled or started.
+	dh_installsystemd --no-enable --no-start vec-embed.socket vec-embed.service
+	# Started by the timer only (enabling it would run a full index at boot).
+	dh_installsystemd --no-enable --no-start vec-updatedb.service
+	dh_installsystemd vec-updatedb.timer vec-watch.service
 
 override_dh_auto_test:
 	# Unit tests pass, but skip here to avoid writing to /var/lib/vec in sbuild.
