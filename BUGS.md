@@ -9,6 +9,12 @@
 - **`exclude_dirs` / `include_paths` edits need a restart** of `vec watch` (the config is read once). The next incremental `vec updatedb` prunes newly excluded files; `--full` is no longer needed for that.
 - **The kernel queue overflow path is covered by unit tests only.** A 40 000-event burst did not overflow the default queue in the end-to-end test; forcing it needs root (`fs.inotify.max_queued_events`).
 
+## Known Bugs
+
+### Packaging
+
+- **`vec-store/system-sqlite` is a no-op.** The feature is empty and `rusqlite` is always built with `bundled`, so `cargo build --features vec-store/system-sqlite` (the PACKAGING.md distro recipe) still embeds its own SQLite instead of linking the system `libsqlite3`. Distro packages therefore do not pick up the distro's SQLite security updates; they get SQLite fixes only through vec releases.
+
 ## Untested Platforms
 
 ### macOS

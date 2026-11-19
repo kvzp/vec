@@ -25,7 +25,7 @@ Vector search. Proven security. Zero runtime dependencies.
 
 ## Build from source
 
-Requirements: [Rust](https://rustup.rs) (stable). SQLite is bundled — no system libraries needed.
+Requirements: [Rust](https://rustup.rs) 1.89 or newer (stable). SQLite is bundled — no system libraries needed.
 
 ```bash
 git clone https://github.com/kvzp/vec

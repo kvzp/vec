@@ -141,22 +141,17 @@ impl Embedder {
         // the input facts we supply below.
         if let Some(graph) = proto.graph.as_mut() {
             for input in graph.input.iter_mut() {
-                if let Some(type_proto) = input.r#type.as_mut() {
-                    if let Some(tract_onnx::pb::type_proto::Value::TensorType(ref mut tt)) =
+                if let Some(type_proto) = input.r#type.as_mut()
+                    && let Some(tract_onnx::pb::type_proto::Value::TensorType(ref mut tt)) =
                         type_proto.value
-                    {
-                        if let Some(shape) = tt.shape.as_mut() {
-                            for (i, dim) in shape.dim.iter_mut().enumerate() {
-                                use tract_onnx::pb::tensor_shape_proto::dimension::Value;
-                                // Replace any symbolic expression tract can't parse with concrete.
-                                if matches!(dim.value, Some(Value::DimParam(_))) {
-                                    dim.value = Some(Value::DimValue(if i == 0 {
-                                        1
-                                    } else {
-                                        max_tokens as i64
-                                    }));
-                                }
-                            }
+                    && let Some(shape) = tt.shape.as_mut()
+                {
+                    for (i, dim) in shape.dim.iter_mut().enumerate() {
+                        use tract_onnx::pb::tensor_shape_proto::dimension::Value;
+                        // Replace any symbolic expression tract can't parse with concrete.
+                        if matches!(dim.value, Some(Value::DimParam(_))) {
+                            dim.value =
+                                Some(Value::DimValue(if i == 0 { 1 } else { max_tokens as i64 }));
                         }
                     }
                 }

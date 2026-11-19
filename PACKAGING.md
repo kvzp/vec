@@ -29,6 +29,8 @@ This mirrors how other data-heavy tools are packaged: `tesseract-ocr` + language
 | Fedora / RHEL | `cargo`, `rust`, `sqlite-devel`, `pkg-config` |
 | Arch | `rust`, `sqlite`, `pkg-config` |
 
+**Rust ≥ 1.89** is required (`rust-version` in `Cargo.toml`). Debian 13 (trixie) ships `rustc` 1.85, which is too old: use a newer toolchain (rustup, or a backport) on that release.
+
 No `protobuf-compiler`. No Python. No HuggingFace tooling. No network access at build time.
 
 ### Build command

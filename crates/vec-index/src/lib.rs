@@ -472,21 +472,21 @@ fn scoped_walkers(
         // Follow symlinks is intentionally false (default) — avoids infinite loops.
         builder.follow_links(false);
 
-        if let Some(scopes) = scopes {
-            if !scopes.iter().any(|s| root.starts_with(s)) {
-                let inside: Vec<PathBuf> = scopes
-                    .iter()
-                    .filter(|s| s.starts_with(root))
-                    .cloned()
-                    .collect();
-                if inside.is_empty() {
-                    continue;
-                }
-                builder.filter_entry(move |e| {
-                    let p = e.path();
-                    inside.iter().any(|s| s.starts_with(p) || p.starts_with(s))
-                });
+        if let Some(scopes) = scopes
+            && !scopes.iter().any(|s| root.starts_with(s))
+        {
+            let inside: Vec<PathBuf> = scopes
+                .iter()
+                .filter(|s| s.starts_with(root))
+                .cloned()
+                .collect();
+            if inside.is_empty() {
+                continue;
             }
+            builder.filter_entry(move |e| {
+                let p = e.path();
+                inside.iter().any(|s| s.starts_with(p) || p.starts_with(s))
+            });
         }
         out.push(builder);
     }
@@ -830,14 +830,13 @@ fn index_walk(
 
         // ---- incremental check ----
         // Use store.get_file() and compare the stored hash directly.
-        if !full {
-            if let Ok(Some(record)) = store.get_file(&path) {
-                if record.hash == hash {
-                    stats.files_unchanged += 1;
-                    seen.kept.insert(path);
-                    continue;
-                }
-            }
+        if !full
+            && let Ok(Some(record)) = store.get_file(&path)
+            && record.hash == hash
+        {
+            stats.files_unchanged += 1;
+            seen.kept.insert(path);
+            continue;
         }
 
         // ---- chunk ----
