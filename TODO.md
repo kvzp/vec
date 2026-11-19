@@ -51,3 +51,4 @@
 
 - [x] **Nix flake** — `flake.nix` for NixOS users.
 - [ ] **Homebrew formula** — deferred: macOS is untested, no hardware available.
+- [ ] **Writers coordinate full walks** — `vec watch`'s startup/reload rescan and a running `vec updatedb` walk the same tree and embed the same changed files twice (seen 2026-11-19 on a large index: half the Ollama throughput wasted). Take an advisory lock (or a meta flag) for whole-tree walks; the watch defers its rescan while another writer holds it.
