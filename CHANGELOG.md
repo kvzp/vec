@@ -23,6 +23,9 @@ Audit of 2026-11-19 ([tasks/audit-2026-11-19.md](tasks/audit-2026-11-19.md)) and
 
 ### Added
 
+- **Model and runtime versioning.** HTTP (Ollama) backend: the model identity's `sha256` is the model digest from `[embed] http_tags_path` (Ollama `/api/tags`), so a model re-pulled with other weights under the same tag is a model mismatch (an index without a digest adopts it at its next write). `Embedder::runtime()` (`ollama <version>` from `http_version_path`, `tract <version> (vec <version>)` for ONNX) is recorded as `runtime.first_write` / `runtime.last_write` and shown by `vec status`, `vec doctor` and MCP `index_status` (`runtime_first_write`, `runtime_last_write`, `canary`).
+- **Embedding canary** (`[embed] canary_text`, `canary_warn_cosine`, `canary_min_cosine`): stored at the first write to an index (adopted, with a note, by an existing index at its next write). Writers re-embed it before writing, `vec watch` at start-up, reload and every flush, the daemon at start-up, `vec doctor` always. Below `canary_warn_cosine`: a warning naming the runtimes; below `canary_min_cosine`: writers refuse with a typed `vec_store::EmbeddingDrift` asking for `vec updatedb --full`, `vec watch` pauses indexing and retries with backoff, `vec doctor` fails. An unscoped `--full` re-embeds and replaces the canary when it completes. New keys `[embed] http_tags_path`, `http_version_path`, `http_default_tag`, `canary_*` ([CONFIG.md](CONFIG.md)).
+- `Embedder::stub_with_seed` (tests: a stub whose vectors drift).
 - `vec search` (explicit form), `--files-only`, `vec doctor`, `vec config show` (with provenance) / `vec config check [FILE]`, `vec status --daemon`, `--json` for `similar` and `explain`.
 - `vec status` / MCP `index_status`: model identity, schema, last `updatedb` run, watcher state (pending, overflows, rescans, reloads, last success/error).
 - MCP tools `similar` and `explain`; `search` takes `queries` and `exclude`; `index_status` takes `probe_daemon`.

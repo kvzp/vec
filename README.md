@@ -141,6 +141,13 @@ fail with a "model mismatch" or "schema version" error. Move any
 warning, for one release). Restart a running `vec daemon`: protocol v1 daemons
 are not understood (queries fall back to in-process embedding with a warning).
 
+The index now also records the embedding runtime (`ollama <version>` or
+`tract <version>`) and an **embedding canary**; an existing index records them at
+its next write (a `note:` line says so). After upgrading Ollama, re-pulling a
+model or upgrading vec, run `vec doctor`: when the canary reports drift,
+writers (including `vec watch`) stop indexing until `sudo vec updatedb --full`
+([FAILURE-ZONE.md](FAILURE-ZONE.md#model)).
+
 ## Usage
 
 ```bash

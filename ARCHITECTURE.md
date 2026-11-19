@@ -90,7 +90,9 @@ CREATE INDEX idx_chunks_file ON chunks(file_id);
 ```
 
 There is no content column. `meta` keys: `model_name`, `embedding_dim`,
-`model_sha256`, `updatedb.last_run`, and the watcher's `watch.*`
+`model_sha256`, the embedding canary (`canary.text`, `canary.vector`,
+`canary.runtime`), the runtime history (`runtime.first_write`,
+`runtime.last_write`), `updatedb.last_run`, and the watcher's `watch.*`
 (`last_flush`, `last_success`, `last_error`, `last_paths`, `watched_dirs`,
 `watch_failures`, `pending`, `overflows`, `rescans`, `reloads`).
 
@@ -105,9 +107,15 @@ Requires SQLite ≥ 3.35 (`RETURNING`).
 ## Model identity
 
 `ModelIdentity { name, dim, sha256 }`: the configured model name, the vector
-dimension, and for ONNX the sha256 of the model file. Two identities are
-compatible when name and dimension are equal and, when both hashes are known,
-the hashes are equal.
+dimension, and the sha256 of the model file (ONNX) or the model digest the
+server reports (HTTP: the entry of `[embed] model` in `http_tags_path`, Ollama
+`/api/tags`, matched with `http_default_tag` when the name has no tag; fetched
+once when the embedder is created). Two identities are compatible when name and
+dimension are equal and, when both hashes are known, the hashes are equal. A
+model re-pulled under the same tag with other weights has another digest, so
+writers and queries refuse it like another model. A server that reports no
+digest leaves `sha256` unknown (then name and dimension are the identity), and
+an index recorded without one adopts it at the next write.
 
 - **Writers** (`updatedb`, `watch`, the daemon) know the sha256: from the cache
   (`~/.cache/vec/model-sha256.toml`, keyed by path, size, mtime, device, inode)
@@ -115,7 +123,7 @@ the hashes are equal.
   index, fills in a missing hash, or fails with a typed `ModelMismatch`.
   `replace_file` re-checks inside its transaction.
 - **Readers** never hash: they check name and dimension, and the sha256 only when
-  the cache already has it. `[embed] model` differing from the index's model name
+  the cache already has it (ONNX) or the server reported a digest (HTTP). `[embed] model` differing from the index's model name
   is an error asking for `vec updatedb --full`.
 - **Legacy index** (no recorded identity): adopted when its vectors have the
   model's dimension, refused otherwise.
@@ -124,6 +132,49 @@ the hashes are equal.
   the index is emptied right before the first successful write, so a model that
   cannot embed leaves it intact. A scoped `--full` (`--path`) with another model
   is refused.
+
+### Embedding runtime and canary
+
+The identity cannot see the same model computed differently: an Ollama upgrade
+(e.g. 0.40.5 → 0.40.16), a tract upgrade, a quantization change behind the same
+digest-less name. Those can shift every vector slightly, and new vectors then
+compare worse with the stored ones. Two records cover it (`vec_store::canary`):
+
+- **Runtime** (`Embedder::runtime`): `ollama <version>` (asked from
+  `http_version_path` at each check, so a restarted server shows its new
+  version), `tract <version> (vec <version>)` for ONNX (tract's version is read
+  from `Cargo.lock` at build time; `vec <version>` alone without a lock file).
+  Writers record `runtime.last_write` at their first write of a run and
+  `runtime.first_write` when none is recorded, after a model reset and after a
+  completed unscoped `--full`. Informational: `vec status`, `vec doctor`, MCP
+  `index_status`.
+- **Canary**: the vector of `[embed] canary_text`, stored with its runtime at the
+  first write to an index (or the first write after a model reset). A check
+  embeds the **stored** text again and takes the cosine with the stored vector:
+  `>= canary_warn_cosine` ok; down to `canary_min_cosine` a one-line warning
+  naming both runtimes; below, **drift**.
+
+| Who | When | On drift |
+|-----|------|----------|
+| `vec updatedb`, `update_paths` (`Run::new`) | start of every run, after the model check, before any write | typed `vec_store::EmbeddingDrift` error asking for `vec updatedb --full`; nothing written |
+| `vec watch` | start-up and every reload (logged), and every flush (through `update_paths`) | the flush fails, the changes are re-queued with backoff (`retry_max_ms`): indexing pauses and resumes once the runtime is back or the index was rebuilt |
+| `vec daemon` | start-up | logged (it serves readers; never fatal) |
+| `vec doctor` | always | FAIL |
+| queries | never (one embedding per query stays one embedding) | |
+
+An index without a canary (a new index, or one built before canaries existed)
+records one at its next write; for a non-empty index this **adopts** the current
+runtime as the reference, with a `note:` line in the log.
+
+**`--full` and the canary.** An unscoped `--full` accepts a drifted canary (it
+re-embeds every file) and replaces the canary, with `runtime.first_write`, only
+**when the run completes**. A run that dies midway leaves the old canary, so the
+index (now a mix of runtimes) keeps failing the check, and every writer keeps
+refusing, until a `--full` completes. Recording the canary at the start would
+make the next incremental run accept a half-rebuilt index. A scoped `--full`
+(`--path`) cannot fix drift and is refused. After a model reset the index holds
+only the new model's vectors from the first write on, so the reset records the
+new canary at once (`Store::reset_model` removes the old one).
 
 ## Chunking
 
@@ -153,7 +204,9 @@ cumulative UTF-8 lengths. A property test checks coverage, ordering and offsets.
   comes from the tokenizer.
 - **HTTP** (`backend = "ollama"`): `POST {model, input: [...]}` to
   `embed_url + http_endpoint_path`; status, chunked encoding and numeric values
-  are checked; `http_concurrency` requests in flight; plain HTTP only.
+  are checked; `http_concurrency` requests in flight; plain HTTP only. At start
+  one probe learns the dimension and one `GET http_tags_path` the model digest;
+  `GET http_version_path` gives the runtime.
 
 All vectors are L2-normalised; the store scores with a dot product.
 

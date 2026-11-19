@@ -6,7 +6,11 @@
 //
 // Startup: the configuration and the embedder are loaded once (a model that
 // cannot be loaded, or that differs from the index's, is an error before
-// anything is watched). The pair, with the event filter built from the same
+// anything is watched). The index's embedding canary is re-embedded and the
+// result logged; a drifted runtime is not fatal here, but every flush checks
+// the canary again (in `update_paths`) and refuses to write, so indexing
+// pauses (changes re-queued with backoff) until the runtime is back or the
+// index was rebuilt with `vec updatedb --full`. The pair, with the event filter built from the same
 // configuration, is the `Runtime`; SIGHUP replaces it (see below).
 //
 // Architecture (four threads):
@@ -185,7 +189,10 @@ impl Runtime {
         let cache = vec_core::model_sha::ShaCache::for_user()?;
         let identity = vec_core::model_sha::writer_identity(&embedder, cache.as_ref())
             .context("computing the model identity")?;
-        open_store(&cfg)?.check_model(&identity)?;
+        let store = open_store(&cfg)?;
+        store.check_model(&identity)?;
+        report_canary(&store, &embedder, &cfg);
+        drop(store);
         let filter = IndexFilter::new(&cfg, &|msg| anstream::eprintln!("{msg}"));
         Ok(Self {
             cfg,
@@ -193,6 +200,35 @@ impl Runtime {
             filter,
         })
     }
+}
+
+/// Re-embed the index's canary with a freshly loaded embedder and log the
+/// outcome. Never fatal: a drift is enforced by every flush (`update_paths`
+/// refuses to write), which pauses indexing and retries with backoff, so an
+/// embedding server restarted onto a drifting runtime stops indexing instead
+/// of mixing vectors, and indexing resumes once the old runtime is back (or
+/// `vec updatedb --full` has rebuilt the index).
+fn report_canary(store: &Store, embedder: &Embedder, cfg: &Config) {
+    let limits = vec_store::CanaryLimits::from_config(&cfg.embed);
+    match store.check_canary(|t| embedder.embed_one(t), embedder.runtime(), limits) {
+        Ok(None) => {
+            anstream::eprintln!("  embedding canary: none recorded yet (the next write records it)")
+        }
+        Ok(Some(check)) => match check.verdict {
+            vec_store::CanaryVerdict::Ok => anstream::eprintln!("  {check}"),
+            vec_store::CanaryVerdict::Warn => anstream::eprintln!("  warn: {check}"),
+            vec_store::CanaryVerdict::Drift => anstream::eprintln!(
+                "  error: {}\n  Indexing is paused: changes are kept and retried with backoff.",
+                store.drift_error(check)
+            ),
+        },
+        Err(e) => anstream::eprintln!("  warn: could not check the embedding canary: {e:#}"),
+    }
+}
+
+/// `true` when `e` is an embedding drift (see [`report_canary`]).
+fn is_drift(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<vec_store::EmbeddingDrift>())
 }
 
 /// The runtime in use, replaced as a whole on reload. Readers take a
@@ -711,10 +747,17 @@ fn flush(
             // backoff (a broken database must not become a busy loop).
             *failures = failures.saturating_add(1);
             let delay = retry_delay(&rt.cfg.watch, *failures);
-            anstream::eprintln!(
-                "warn: reindex failed (attempt {failures}), retrying in {:.1}s: {e:#}",
-                delay.as_secs_f64()
-            );
+            if is_drift(e) {
+                anstream::eprintln!(
+                    "error: indexing paused (attempt {failures}), checking again in {:.1}s: {e:#}",
+                    delay.as_secs_f64()
+                );
+            } else {
+                anstream::eprintln!(
+                    "warn: reindex failed (attempt {failures}), retrying in {:.1}s: {e:#}",
+                    delay.as_secs_f64()
+                );
+            }
             let now = Instant::now();
             p.requeue(batch, now, rt.cfg.watch.max_pending, now + delay);
             cvar.notify_one();
@@ -1444,9 +1487,15 @@ mod tests {
 
     /// A runtime with a stub embedder (tests only: never used by vec watch).
     fn stub_runtime(cfg: Config) -> Runtime {
+        seeded_runtime(cfg, 0)
+    }
+
+    /// A runtime whose stub embedder has another seed: same model identity,
+    /// other vectors (an embedding runtime that drifted).
+    fn seeded_runtime(cfg: Config, seed: u64) -> Runtime {
         Runtime {
             filter: IndexFilter::new(&cfg, &|_| {}),
-            embedder: Embedder::stub(8),
+            embedder: Embedder::stub_with_seed(8, seed),
             cfg,
         }
     }
@@ -1535,6 +1584,70 @@ mod tests {
         assert_eq!(seen, rt.cfg.index.include_paths);
         assert_eq!(meta(&rt.cfg, "watch.rescans").as_deref(), Some("1"));
         assert_eq!(meta(&rt.cfg, "watch.overflows").as_deref(), Some("1"));
+    }
+
+    /// An embedding runtime that drifted (e.g. Ollama restarted onto another
+    /// version) pauses indexing: nothing is written, the change is kept and
+    /// retried with backoff, and indexing resumes when the runtime is back.
+    #[test]
+    fn drift_pauses_indexing_and_keeps_the_changes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let good = stub_runtime(test_cfg(&dir));
+        let a = dir.path().join("a.rs");
+        std::fs::write(&a, "fn main() {}\n".repeat(20)).unwrap();
+        let stats = WatchStats::default();
+        let mut failures = 0;
+        let pending = one_change(&dir);
+        let batch = lock(&pending.0).take(Instant::now());
+        flush(&good, batch, &pending, &stats, &mut failures, |s, p| {
+            index_batch(s, &good, p)
+        });
+        assert_eq!(failures, 0);
+        let indexed = open_store(&good.cfg)
+            .unwrap()
+            .get_file(&a)
+            .unwrap()
+            .unwrap();
+
+        let drifted = seeded_runtime(test_cfg(&dir), 1);
+        std::fs::write(&a, "fn changed() {}\n".repeat(20)).unwrap();
+        lock(&pending.0).insert(a.clone(), Instant::now(), 100);
+        let batch = lock(&pending.0).take(Instant::now());
+        flush(&drifted, batch, &pending, &stats, &mut failures, |s, p| {
+            index_batch(s, &drifted, p)
+        });
+        assert_eq!(failures, 1);
+        assert!(lock(&pending.0).paths.contains(&a), "change kept");
+        assert!(
+            lock(&pending.0).not_before.is_some(),
+            "retried with backoff"
+        );
+        let err = meta(&good.cfg, "watch.last_error").unwrap();
+        assert!(err.contains("embedding drift"), "{err}");
+        assert_eq!(
+            open_store(&good.cfg)
+                .unwrap()
+                .get_file(&a)
+                .unwrap()
+                .unwrap(),
+            indexed,
+            "nothing written"
+        );
+
+        // The old runtime is back: the retry indexes the change.
+        let batch = lock(&pending.0).take(Instant::now());
+        flush(&good, batch, &pending, &stats, &mut failures, |s, p| {
+            index_batch(s, &good, p)
+        });
+        assert_eq!(failures, 0);
+        assert_ne!(
+            open_store(&good.cfg)
+                .unwrap()
+                .get_file(&a)
+                .unwrap()
+                .unwrap(),
+            indexed
+        );
     }
 
     #[test]

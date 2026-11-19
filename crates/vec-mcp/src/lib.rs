@@ -8,7 +8,7 @@
 //! | `similar` | chunks similar to the one at `file_path:line` (stored vector, no model) |
 //! | `explain` | the chunks covering `file_path:line` and the file's index entry |
 //! | `context` | lines around `file_path:line` of an indexed file |
-//! | `index_status` | index, model, watcher and daemon state |
+//! | `index_status` | index, model, embedding runtime, watcher and daemon state |
 //!
 //! Search and ranking are [`vec_query::Searcher`]'s, exactly as in the CLI.
 //! The server keeps one searcher, so the in-process model is loaded at most
@@ -282,8 +282,9 @@ impl VecServer {
     /// Index statistics.
     #[tool(
         description = "Return the state of the vec index: files, chunks, schema, the model the \
-                       index was built with vs the configured one, last updatedb run, watcher \
-                       state, and whether the embedding daemon socket exists (probe_daemon: \
+                       index was built with vs the configured one, last updatedb run, the \
+                       embedding runtime of the first and last write and the stored embedding \
+                       canary, watcher state, and whether the embedding daemon socket exists (probe_daemon: \
                        ask the daemon for its model, which starts a socket-activated one). JSON."
     )]
     pub async fn index_status(

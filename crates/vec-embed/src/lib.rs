@@ -6,13 +6,22 @@
 //!   and the HuggingFace `tokenizer.json` that sits next to the model file.
 //! - **HTTP** ([`Embedder::http`]): an Ollama-compatible embedding endpoint
 //!   (`POST {"model", "input": [..]}` → `{"embeddings": [[..], ..]}`).
-//! - **Stub** ([`Embedder::stub`]): deterministic pseudo-random unit vectors, for tests.
+//! - **Stub** ([`Embedder::stub`], [`Embedder::stub_with_seed`]): deterministic
+//!   pseudo-random unit vectors, for tests.
 //!
 //! [`Embedder::identity`] names the model (configured name and dimension) so the
 //! store can refuse to mix vectors from different models.
 //! [`Embedder::identity_with_sha`] adds the sha256 of the ONNX file. That hash is
 //! computed only on request, because query paths must not hash a large model file
-//! on every call. Writers (index, watch) record it.
+//! on every call. Writers (index, watch) record it. The HTTP backend's identity
+//! carries the digest the server reports for the model (Ollama `/api/tags`,
+//! fetched once by [`Embedder::http`]), so a model re-pulled under the same tag
+//! with other weights is a different identity.
+//!
+//! [`Embedder::runtime`] names the software that computes the vectors (the
+//! Ollama version, or the tract version for ONNX). A runtime upgrade can move
+//! vectors slightly with the same model; the store records the runtime and an
+//! embedding canary to measure that (see `vec_store`).
 //!
 //! ## ONNX inputs, outputs and batching
 //!
@@ -63,7 +72,8 @@ pub struct ModelIdentity {
     pub name: String,
     /// Embedding dimension.
     pub dim: usize,
-    /// Lowercase hex sha256 of the ONNX file, when known.
+    /// Lowercase hex sha256 of the ONNX file, or the model digest reported by
+    /// the HTTP server, when known.
     pub sha256: Option<String>,
 }
 
@@ -130,6 +140,15 @@ pub struct HttpOptions {
     pub error_preview_chars: usize,
     /// Texts per request.
     pub batch_size: usize,
+    /// Path (appended to the URL's own path) of the model list, whose entry
+    /// for [`HttpOptions::model`] gives the model digest (Ollama `/api/tags`).
+    pub tags_path: String,
+    /// Path (appended to the URL's own path) of the server version (Ollama
+    /// `/api/version`), for [`Embedder::runtime`].
+    pub version_path: String,
+    /// Tag the server assumes for a model name without one (Ollama: `latest`),
+    /// used to find the model in the model list.
+    pub default_tag: String,
 }
 
 /// The embedding engine.
@@ -149,8 +168,12 @@ impl fmt::Debug for Embedder {
 
 enum Backend {
     Onnx(Box<OnnxModel>),
-    Http(HttpClient),
-    Stub,
+    Http(Box<HttpClient>),
+    /// Test embedder; the seed selects another family of vectors (a stand-in
+    /// for a runtime that drifted).
+    Stub {
+        seed: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +193,11 @@ impl Embedder {
 
     /// Connect to an Ollama-compatible HTTP endpoint. One probe request learns
     /// the embedding dimension, so an unreachable endpoint fails here.
+    ///
+    /// The identity's `sha256` is the digest of the model's entry in the model
+    /// list ([`HttpOptions::tags_path`]), fetched once here. A server that has
+    /// no model list, does not list the model, or reports no digest leaves it
+    /// `None` (name and dimension are then the whole identity, as before).
     pub fn http(opts: &HttpOptions) -> Result<Self> {
         let client = HttpClient::new(opts)?;
         let probe = client
@@ -180,18 +208,28 @@ impl Embedder {
             .map(Vec::len)
             .filter(|&d| d > 0)
             .ok_or_else(|| anyhow!("embed endpoint {} returned no vector", client.describe()))?;
+        let mut identity = ModelIdentity::new(opts.model.clone(), dim);
+        // Best effort by design: no digest is the pre-digest identity.
+        identity.sha256 = client.model_digest().ok().flatten();
         Ok(Self {
-            identity: ModelIdentity::new(opts.model.clone(), dim),
-            backend: Backend::Http(client),
+            identity,
+            backend: Backend::Http(Box::new(client)),
         })
     }
 
     /// A stub embedder: deterministic unit vectors of length `dim` derived from a
     /// hash of the text. Not semantically meaningful; for tests and explicit use.
     pub fn stub(dim: usize) -> Self {
+        Self::stub_with_seed(dim, 0)
+    }
+
+    /// A stub embedder whose vectors also depend on `seed`: same identity as
+    /// [`Embedder::stub`], other vectors for every other seed. Tests use it as
+    /// a runtime that drifted. Its [`Embedder::runtime`] names the seed.
+    pub fn stub_with_seed(dim: usize, seed: u64) -> Self {
         Self {
             identity: ModelIdentity::new(STUB_MODEL_NAME, dim),
-            backend: Backend::Stub,
+            backend: Backend::Stub { seed },
         }
     }
 
@@ -210,7 +248,26 @@ impl Embedder {
     pub fn model_file(&self) -> Option<&Path> {
         match &self.backend {
             Backend::Onnx(m) => Some(&m.path),
-            Backend::Http(_) | Backend::Stub => None,
+            Backend::Http(_) | Backend::Stub { .. } => None,
+        }
+    }
+
+    /// The software that computes the vectors, for the record and for drift
+    /// messages: `ollama <version>` (asked from the server on every call, so
+    /// a restarted server shows its new version; `None` when it does not
+    /// answer), `tract <version> (vec <version>)` for ONNX (`vec <version>`
+    /// alone when the tract version was not known at build time), or
+    /// `stub seed <n>`.
+    #[must_use]
+    pub fn runtime(&self) -> Option<String> {
+        match &self.backend {
+            Backend::Onnx(_) => Some(onnx_runtime()),
+            Backend::Http(c) => c
+                .server_version()
+                .ok()
+                .flatten()
+                .map(|v| format!("{HTTP_RUNTIME_NAME} {v}")),
+            Backend::Stub { seed } => Some(format!("{STUB_MODEL_NAME} seed {seed}")),
         }
     }
 
@@ -219,16 +276,18 @@ impl Embedder {
         match self.backend {
             Backend::Onnx(_) => "onnx",
             Backend::Http(_) => "http",
-            Backend::Stub => "stub",
+            Backend::Stub { .. } => "stub",
         }
     }
 
     /// sha256 of the ONNX model file (lowercase hex), computed on the first call
-    /// and cached. `None` for the HTTP and stub backends.
+    /// and cached; for HTTP the digest the server reported at construction
+    /// (`None` when it reported none); `None` for the stub backend.
     pub fn model_sha256(&self) -> Result<Option<String>> {
         match &self.backend {
             Backend::Onnx(m) => m.sha256().map(|s| Some(s.to_owned())),
-            Backend::Http(_) | Backend::Stub => Ok(None),
+            Backend::Http(_) => Ok(self.identity.sha256.clone()),
+            Backend::Stub { .. } => Ok(None),
         }
     }
 
@@ -256,7 +315,10 @@ impl Embedder {
             return Ok(Vec::new());
         }
         let vectors = match &self.backend {
-            Backend::Stub => texts.iter().map(|t| stub_embed(t, self.dim())).collect(),
+            Backend::Stub { seed } => texts
+                .iter()
+                .map(|t| stub_embed(t, self.dim(), *seed))
+                .collect(),
             Backend::Onnx(m) => m.embed(texts)?,
             Backend::Http(c) => c.embed(texts)?,
         };
@@ -289,6 +351,25 @@ impl Embedder {
 
 /// Identity name of the stub backend.
 const STUB_MODEL_NAME: &str = "stub";
+
+/// Name of the HTTP runtime in [`Embedder::runtime`] (a label of the server
+/// protocol the backend speaks, not a tunable).
+const HTTP_RUNTIME_NAME: &str = "ollama";
+
+/// tract-onnx version this crate was built against (from the workspace
+/// Cargo.lock, see build.rs); empty when unknown.
+const TRACT_VERSION: &str = env!("VEC_EMBED_TRACT_VERSION");
+
+/// [`Embedder::runtime`] of the ONNX backend: the inference library and vec
+/// itself (whose tokenization and pooling code shapes the vectors too).
+fn onnx_runtime() -> String {
+    let vec_version = env!("CARGO_PKG_VERSION");
+    if TRACT_VERSION.is_empty() {
+        format!("vec {vec_version}")
+    } else {
+        format!("tract {TRACT_VERSION} (vec {vec_version})")
+    }
+}
 
 /// A short text used to check that a backend works: [`Embedder::http`] embeds
 /// it to learn the dimension, and the indexer embeds it to tell a failing
@@ -694,7 +775,9 @@ struct HttpClient {
     authority: String,
     /// Value of the Host header (the URL's authority as written).
     host_header: String,
-    /// Request path: the URL's own path followed by the endpoint path.
+    /// The URL's own path, without a trailing slash (other paths are appended).
+    base: String,
+    /// Embedding request path: `base` followed by the endpoint path.
     path: String,
     opts: HttpOptions,
 }
@@ -732,11 +815,17 @@ impl HttpClient {
         if host_header.is_empty() {
             bail!("[embed] embed_url has no host: {}", opts.url);
         }
-        if !opts.endpoint_path.starts_with('/') {
-            bail!(
-                "[embed] http_endpoint_path must start with '/': {}",
-                opts.endpoint_path
-            );
+        for (key, value) in [
+            ("http_endpoint_path", &opts.endpoint_path),
+            ("http_tags_path", &opts.tags_path),
+            ("http_version_path", &opts.version_path),
+        ] {
+            if !value.starts_with('/') {
+                bail!("[embed] {key} must start with '/': {value}");
+            }
+        }
+        if opts.default_tag.is_empty() {
+            bail!("[embed] http_default_tag must not be empty");
         }
         // A port is present when the authority ends in ":digits" (an IPv6
         // literal without port ends in ']').
@@ -748,11 +837,46 @@ impl HttpClient {
         } else {
             format!("{host_header}:{HTTP_DEFAULT_PORT}")
         };
+        let base = base.trim_end_matches('/').to_owned();
         Ok(Self {
             authority,
             host_header: host_header.to_owned(),
-            path: format!("{}{}", base.trim_end_matches('/'), opts.endpoint_path),
+            path: format!("{base}{}", opts.endpoint_path),
+            base,
             opts: opts.clone(),
+        })
+    }
+
+    /// The digest of the configured model in the server's model list
+    /// (`None` when the list has no entry for it, or the entry no digest).
+    fn model_digest(&self) -> Result<Option<String>> {
+        let tags = self.get_json(&self.opts.tags_path)?;
+        Ok(parse_model_digest(
+            &tags,
+            &self.opts.model,
+            &self.opts.default_tag,
+        ))
+    }
+
+    /// The version the server reports (`None` when its answer has none).
+    fn server_version(&self) -> Result<Option<String>> {
+        let v = self.get_json(&self.opts.version_path)?;
+        Ok(v.get("version")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned))
+    }
+
+    /// GET `base + path` and parse the body as JSON.
+    fn get_json(&self, path: &str) -> Result<serde_json::Value> {
+        let full = format!("{}{path}", self.base);
+        let body = self.exchange("GET", &full, None)?;
+        serde_json::from_slice(&body).with_context(|| {
+            format!(
+                "response from http://{}{full} is not JSON: {}",
+                self.host_header,
+                preview(&body, self.opts.error_preview_chars)
+            )
         })
     }
 
@@ -805,9 +929,6 @@ impl HttpClient {
 
     /// One POST with all of `texts` as the `input` array.
     fn request(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        use std::net::{TcpStream, ToSocketAddrs};
-        use std::time::Duration;
-
         let input: Vec<&str> = texts
             .iter()
             .map(|t| truncate_at_char_boundary(t, self.opts.max_input_bytes))
@@ -818,7 +939,18 @@ impl HttpClient {
             "truncate": true,
         })
         .to_string();
+        let response = self.exchange("POST", &self.path, Some(&body))?;
+        parse_embeddings(&response, texts.len(), self.opts.error_preview_chars)
+            .with_context(|| format!("response from {}", self.describe()))
+    }
 
+    /// One HTTP/1.1 exchange on a new connection: `method path` with an
+    /// optional JSON `body`; returns the response body of a 2xx status.
+    fn exchange(&self, method: &str, path: &str, body: Option<&str>) -> Result<Vec<u8>> {
+        use std::net::{TcpStream, ToSocketAddrs};
+        use std::time::Duration;
+
+        let describe = || format!("http://{}{path}", self.host_header);
         let connect_timeout = Duration::from_millis(self.opts.connect_timeout_ms);
         let io_timeout = Duration::from_millis(self.opts.read_timeout_ms);
         let addrs = self
@@ -839,7 +971,7 @@ impl HttpClient {
         let mut stream = match (stream, last_err) {
             (Some(s), _) => s,
             (None, Some(e)) => {
-                return Err(e).with_context(|| format!("connecting to {}", self.describe()));
+                return Err(e).with_context(|| format!("connecting to {}", describe()));
             }
             (None, None) => bail!("{} resolved to no address", self.authority),
         };
@@ -850,27 +982,25 @@ impl HttpClient {
             .set_write_timeout(Some(io_timeout))
             .context("setting write timeout")?;
 
-        let request = format!(
-            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n",
-            self.path,
-            self.host_header,
-            body.len()
-        );
+        let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {}\r\n", self.host_header);
+        if let Some(body) = body {
+            request.push_str(&format!(
+                "Content-Type: application/json\r\nContent-Length: {}\r\n",
+                body.len()
+            ));
+        }
+        request.push_str("Connection: close\r\n\r\n");
         stream
             .write_all(request.as_bytes())
-            .and_then(|()| stream.write_all(body.as_bytes()))
-            .with_context(|| format!("sending request to {}", self.describe()))?;
+            .and_then(|()| stream.write_all(body.unwrap_or_default().as_bytes()))
+            .with_context(|| format!("sending request to {}", describe()))?;
 
         let mut raw = Vec::new();
         stream
             .read_to_end(&mut raw)
-            .with_context(|| format!("reading response from {}", self.describe()))?;
-        let preview_chars = self.opts.error_preview_chars;
-        let body = parse_http_response(&raw, preview_chars)
-            .with_context(|| format!("response from {}", self.describe()))?;
-        parse_embeddings(&body, texts.len(), preview_chars)
-            .with_context(|| format!("response from {}", self.describe()))
+            .with_context(|| format!("reading response from {}", describe()))?;
+        parse_http_response(&raw, self.opts.error_preview_chars)
+            .with_context(|| format!("response from {}", describe()))
     }
 }
 
@@ -981,6 +1111,29 @@ fn decode_chunked(mut raw: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
+/// The digest of `model` in an Ollama model list
+/// (`{"models": [{"name", "model", "digest"}, ..]}`): the entry whose `name`
+/// or `model` is `model`, or `model:default_tag` when `model` has no tag.
+/// The digest is returned as lowercase hex, without an `algorithm:` prefix;
+/// `None` when no entry matches or its digest is not hex.
+fn parse_model_digest(tags: &serde_json::Value, model: &str, default_tag: &str) -> Option<String> {
+    let tagged = (!model.contains(':')).then(|| format!("{model}:{default_tag}"));
+    let matches = |name: &str| name == model || tagged.as_deref() == Some(name);
+    let entry = tags.get("models")?.as_array()?.iter().find(|m| {
+        ["name", "model"]
+            .iter()
+            .filter_map(|k| m.get(k).and_then(serde_json::Value::as_str))
+            .any(matches)
+    })?;
+    let digest = entry.get("digest")?.as_str()?;
+    let hex = digest
+        .rsplit(':')
+        .next()
+        .unwrap_or(digest)
+        .to_ascii_lowercase();
+    (!hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit())).then_some(hex)
+}
+
 /// Parse `{"embeddings": [[f32, ..], ..]}` and check there is one finite,
 /// numeric vector per input.
 fn parse_embeddings(body: &[u8], expected: usize, preview_chars: usize) -> Result<Vec<Vec<f32>>> {
@@ -1026,16 +1179,17 @@ fn parse_embeddings(body: &[u8], expected: usize, preview_chars: usize) -> Resul
 // Stub embedding: deterministic unit vector from text
 // ---------------------------------------------------------------------------
 
-/// Generate a deterministic unit vector of `dim` f32s from `text`:
-/// an FNV-1a hash of the text seeds an LCG (Knuth's MMIX constants) whose
+/// Generate a deterministic unit vector of `dim` f32s from `text` and
+/// `seed` (0 = the plain stub): an FNV-1a hash of the text, started from the
+/// FNV offset XOR `seed`, seeds an LCG (Knuth's MMIX constants) whose
 /// outputs, mapped to [-1, 1], are L2-normalised.
-fn stub_embed(text: &str, dim: usize) -> Vec<f32> {
+fn stub_embed(text: &str, dim: usize, seed: u64) -> Vec<f32> {
     const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
     const FNV_PRIME: u64 = 1_099_511_628_211;
     const LCG_A: u64 = 6_364_136_223_846_793_005;
     const LCG_C: u64 = 1_442_695_040_888_963_407;
 
-    let mut state = text.bytes().fold(FNV_OFFSET, |h, b| {
+    let mut state = text.bytes().fold(FNV_OFFSET ^ seed, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(FNV_PRIME)
     });
     let mut v: Vec<f32> = (0..dim)
@@ -1226,6 +1380,9 @@ mod tests {
             max_input_bytes: 64,
             error_preview_chars: PREVIEW_CHARS,
             batch_size: 2,
+            tags_path: "/api/tags".into(),
+            version_path: "/api/version".into(),
+            default_tag: "latest".into(),
         }
     }
 
@@ -1239,19 +1396,33 @@ mod tests {
         assert!(HttpClient::new(&http_opts("https://embed.example".into())).is_err());
     }
 
-    /// A one-thread fake server: answers each connection with a chunked JSON
-    /// body holding one 3-d vector per input, and records the request lines.
-    fn fake_server(connections: usize) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    /// What the fake server answers to the model list and version requests
+    /// (`None`: 404).
+    #[derive(Clone, Default)]
+    struct FakeApi {
+        tags: Option<serde_json::Value>,
+        version: Option<serde_json::Value>,
+    }
+
+    /// A one-thread fake server for `connections` connections. A GET of the
+    /// tags or version path gets `api`'s answer; a POST gets a chunked JSON
+    /// body holding one 3-d vector per input. Records the request lines.
+    fn fake_server(
+        connections: usize,
+        api: FakeApi,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let opts = http_opts(String::new());
         let handle = std::thread::spawn(move || {
             let mut seen = Vec::new();
             for _ in 0..connections {
                 let (mut s, _) = listener.accept().unwrap();
                 let mut buf = Vec::new();
                 let mut tmp = [0u8; 4096];
-                // Read headers + body (Content-Length) without waiting for EOF.
-                let body = loop {
+                // Read headers + body (Content-Length, 0 when absent) without
+                // waiting for EOF.
+                let (line, body) = loop {
                     let n = s.read(&mut tmp).unwrap();
                     buf.extend_from_slice(&tmp[..n]);
                     if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -1259,19 +1430,39 @@ mod tests {
                         let len: usize = head
                             .lines()
                             .find_map(|l| l.strip_prefix("Content-Length: "))
-                            .unwrap()
-                            .parse()
-                            .unwrap();
+                            .map_or(0, |v| v.parse().unwrap());
                         if buf.len() >= end + 4 + len {
-                            seen.push(head.lines().next().unwrap().to_string());
-                            break buf[end + 4..end + 4 + len].to_vec();
+                            let line = head.lines().next().unwrap().to_string();
+                            break (line, buf[end + 4..end + 4 + len].to_vec());
                         }
                     }
                 };
-                let req: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                let n = req["input"].as_array().unwrap().len();
-                let vecs: Vec<[f32; 3]> = (0..n).map(|i| [i as f32 + 1.0, 0.0, 0.0]).collect();
-                let json = serde_json::json!({ "embeddings": vecs }).to_string();
+                seen.push(line.clone());
+                let path = line.split_whitespace().nth(1).unwrap().to_owned();
+                let canned = if path.ends_with(&opts.tags_path) {
+                    Some(api.tags.clone())
+                } else if path.ends_with(&opts.version_path) {
+                    Some(api.version.clone())
+                } else {
+                    None
+                };
+                let json = match canned {
+                    Some(Some(v)) => v.to_string(),
+                    Some(None) => {
+                        s.write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot found",
+                        )
+                        .unwrap();
+                        continue;
+                    }
+                    None => {
+                        let req: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let n = req["input"].as_array().unwrap().len();
+                        let vecs: Vec<[f32; 3]> =
+                            (0..n).map(|i| [i as f32 + 1.0, 0.0, 0.0]).collect();
+                        serde_json::json!({ "embeddings": vecs }).to_string()
+                    }
+                };
                 let (a, b) = json.split_at(json.len() / 2);
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{a}\r\n{:x}\r\n{b}\r\n0\r\n\r\n",
@@ -1285,23 +1476,117 @@ mod tests {
         (format!("http://{addr}/base"), handle)
     }
 
+    /// Test digest of the fake model list.
+    const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn tags_listing(name: &str) -> serde_json::Value {
+        serde_json::json!({ "models": [
+            { "name": "other:latest", "model": "other:latest", "digest": "ff" },
+            { "name": name, "model": name, "digest": DIGEST },
+        ]})
+    }
+
     #[test]
     fn http_backend_batches_requests_and_normalises() {
-        // 1 probe + ceil(3 / batch_size=2) = 2 requests.
-        let (url, server) = fake_server(3);
+        // 1 probe + 1 model list + ceil(3 / batch_size=2) = 2 requests.
+        let (url, server) = fake_server(4, FakeApi::default());
         let emb = Embedder::http(&http_opts(url)).unwrap();
         assert_eq!(emb.dim(), 3);
         assert_eq!(emb.identity().name, "test-model");
+        assert_eq!(emb.identity().sha256, None, "no model list: no digest");
         let out = emb.embed_batch(&["a", "b", "c"]).unwrap();
         assert_eq!(out.len(), 3);
         for v in &out {
             assert!((dot(v, v) - 1.0).abs() < 1e-6);
         }
         let lines = server.join().unwrap();
-        assert!(
-            lines.iter().all(|l| l == "POST /base/api/embed HTTP/1.1"),
-            "{lines:?}"
+        assert_eq!(lines[1], "GET /base/api/tags HTTP/1.1");
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 1)
+            .for_each(|(_, l)| assert_eq!(l, "POST /base/api/embed HTTP/1.1"));
+    }
+
+    #[test]
+    fn http_identity_carries_the_model_digest_and_runtime_the_server_version() {
+        // The configured name has no tag: the default tag finds it.
+        let api = FakeApi {
+            tags: Some(tags_listing("test-model:latest")),
+            version: Some(serde_json::json!({ "version": "0.40.16" })),
+        };
+        let (url, server) = fake_server(3, api);
+        let emb = Embedder::http(&http_opts(url)).unwrap();
+        assert_eq!(emb.identity().sha256.as_deref(), Some(DIGEST));
+        assert_eq!(emb.model_sha256().unwrap().as_deref(), Some(DIGEST));
+        assert_eq!(emb.identity_with_sha().unwrap(), *emb.identity());
+        assert_eq!(emb.runtime().as_deref(), Some("ollama 0.40.16"));
+        let lines = server.join().unwrap();
+        assert_eq!(lines[2], "GET /base/api/version HTTP/1.1");
+    }
+
+    #[test]
+    fn http_runtime_is_none_when_the_server_has_no_version() {
+        let (url, server) = fake_server(3, FakeApi::default());
+        let emb = Embedder::http(&http_opts(url)).unwrap();
+        assert_eq!(emb.runtime(), None);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn model_digest_matching_rules() {
+        let tags = serde_json::json!({ "models": [
+            { "name": "m:latest", "model": "m:latest", "digest": "sha256:ABCDEF" },
+            { "name": "m:v2", "digest": "1234" },
+            { "name": "bad:latest", "digest": "not-hex!" },
+            { "name": "nodigest:latest" },
+        ]});
+        assert_eq!(
+            parse_model_digest(&tags, "m", "latest").as_deref(),
+            Some("abcdef")
         );
+        assert_eq!(
+            parse_model_digest(&tags, "m:latest", "latest").as_deref(),
+            Some("abcdef")
+        );
+        assert_eq!(
+            parse_model_digest(&tags, "m:v2", "latest").as_deref(),
+            Some("1234")
+        );
+        assert_eq!(parse_model_digest(&tags, "m:v3", "latest"), None);
+        assert_eq!(
+            parse_model_digest(&tags, "m", "v9"),
+            None,
+            "default tag differs"
+        );
+        assert_eq!(parse_model_digest(&tags, "bad", "latest"), None);
+        assert_eq!(parse_model_digest(&tags, "nodigest", "latest"), None);
+        assert_eq!(
+            parse_model_digest(&serde_json::json!({}), "m", "latest"),
+            None
+        );
+    }
+
+    #[test]
+    fn stub_seed_changes_vectors_not_identity() {
+        let a = Embedder::stub(DIM);
+        let b = Embedder::stub_with_seed(DIM, 7);
+        assert_eq!(a.identity(), b.identity());
+        assert!(dot(&a.embed_one("x").unwrap(), &b.embed_one("x").unwrap()) < 0.9);
+        assert_eq!(
+            a.embed_one("x").unwrap(),
+            Embedder::stub_with_seed(DIM, 0).embed_one("x").unwrap()
+        );
+        assert_eq!(b.runtime().as_deref(), Some("stub seed 7"));
+    }
+
+    #[test]
+    fn onnx_runtime_names_tract_when_known() {
+        let r = onnx_runtime();
+        assert!(r.contains(env!("CARGO_PKG_VERSION")), "{r}");
+        if !TRACT_VERSION.is_empty() {
+            assert!(r.starts_with("tract "), "{r}");
+        }
     }
 
     #[test]

@@ -39,10 +39,28 @@ pub struct StatusReport {
     pub model_mismatch: bool,
     /// End of the last successful `vec updatedb` (Unix seconds).
     pub last_updatedb: Option<u64>,
+    /// Embedding runtime (e.g. `ollama 0.40.16`, `tract 0.22.5 (vec 0.1.0)`)
+    /// of the first write since the index was created, reset for another
+    /// model or fully rebuilt.
+    pub runtime_first_write: Option<String>,
+    /// Embedding runtime of the most recent write.
+    pub runtime_last_write: Option<String>,
+    /// The stored embedding canary (`None`: not recorded yet). `vec doctor`
+    /// re-embeds it; status only shows it.
+    pub canary: Option<CanaryInfo>,
     /// State recorded by `vec watch` (`None` when it never ran on this index).
     pub watcher: Option<WatcherStatus>,
     /// The embedding daemon.
     pub daemon: DaemonStatus,
+}
+
+/// The index's embedding canary, as stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CanaryInfo {
+    /// The text whose vector is stored.
+    pub text: String,
+    /// The runtime that computed the stored vector.
+    pub runtime: Option<String>,
 }
 
 /// The watcher's state, as recorded at its last flush.
@@ -113,6 +131,16 @@ pub enum DaemonStatus {
 pub fn status(cfg: &Config, store: &Store, probe_daemon: bool) -> Result<StatusReport> {
     let (files, chunks, _) = store.stats().context("reading index statistics")?;
     let index_model = store.model().context("reading the index's model")?;
+    let runtimes = store
+        .runtime_history()
+        .context("reading the index's runtime history")?;
+    let canary = store
+        .canary()
+        .context("reading the index's embedding canary")?
+        .map(|c| CanaryInfo {
+            text: c.text,
+            runtime: c.runtime,
+        });
     let (model_path, model_error) = match cfg.embed.backend {
         vec_core::config::EmbedBackend::Onnx => match cfg.resolve_model_path() {
             Ok(p) => (Some(p), None),
@@ -160,6 +188,9 @@ pub fn status(cfg: &Config, store: &Store, probe_daemon: bool) -> Result<StatusR
         model_path,
         model_error,
         last_updatedb: number(vec_index::META_LAST_UPDATEDB)?,
+        runtime_first_write: runtimes.first_write,
+        runtime_last_write: runtimes.last_write,
+        canary,
         watcher,
         daemon: if probe_daemon {
             daemon_status(cfg, index_model.as_ref())

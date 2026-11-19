@@ -22,19 +22,20 @@ the code; each section names the files to read for the details.
 
 | Tool | Shows |
 |------|-------|
-| `vec doctor` | config validity and layers, model file, index schema/model vs configured model, daemon identity (starts a socket-activated daemon) |
-| `vec status [--daemon]` | files, chunks, schema version, index model vs configured, `updatedb.last_run`, watcher state |
+| `vec doctor` | config validity and layers, model file, model runtime, index schema/model vs configured model, index runtime history, **embedding canary** (re-embedded: ok / warn / FAIL), daemon identity (starts a socket-activated daemon) |
+| `vec status [--daemon]` | files, chunks, schema version, index model vs configured, `updatedb.last_run`, embedding runtime of the first and last write, canary runtime (not re-embedded), watcher state |
 | `vec config show` | effective values and the layer that set each |
 | `vec explain file:line` | chunks of a line, indexed hash, `changed_since_indexed` |
 | `vec diff` | what `updatedb` would add, change, remove |
 | `journalctl -u vec-watch -u vec-updatedb -u vec-embed` | service logs (`--user` for user units) |
-| `meta` table | `model_name`, `embedding_dim`, `model_sha256`, `updatedb.last_run`, `watch.*` |
+| `meta` table | `model_name`, `embedding_dim`, `model_sha256`, `canary.*`, `runtime.*`, `updatedb.last_run`, `watch.*` |
 
 ## Model
 
 Files: `crates/vec-core/src/config.rs` (resolution), `crates/vec-embed/src/lib.rs`,
 `crates/vec-store/src/lib.rs` (`ensure_model`, `check_model`, `ModelMismatch`),
-`crates/vec-core/src/model_sha.rs`, `crates/vec-index/src/lib.rs` (`Run::new`, `reset`).
+`crates/vec-core/src/model_sha.rs`, `crates/vec-index/src/lib.rs` (`Run::new`, `check_canary`, `reset`),
+`crates/vec-store/src/canary.rs` (`CanaryCheck`, `EmbeddingDrift`).
 
 | Trigger | What vec does | Index state | Detect | Recover |
 |---------|---------------|-------------|--------|---------|
@@ -47,6 +48,13 @@ Files: `crates/vec-core/src/config.rs` (resolution), `crates/vec-embed/src/lib.r
 | `vec updatedb --full`, other model | the index is emptied right before the **first successful write**, then refilled. A model that cannot embed leaves the old index intact. `--full --path` with another model is refused | | | |
 | Crash or kill during `--full` with another model | files written so far carry the new model; the rest are gone (no staging) | **partial but consistent** (one identity) | `vec status` file count | `vec updatedb` (incremental adds the missing files) |
 | Crash during `--full` with the same model | files not yet reached keep their old (compatible) vectors | consistent | | re-run `vec updatedb --full` (incremental would skip them by size+mtime) |
+| Ollama model re-pulled under the same tag with other weights | the server's digest (`http_tags_path`) differs from the recorded `model_sha256`: `ModelMismatch` for writers and queries, exit 1. A server that reports no digest: caught by the canary instead (rows below) | untouched | `vec doctor` (index model FAIL) | `vec updatedb --full` (or pull the old weights back) |
+| Embedding runtime upgraded (Ollama, tract), vectors moved a little (canary cosine between `canary_min_cosine` and `canary_warn_cosine`) | one line `warn: embedding canary cosine 0.99… (…); runtime when recorded: ollama 0.40.5, now: ollama 0.40.16` per writer run / watcher start; indexing goes on | consistent enough (vectors of both runtimes, close) | `vec doctor` (canary warn), `vec status` (runtime first/last write differ) | optional `vec updatedb --full` |
+| **Embedding drift detected** (canary cosine below `canary_min_cosine`: runtime upgrade, re-pull without digest, quantization change) | writers stop before writing: `embedding drift: … cosine … (minimum 0.98); runtime when recorded: …, now: … Re-embed everything with vec updatedb --full`, exit 1 (typed `EmbeddingDrift`). `vec watch` pauses (below). The daemon logs it at start-up. Queries are not checked (doctor/status only) | **untouched** | `vec doctor`: canary FAIL | `vec updatedb --full`, or restore the previous runtime |
+| `vec updatedb --full` (unscoped) on a drifted index | warns, re-embeds every file, replaces the canary and `runtime.first_write` **when the run completes**. `--full --path` is refused (it would leave a mix) | rebuilt | | |
+| Crash during a `--full` that fixes drift | the old canary stays: the half-rebuilt index keeps failing the check, every writer keeps refusing | mixed runtimes, flagged | `vec doctor` canary FAIL | re-run `vec updatedb --full` to the end |
+| Index built before canaries existed (or canary removed) | the next write records one with the current runtime (`note: the index has no embedding canary …`): the current runtime is assumed to have built the index | unchanged | `vec status` (canary recorded with …) | if the runtime changed since the index was built: `vec updatedb --full` |
+| Ollama has no model list / version endpoint (other server) | digest and runtime unknown (`None`): identity is name + dimension, runtime `not recorded`; the canary still works | | `vec status` | |
 
 ## Ollama / HTTP backend
 
@@ -93,6 +101,7 @@ Files: `crates/vec-daemon/src/server.rs`, `client.rs`, `deadline.rs`,
 | Daemon slow to answer | | waits `reply_timeout_ms` for a reply to start, then `io_timeout_ms` for the rest → warning, in-process for the rest of the process | raise `reply_timeout_ms` |
 | Socket-activated cold start | loads and hashes the model before the first accept | the starting query waits for it (bounded by `reply_timeout_ms`; on timeout it embeds in-process while the daemon keeps starting) | `vec doctor` |
 | Daemon serves another model | | identity mismatch → warning, in-process | `vec doctor`: FAIL "serves X, not the index's model"; restart the daemon |
+| Daemon starts on a drifted runtime | re-embeds the index's canary at start-up and logs `error: embedding canary cosine …` (keeps serving) | queries use its vectors (not checked per query) | `vec doctor` canary FAIL; `vec updatedb --full` |
 | Old (protocol v1) daemon after an upgrade | answers the v2 hello with an error | protocol mismatch → warning, in-process | restart the daemon |
 | Oversized / too many texts / invalid UTF-8 | error reply (`request too large`, `too many texts`, `not valid UTF-8`); clients split batches so their own requests never hit the limits | | |
 | Embedding fails inside the daemon | `embedding failed (details in the daemon log)` | warning, in-process | daemon log |
@@ -110,6 +119,7 @@ File: `crates/vec-watch/src/lib.rs`.
 | inotify queue overflow | next flush rescans the include paths (watches and index) | converges | `watch.overflows`, `watch.rescans` | none needed |
 | More than `max_pending` distinct changes | collapse into parent directories (never above an include path); if still too many, rescan | converges | `watch.overflows` | raise `max_pending` |
 | Watch limit (`fs.inotify.max_user_watches`) exhausted | the directory is logged and counted, changes there are missed until the next `vec updatedb` | stale under it | `watch_failures` in `vec status` | raise the limit (`contrib/99-vec.conf`), restart |
+| Embedding drift (e.g. Ollama restarted onto a runtime that moves vectors) | start-up / reload: logged (`error: embedding drift …`, not fatal). Each flush re-embeds the canary first and refuses: `error: indexing paused (attempt N), checking again in Xs`, the changes are re-queued with backoff (`debounce_ms` doubling up to `retry_max_ms`); indexing resumes by itself when the old runtime is back or the index was rebuilt | untouched (no mixed vectors) | `watch.last_error`, `watch.pending` in `vec status`, `vec doctor` canary FAIL | `vec updatedb --full` (the watcher resumes at its next retry) |
 | Flush fails (DB locked, disk full, backend down) | re-queued, retried after `debounce_ms`, doubling up to `retry_max_ms`; never dropped | per-file atomic | `warn: reindex failed (attempt N) ...`, `watch.last_error`, `watch.last_success` | fix the cause |
 | SIGHUP with a bad config or model | `error: reload failed, keeping the current configuration` | unchanged | journal; `watch.reloads` does not grow | fix, reload again |
 | Watcher stopped for a while | `startup_rescan` re-indexes at start; the daily timer reconciles anyway | | | |
