@@ -171,12 +171,27 @@ pub struct SearchConfig {
     pub path_boost: f32,
     /// Query words shorter than this (in characters) never boost a path.
     pub path_boost_min_word_chars: usize,
+    /// Query words ignored when picking a result's best line and boosting
+    /// paths (compared case-insensitively). The embedding still sees them.
+    pub stop_words: Vec<String>,
+    /// A query word and a word of a line or path also match when one starts
+    /// with the other and both have at least this many characters.
+    pub word_prefix_min_chars: usize,
     /// Most queries accepted by one search (CLI and MCP).
     pub max_queries: usize,
     /// Results scoring below this are dropped.
     pub min_score: f32,
     /// Lines around the requested line shown by `vec context`.
     pub context_window: usize,
+}
+
+impl SearchConfig {
+    /// The [`QueryTerms`](crate::snippet::QueryTerms) of `queries` under
+    /// `stop_words` and `word_prefix_min_chars`.
+    #[must_use]
+    pub fn terms<S: AsRef<str>>(&self, queries: &[S]) -> crate::snippet::QueryTerms {
+        crate::snippet::QueryTerms::new(queries, &self.stop_words, self.word_prefix_min_chars)
+    }
 }
 
 /// `[database]`: SQLite settings.
@@ -670,6 +685,10 @@ impl Config {
         check(
             s.max_queries > 0,
             "[search] max_queries must be greater than 0".into(),
+        );
+        check(
+            s.word_prefix_min_chars > 0,
+            "[search] word_prefix_min_chars must be greater than 0".into(),
         );
         check(
             s.min_score.is_finite() && (-1.0..=1.0).contains(&s.min_score),
@@ -1319,6 +1338,10 @@ mod tests {
             ("[database]\ndb_path = \"vec.db\"\n", "[database] db_path"),
             ("[search]\nmin_score = 2.0\n", "[search] min_score"),
             ("[search]\ndefault_limit = 0\n", "[search] default_limit"),
+            (
+                "[search]\nword_prefix_min_chars = 0\n",
+                "[search] word_prefix_min_chars",
+            ),
             ("[watch]\nmax_wait_ms = 1\n", "[watch] max_wait_ms"),
             ("[embed]\nbackend = \"ollama\"\n", "[embed] embed_url"),
             ("[embed]\nembed_url = \"https://x.example\"\n", "http://"),

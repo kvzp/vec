@@ -82,7 +82,7 @@ Rule reminder: no tunable, path, model name, timeout, URL or limit as a literal 
 - [x] Tests: run_daemon lifecycle, stalled client, short body, bad UTF-8, failing embedder flush
   - Plus an ignored real-model test (daemon vectors = in-process within 1e-4), run once.
 - [x] Daemon client: separate reply wait from stall timeout (new key `[daemon] reply_timeout_ms`, >= io_timeout_ms)
-  - Root cause: the handshake reply of a socket-activated daemon waits for model load + sha256 (16.5 s in a debug build), but the client allowed only io_timeout_ms (10 s). The "after ~7 s" was a wall-clock step in WSL2 (date), not an early timeout: monotonic time was 10.15 s. Client reads now use whole-read deadlines (not per read(2)). Server timeouts only bound waits on the client, never inference. Eager start-up kept and documented (defaults.toml, contrib units).
+  - Root cause: the handshake reply of a socket-activated daemon waits for model load + sha256 (16.5 s in a debug build), but the client allowed only io_timeout_ms (10 s). The "after ~7 s" was a wall-clock step of the VM (date), not an early timeout: monotonic time was 10.15 s. Client reads now use whole-read deadlines (not per read(2)). Server timeouts only bound waits on the client, never inference. Eager start-up kept and documented (defaults.toml, contrib units).
 
 ## Phase B2 — vec-cli + vec-mcp
 - [x] Shared snippet/best-line helper (one implementation, bounds-safe, char-boundary-safe)

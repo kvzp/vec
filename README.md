@@ -2,7 +2,7 @@
 
 **`locate` finds files by name. `vec` finds them by meaning.**
 
-Ask for "where do we retry failed uploads" and get the file and line, even when
+Search for "where do we retry failed uploads" and get the file and line, even when
 none of those words appear in the code. vec indexes your files with a local
 embedding model, answers in a terminal or as an MCP tool for Claude Code and
 other AI agents, and never sends your text anywhere. Results respect Unix file

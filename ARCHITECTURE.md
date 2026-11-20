@@ -136,7 +136,7 @@ an index recorded without one adopts it at the next write.
 ### Embedding runtime and canary
 
 The identity cannot see the same model computed differently: an Ollama upgrade
-(e.g. 0.40.5 → 0.40.16), a tract upgrade, a quantization change behind the same
+(e.g. a minor Ollama release), a tract upgrade, a quantization change behind the same
 digest-less name. Those can shift every vector slightly, and new vectors then
 compare worse with the stored ones. Two records cover it (`vec_store::canary`):
 

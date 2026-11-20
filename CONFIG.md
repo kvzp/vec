@@ -132,6 +132,8 @@ bytecode, **secret material** (`.env`, `.env.*`, `*.key`, `*.pem`, `*.p12`,
 | `snippet_lines` | `3` | snippet **radius**: lines before and after the best line (`--snippet`, MCP), so up to `2n+1` lines | |
 | `path_boost` | `0.05` | added to the score for each query word found in the result's path below its include path; a boosted score never exceeds 1.0; `0` = off | >= 0 |
 | `path_boost_min_word_chars` | `3` | shorter query words never boost | |
+| `stop_words` | `["a", "the", "where", …]` (English function words, see `defaults.toml`) | query words ignored when picking a result's best line and boosting paths, so a question is matched on its content words; the embedding still sees the whole query; `[]` = none | |
+| `word_prefix_min_chars` | `4` | a query word also matches a word that starts with it (or that it starts with) when both are at least this long (`upload` ~ `uploads`); shorter words must be equal. Words are split at non-alphanumerics and camelCase, never matched as substrings | > 0 |
 | `max_queries` | `8` | most queries per search (`vec a b c`, MCP `queries`) | > 0 |
 | `min_score` | `0.0` | results below this cosine similarity are dropped | -1.0 to 1.0 |
 | `context_window` | `10` | lines before and after the line of `vec context` / MCP `context` | |

@@ -393,7 +393,7 @@ impl Searcher {
         queries: &[String],
         snippet_lines: Option<usize>,
     ) -> Vec<Annotated> {
-        let words = snippet::query_words(queries);
+        let terms = self.cfg.search.terms(queries);
         let mut cache: HashMap<&Path, Option<String>> = HashMap::new();
         results
             .iter()
@@ -407,7 +407,7 @@ impl Searcher {
                             text,
                             r.byte_offset..r.byte_end,
                             r.start_line,
-                            &words,
+                            &terms,
                         );
                         (line, snippet_lines.map(|n| snippet::snippet(text, line, n)))
                     }
