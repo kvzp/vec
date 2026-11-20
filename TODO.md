@@ -18,7 +18,9 @@
 - [ ] **Language-aware chunking (treesitter)** — deferred: adds C compilation dependency, conflicts with "pure Rust, no C deps" principle. Current boundary-pattern chunking works well enough. Revisit when quality complaints arise.
 - [x] **Path-weighted re-ranking** — boost results where the file path matches query keywords. Configurable via `[search] path_boost` (default: 0.05).
 - [ ] **Best line by meaning** — pick a result's line by embedding sliding windows of its chunk instead of word matching. Measured 2026-11-20 with Ollama: ~150 windows for 10 results cost 3–4 s per search, too slow by default; worth it only as an opt-in (MCP, `--snippet`) or with a cheaper scheme (fewer, larger windows; top results only).
-- [ ] **Model task prefixes** — nomic-embed-text expects `search_query: ` / `search_document: ` prefixes; vec sends none. Make them `[embed]` keys per model, measure retrieval with and without; needs `vec updatedb --full`.
+- [x] **Model task prefixes** — measured 2026-11-20 ([bench/static-embed/RESULTS.md](bench/static-embed/RESULTS.md)): no gain (35/40 either way), not worth a re-index.
+- [ ] **Keyword search fused with vectors** — SQLite FTS5 over vec's word tokens, reciprocal rank fusion with the vector ranking. Benchmark: 37/40 vs 35/40 for vectors alone.
+- [ ] **Built-in static embedding model** — Model2Vec distilled from `mxbai-embed-large-v1` (15 MB, 256 dims) compiled into the binary: no Ollama, no ONNX runtime. With keyword search 33/40 vs 35/40 for Ollama today, indexing ~200× faster.
 - [ ] **Index compression** — deferred: current DB is ~108 MB for 27k chunks, manageable. Revisit when DB exceeds 1 GB.
 
 ## Performance

@@ -1,0 +1,79 @@
+[[query]]
+text = "how do we split a long source file into overlapping pieces that try to start where a function begins"
+expect = ["crates/vec-index/src/lib.rs"]
+
+[[query]]
+text = "where do we clean up the leftover socket file when the previous background process crashed"
+expect = ["crates/vec-daemon/src/server.rs"]
+
+[[query]]
+text = "how does the client avoid hanging forever if the background embedding process stops answering halfway through a reply"
+expect = ["crates/vec-daemon/src/client.rs", "crates/vec-daemon/src/deadline.rs"]
+
+[[query]]
+text = "how do we notice that the same model now produces slightly different vectors after upgrading the inference server"
+expect = ["crates/vec-store/src/canary.rs"]
+
+[[query]]
+text = "where are hits that the current user has no permission to open dropped before they are shown"
+expect = ["crates/vec-query/src/lib.rs", "crates/vec-core/src/util.rs"]
+
+[[query]]
+text = "how are the system-wide settings, the per-user file and a file given on the command line combined, and how do we remember which one set each value"
+expect = ["crates/vec-core/src/config.rs"]
+
+[[query]]
+text = "what happens when someone edits a .gitignore while the real-time watcher is running"
+expect = ["crates/vec-watch/src/lib.rs"]
+
+[[query]]
+text = "how does an index created by an older release get upgraded to the newer table layout"
+expect = ["crates/vec-store/src/lib.rs"]
+
+[[query]]
+text = "score bonus from filename words"
+expect = ["crates/vec-query/src/rank.rs"]
+
+[[query]]
+text = "choosing which line to highlight"
+expect = ["crates/vec-core/src/snippet.rs"]
+
+[[query]]
+text = "avoid rehashing big weights file"
+expect = ["crates/vec-core/src/model_sha.rs"]
+
+[[query]]
+text = "systemd hands over listening descriptor"
+expect = ["crates/vec-daemon/src/activation.rs"]
+
+[[query]]
+text = "tools exposed to AI assistants"
+expect = ["crates/vec-mcp/src/lib.rs"]
+
+[[query]]
+text = "binary framing between client and daemon"
+expect = ["crates/vec-daemon/src/protocol.rs"]
+
+[[query]]
+text = "where does the error \"busy: all N connections ([daemon] max_connections) are in use; embed in-process\" come from"
+expect = ["crates/vec-daemon/src/server.rs"]
+
+[[query]]
+text = "why do we call restore_sigpipe at the start of main"
+expect = ["crates/vec-cli/src/main.rs"]
+
+[[query]]
+text = "where is the \"truncated chunked body\" error raised when talking to the Ollama HTTP backend"
+expect = ["crates/vec-embed/src/lib.rs"]
+
+[[query]]
+text = "what does the --files-only search flag do and where is it handled"
+expect = ["crates/vec-cli/src/commands/search.rs", "crates/vec-cli/src/main.rs"]
+
+[[query]]
+text = "the code behind \"vec doctor: N problem(s) found\""
+expect = ["crates/vec-cli/src/commands/status.rs"]
+
+[[query]]
+text = "docs explaining why snippets are read with O_NOFOLLOW | O_NONBLOCK and what access(R_OK) protects"
+expect = ["SECURITY.md"]

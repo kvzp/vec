@@ -9,3 +9,4 @@
 ## 2026-11-20 — the owner's machine is private, the repo is public
 - github.com/kvzp/vec is PUBLIC. Never write anything from the owner's machine into the repo, a PR or a commit message: no home paths, no other project names, no file names or counts from their index, no hardware/OS details, no session scratch paths. Test fixtures and doc examples use invented names (`/work/TheApp`). Before every push: `git diff origin/main | grep -iE '/home/|~/|<names seen in their index>'`.
 - The live index spans the owner's whole home: a demo query returns their other projects. Don't name or quote those as examples; demo on the vec repo itself, or say "files from your other projects" without naming them.
+- No AI-tool attribution in commits or PRs: no co-author trailers, no "generated with" footers. The owner's commits are theirs.

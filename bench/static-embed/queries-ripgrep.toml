@@ -1,0 +1,79 @@
+[[query]]
+text = "where do we decide whether to map a file straight into memory or read it through a buffer"
+expect = ["crates/core/flags/hiargs.rs", "crates/searcher/src/searcher/mmap.rs"]
+
+[[query]]
+text = "how can we search inside packed archive files by spawning an external unpacking program"
+expect = ["crates/cli/src/decompress.rs"]
+
+[[query]]
+text = "why does the program exit successfully when its output is piped into head and the reader goes away early"
+expect = ["crates/core/main.rs"]
+
+[[query]]
+text = "how do we decide that a dot-file should be treated as invisible, including the special Windows file attribute"
+expect = ["crates/ignore/src/pathutil.rs"]
+
+[[query]]
+text = "how do idle threads in the parallel directory traversal get handed more work from busy ones"
+expect = ["crates/ignore/src/walk.rs"]
+
+[[query]]
+text = "where do we figure out where the user's personal global ignore rules live by reading their git configuration"
+expect = ["crates/ignore/src/gitignore.rs"]
+
+[[query]]
+text = "how does case-insensitive matching switch on automatically only when the pattern is all lowercase"
+expect = ["crates/regex/src/config.rs", "crates/regex/src/ast.rs"]
+
+[[query]]
+text = "how do we order the output by when each file was last changed"
+expect = ["crates/core/flags/hiargs.rs", "crates/core/flags/lowargs.rs"]
+
+[[query]]
+text = "lines surrounding a match"
+expect = ["crates/searcher/src/searcher/core.rs"]
+
+[[query]]
+text = "clickable file links in terminal"
+expect = ["crates/printer/src/hyperlink/mod.rs"]
+
+[[query]]
+text = "wildcard pattern to regex translation"
+expect = ["crates/globset/src/glob.rs"]
+
+[[query]]
+text = "built-in language file extensions"
+expect = ["crates/ignore/src/default_types.rs"]
+
+[[query]]
+text = "machine readable output format"
+expect = ["crates/printer/src/json.rs"]
+
+[[query]]
+text = "required substring prefilter optimization"
+expect = ["crates/regex/src/literal.rs"]
+
+[[query]]
+text = "where is RIPGREP_CONFIG_PATH read and the config file turned into extra arguments"
+expect = ["crates/core/flags/config.rs", "crates/core/flags/parse.rs"]
+
+[[query]]
+text = "where does the error 'the literal \"\\n\" is not allowed in a regex' come from"
+expect = ["crates/regex/src/strip.rs", "crates/regex/src/error.rs"]
+
+[[query]]
+text = "which code prints 'No files were searched, which means ripgrep probably applied a filter you didn't expect'"
+expect = ["crates/core/main.rs"]
+
+[[query]]
+text = "where is the TooManyNestedAlternates glob error raised"
+expect = ["crates/globset/src/glob.rs", "crates/globset/src/lib.rs"]
+
+[[query]]
+text = "how does --max-filesize parse values like 10M with parse_human_readable_size"
+expect = ["crates/cli/src/human.rs"]
+
+[[query]]
+text = "where is the IGNORE_MESSAGES switch behind --no-ignore-messages stored"
+expect = ["crates/core/messages.rs"]

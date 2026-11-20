@@ -1,0 +1,51 @@
+# Retrieval benchmark: static embeddings vs Ollama vs keyword search.
+# Every tunable lives here; bench.py has no literals of its own.
+# Environment: VEC_BENCH_OLLAMA_URL (e.g. the [embed] embed_url of your vec
+# config) is required for the ollama methods.
+
+[corpus]
+# Directory names skipped while walking a corpus.
+skip_dirs = [".git", "target", "node_modules"]
+# File names skipped (generated, not code a person searches).
+skip_files = ["Cargo.lock"]
+# Files larger than this (bytes) are skipped, like [index] max_file_size.
+max_file_bytes = 1048576
+
+[chunk]
+# Same defaults as vec's [index] chunk_size / chunk_overlap / min_chunk_lines.
+size = 40
+overlap = 10
+min_lines = 5
+
+[ollama]
+model = "nomic-embed-text-v2-moe:latest"
+# Path appended to VEC_BENCH_OLLAMA_URL.
+embed_path = "/api/embed"
+batch = 32
+concurrency = 8
+timeout_s = 300
+# nomic task prefixes, used by the "ollama_prefixed" method only.
+query_prefix = "search_query: "
+document_prefix = "search_document: "
+
+[keyword]
+# Query words dropped before keyword search (vec's [search] stop_words).
+stop_words = [
+  "a", "an", "and", "any", "are", "as", "at", "be", "but", "by", "can",
+  "could", "did", "do", "does", "for", "from", "get", "gets", "how", "i",
+  "if", "in", "into", "is", "it", "its", "me", "my", "of", "on", "or", "our",
+  "should", "so", "some", "that", "the", "their", "them", "then", "there",
+  "these", "they", "this", "those", "to", "too", "us", "was", "we", "were",
+  "what", "when", "where", "which", "who", "whom", "why", "will", "with",
+  "would", "you", "your",
+]
+
+[fusion]
+# Reciprocal rank fusion constant and how many hits of each list are fused.
+rrf_k = 60
+depth = 100
+
+[eval]
+# Files reported per query; hit@k for each k.
+top_files = 10
+ks = [1, 3, 10]
