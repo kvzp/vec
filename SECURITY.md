@@ -96,6 +96,15 @@ use it only on a trusted host or network.
 Encryption at rest (use disk encryption), authentication beyond Unix
 credentials, audit logging.
 
+## Supported versions
+
+| Version | Branch | Security fixes |
+|---------|--------|----------------|
+| 0.1.x | `0.1` | yes |
+| pre-release builds (March 2026) | — | no: upgrade to 0.1 |
+
+Fixes are released as patch versions on the version branch ([CONTRIBUTING.md](CONTRIBUTING.md#versions-and-branches)).
+
 ## Reporting a vulnerability
 
 Use [GitHub Security Advisories](https://github.com/kvzp/vec/security/advisories/new),

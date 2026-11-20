@@ -1,5 +1,7 @@
 # vec
 
+[![Release](https://img.shields.io/github/v/release/kvzp/vec?sort=semver)](https://github.com/kvzp/vec/releases) [![CI](https://github.com/kvzp/vec/actions/workflows/ci.yml/badge.svg)](https://github.com/kvzp/vec/actions/workflows/ci.yml)
+
 **`locate` finds files by name. `vec` finds them by meaning.**
 
 Search for "where do we retry failed uploads" and get the file and line, even when
@@ -73,7 +75,16 @@ For a system-wide index shared by all users, see [Install](#install).
 
 ## Install
 
-Requirements: Rust 1.89+. SQLite is bundled by default.
+**Release binary** (Linux x86_64 and aarch64; the aarch64 build is cross-compiled and untested). Every [release](https://github.com/kvzp/vec/releases) lists its changes and checksums:
+
+```bash
+curl -LO https://github.com/kvzp/vec/releases/latest/download/vec-linux-x86_64.tar.gz
+curl -LO https://github.com/kvzp/vec/releases/latest/download/vec-linux-x86_64.tar.gz.sha256
+sha256sum -c vec-linux-x86_64.tar.gz.sha256 && tar xzf vec-linux-x86_64.tar.gz
+sudo install -m755 vec /usr/local/bin/
+```
+
+**From source** — requirements: Rust 1.89+. SQLite is bundled by default. `main` is the development line; a version branch (`git checkout 0.1`) is the stable one ([CONTRIBUTING.md](CONTRIBUTING.md#versions-and-branches)).
 
 ```bash
 git clone https://github.com/kvzp/vec && cd vec
