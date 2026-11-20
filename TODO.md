@@ -17,6 +17,8 @@
 
 - [ ] **Language-aware chunking (treesitter)** — deferred: adds C compilation dependency, conflicts with "pure Rust, no C deps" principle. Current boundary-pattern chunking works well enough. Revisit when quality complaints arise.
 - [x] **Path-weighted re-ranking** — boost results where the file path matches query keywords. Configurable via `[search] path_boost` (default: 0.05).
+- [ ] **Best line by meaning** — pick a result's line by embedding sliding windows of its chunk instead of word matching. Measured 2026-11-20 with Ollama: ~150 windows for 10 results cost 3–4 s per search, too slow by default; worth it only as an opt-in (MCP, `--snippet`) or with a cheaper scheme (fewer, larger windows; top results only).
+- [ ] **Model task prefixes** — nomic-embed-text expects `search_query: ` / `search_document: ` prefixes; vec sends none. Make them `[embed]` keys per model, measure retrieval with and without; needs `vec updatedb --full`.
 - [ ] **Index compression** — deferred: current DB is ~108 MB for 27k chunks, manageable. Revisit when DB exceeds 1 GB.
 
 ## Performance
@@ -51,4 +53,4 @@
 
 - [x] **Nix flake** — `flake.nix` for NixOS users.
 - [ ] **Homebrew formula** — deferred: macOS is untested, no hardware available.
-- [ ] **Writers coordinate full walks** — `vec watch`'s startup/reload rescan and a running `vec updatedb` walk the same tree and embed the same changed files twice (seen 2026-11-19 on a large index: half the Ollama throughput wasted). Take an advisory lock (or a meta flag) for whole-tree walks; the watch defers its rescan while another writer holds it.
+- [ ] **Writers coordinate full walks** — `vec watch`'s startup/reload rescan and a running `vec updatedb` walk the same tree and embed the same changed files twice (seen 2026-11-19 on a large index: half the embedding throughput wasted). Take an advisory lock (or a meta flag) for whole-tree walks; the watch defers its rescan while another writer holds it.

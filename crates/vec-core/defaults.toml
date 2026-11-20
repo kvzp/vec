@@ -198,6 +198,25 @@ path_boost = 0.05
 # words like "a" or "in" do not boost nearly every result.
 path_boost_min_word_chars = 3
 
+# Query words ignored when picking each result's best line and when boosting
+# paths, so that a question ("where do we retry failed uploads") is matched on
+# its content words. Matching is on whole words, case-insensitive. The
+# embedding (which ranks results) still sees the whole query. [] = none.
+stop_words = [
+  "a", "an", "and", "any", "are", "as", "at", "be", "but", "by", "can",
+  "could", "did", "do", "does", "for", "from", "get", "gets", "how", "i",
+  "if", "in", "into", "is", "it", "its", "me", "my", "of", "on", "or", "our",
+  "should", "so", "some", "that", "the", "their", "them", "then", "there",
+  "these", "they", "this", "those", "to", "too", "us", "was", "we", "were",
+  "what", "when", "where", "which", "who", "whom", "why", "will", "with",
+  "would", "you", "your",
+]
+
+# A query word also matches a word of a line or path that starts with it, or
+# that it starts with, when both have at least this many characters
+# ("upload" ~ "uploads", "embed" ~ "embedding"). Shorter words must be equal.
+word_prefix_min_chars = 4
+
 # Most queries one search accepts (`vec a b c`, MCP `queries`): each one is
 # embedded and scans the whole index.
 max_queries = 8

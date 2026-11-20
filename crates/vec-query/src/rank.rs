@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use vec_core::config::SearchConfig;
+use vec_core::snippet::QueryTerms;
 use vec_store::SearchResult;
 
 /// Merge the hits of several queries (one list per query) into at most
@@ -13,9 +14,11 @@ use vec_store::SearchResult;
 ///
 /// - A chunk found by several queries (same path and start line) keeps its
 ///   best score.
-/// - Each distinct query word of at least `[search] path_boost_min_word_chars`
-///   characters that occurs in the result's path below its include path adds
-///   `[search] path_boost`; a boosted score never exceeds 1.0.
+/// - Each distinct query word (not a `[search] stop_words` entry) of at least
+///   `[search] path_boost_min_word_chars` characters that matches a word of
+///   the result's path below its include path adds `[search] path_boost`; a
+///   boosted score never exceeds 1.0. Words match whole (see
+///   [`QueryTerms`]), so "the" does not boost "TheApp/".
 /// - Results are ordered by score (descending), then path and line, so the
 ///   order is deterministic.
 #[must_use]
@@ -38,7 +41,7 @@ pub fn rank(
     }
     let mut results: Vec<SearchResult> = merged.into_values().collect();
 
-    let words = boost_words(queries, cfg.path_boost_min_word_chars);
+    let words = cfg.terms(queries).at_least(cfg.path_boost_min_word_chars);
     if cfg.path_boost > 0.0 && !words.is_empty() {
         for r in &mut results {
             let matches = path_word_matches(&r.path, include_paths, &words);
@@ -59,27 +62,15 @@ pub fn rank(
     results
 }
 
-/// Distinct lowercase words of `queries` with at least `min_chars` characters.
-fn boost_words(queries: &[String], min_chars: usize) -> Vec<String> {
-    let mut words: Vec<String> = vec_core::snippet::query_words(queries)
-        .into_iter()
-        .filter(|w| w.chars().count() >= min_chars)
-        .collect();
-    words.sort_unstable();
-    words.dedup();
-    words
-}
-
-/// How many of `words` occur in `path` below the longest include path that
-/// contains it (the whole path when none does), case-insensitively.
-fn path_word_matches(path: &Path, include_paths: &[PathBuf], words: &[String]) -> usize {
+/// How many of `words` match a word of `path` below the longest include
+/// path that contains it (the whole path when none does).
+fn path_word_matches(path: &Path, include_paths: &[PathBuf], words: &QueryTerms) -> usize {
     let below = include_paths
         .iter()
         .filter_map(|root| path.strip_prefix(root).ok())
         .min_by_key(|rel| rel.as_os_str().len())
         .unwrap_or(path);
-    let lower = below.to_string_lossy().to_lowercase();
-    words.iter().filter(|w| lower.contains(w.as_str())).count()
+    words.count_in(&below.to_string_lossy())
 }
 
 #[cfg(test)]
@@ -157,6 +148,36 @@ mod tests {
         );
         assert_eq!(out[0].score, 1.0);
         assert!((out[1].score - 0.9).abs() < 1e-6, "short words boosted");
+    }
+
+    #[test]
+    fn stop_words_and_substrings_do_not_boost() {
+        // "the" used to boost every path with a "The…" directory.
+        let out = rank(
+            &cfg(),
+            &[],
+            &q(&["where do we give up when the embedding server is too slow"]),
+            vec![vec![
+                hit("/work/TheApp/config.rs", 1, 0.466),
+                hit("/work/cli/main.rs", 1, 0.5),
+                hit("/work/embed-client/lib.rs", 1, 0.48),
+            ]],
+            10,
+        );
+        let paths: Vec<_> = out
+            .iter()
+            .map(|r| r.path.to_string_lossy().into_owned())
+            .collect();
+        // "embedding" ~ "embed" (a long prefix) boosts embed-client only.
+        assert_eq!(
+            paths,
+            [
+                "/work/embed-client/lib.rs",
+                "/work/cli/main.rs",
+                "/work/TheApp/config.rs"
+            ]
+        );
+        assert!((out[2].score - 0.466).abs() < 1e-6, "TheApp was boosted");
     }
 
     #[test]

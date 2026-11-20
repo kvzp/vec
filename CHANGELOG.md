@@ -9,6 +9,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed — question-style queries
+
+- **Best line and path boost match whole words, without stop words.** A result's best line and the path boost used to match query words as substrings, so in "where do we retry failed uploads" the words "do", "we" and "the" matched inside "documents", "lowercase", "other" or a "The…" directory: the line shown was often not the relevant one, and unrelated paths were boosted. Words are now split at non-alphanumerics and camelCase and matched whole (or by a long prefix, `upload` ~ `uploads`), and `[search] stop_words` are ignored. Ranking by the embedding is unchanged. New keys `[search] stop_words`, `word_prefix_min_chars`.
+
 Audit of 2026-11-19 ([tasks/audit-2026-11-19.md](tasks/audit-2026-11-19.md)) and its review: correctness, robustness and security fixes across every crate.
 
 ### Breaking — read before upgrading
