@@ -77,10 +77,10 @@ Runtime dependencies: `libsqlite3-0` (Debian), `sqlite-libs` (Fedora),
 
 ## Upgrades
 
-- **From 0.1.x:** the index must be rebuilt. Old versions stored wrong vectors
+- **From a pre-release build** (March 2026, before the `v0.1.0` tag): the index must be rebuilt. Old versions stored wrong vectors
   and an older schema; until `vec updatedb --full` has run, queries fail with a
   model-mismatch error and `vec-watch` fails at start-up. Tell users (NEWS /
-  release notes), or run it from the maintainer script on upgrade from < 0.2 in
+  release notes), or run it from the maintainer script on upgrade from a pre-release build in
   the background, as `vec-model-base` does on model changes. See
   [README.md](README.md#upgrading) and [CHANGELOG.md](CHANGELOG.md).
 - **Schema upgrades** happen in place the first time a writer opens the index;

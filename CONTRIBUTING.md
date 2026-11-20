@@ -124,6 +124,31 @@ file with `vec explain file:line`.
 
 ---
 
+## Versions and branches
+
+vec uses [Semantic Versioning](https://semver.org/) and one long-lived branch per minor version, like Odoo's `16.0`, `17.0` branches:
+
+| Branch | What it holds | What goes in |
+|--------|---------------|--------------|
+| `main` | the next version, in development | features, breaking changes, fixes |
+| `0.1`, `0.2`, … | one released version line each | bug and security fixes only: no new features, no config, schema or protocol changes |
+
+- **Releases are tags on a version branch**: `v0.1.0`, then `v0.1.1`, `v0.1.2` for fixes. Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which builds the Linux binaries and publishes a GitHub release whose notes are that version's CHANGELOG section.
+- **A fix goes into the oldest supported version branch first**, then merges forward (`0.1` → `0.2` → `main`), so no branch loses a fix. A fix that only concerns `main` goes to `main` only.
+- **A new version** (`0.2`): when `main` is ready, create the `0.2` branch from it, set `version` in `Cargo.toml` (plus `flake.nix`, `contrib/vec.spec`, `contrib/debian/changelog`), turn `[Unreleased]` into the version's CHANGELOG section, and tag `v0.2.0` on the branch.
+- **Supported versions**: the newest version branch, and the one before it for security fixes ([SECURITY.md](SECURITY.md)).
+- Before 1.0, a minor version (`0.1` → `0.2`) may break the index, config or protocols; the CHANGELOG's **Breaking** section says what to do.
+
+Releasing a fix on `0.1`:
+
+```bash
+git checkout 0.1 && git pull
+# fix, commit, CI green; bump version in Cargo.toml (0.1.0 -> 0.1.1) and the packaging files
+# move the fix's CHANGELOG entry under "## [0.1.1] — <date>"
+git tag -a v0.1.1 -m "vec 0.1.1" && git push origin 0.1 v0.1.1
+git checkout main && git merge 0.1     # forward-port
+```
+
 ## Submitting changes
 
 - One logical change per PR; `cargo test`, clippy and fmt must pass.

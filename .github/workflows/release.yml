@@ -80,33 +80,42 @@ jobs:
         with:
           merge-multiple: true
 
+      - name: Release notes from CHANGELOG.md
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+          awk -v v="$VERSION" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && /^## / { exit }
+            on && /^---$/ { next }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "CHANGELOG.md has no section for $VERSION" >&2
+            exit 1
+          fi
+          {
+            echo
+            echo "## Installation"
+            echo
+            echo '```bash'
+            echo "curl -LO https://github.com/${{ github.repository }}/releases/download/$TAG/vec-linux-x86_64.tar.gz"
+            echo "curl -LO https://github.com/${{ github.repository }}/releases/download/$TAG/vec-linux-x86_64.tar.gz.sha256"
+            echo "sha256sum -c vec-linux-x86_64.tar.gz.sha256 && tar xzf vec-linux-x86_64.tar.gz"
+            echo "sudo install -m755 vec /usr/local/bin/"
+            echo '```'
+            echo
+            echo "aarch64: the same with \`vec-linux-aarch64.tar.gz\` (cross-compiled, untested). Then set up a model: see the README's Quickstart."
+          } >> notes.md
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          name: vec ${{ github.ref_name }}
+          body_path: notes.md
           files: |
             vec-linux-x86_64.tar.gz
             vec-linux-x86_64.tar.gz.sha256
             vec-linux-aarch64.tar.gz
             vec-linux-aarch64.tar.gz.sha256
-          body: |
-            ## Installation
-
-            ```bash
-            # x86_64
-            curl -L https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/vec-linux-x86_64.tar.gz | tar xz
-            install -m755 vec /usr/local/bin/
-
-            # aarch64
-            curl -L https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/vec-linux-aarch64.tar.gz | tar xz
-            install -m755 vec /usr/local/bin/
-            ```
-
-            Then install a model:
-            ```bash
-            vec model download
-            ```
-
-            Verify checksums:
-            ```bash
-            sha256sum -c vec-linux-x86_64.tar.gz.sha256
-            ```

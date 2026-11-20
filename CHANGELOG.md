@@ -9,6 +9,12 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+---
+
+## [0.1.0] — 2026-11-20
+
+First tagged release (branch `0.1`, tag `v0.1.0`): every change since the untagged March 2026 builds.
+
 ### Fixed — question-style queries
 
 - **Best line and path boost match whole words, without stop words.** A result's best line and the path boost used to match query words as substrings, so in "where do we retry failed uploads" the words "do", "we" and "the" matched inside "documents", "lowercase", "other" or a "The…" directory: the line shown was often not the relevant one, and unrelated paths were boosted. Words are now split at non-alphanumerics and camelCase and matched whole (or by a long prefix, `upload` ~ `uploads`), and `[search] stop_words` are ignored. Ranking by the embedding is unchanged. New keys `[search] stop_words`, `word_prefix_min_chars`.
@@ -107,7 +113,9 @@ Audit of 2026-11-19 ([tasks/audit-2026-11-19.md](tasks/audit-2026-11-19.md)) and
 
 ---
 
-## [0.1.0] — 2026-03-04
+## Pre-release development — 2026-03-04
+
+Untagged builds from March 2026 (they report themselves as `vec 0.1.0`). Their indexes must be rebuilt: see Breaking under 0.1.0.
 
 ### Added
 
